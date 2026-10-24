@@ -1,8 +1,8 @@
 name: Hourly Tassajara Weather MOS Pipeline
 on:
   schedule:
-    - cron: "5 * * * *"  # Runs at :05 past every hour
-  workflow_dispatch:     # Lets you click a button to run it manually anytime
+    - cron: "5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,11 +14,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install Python libraries
-        run: uv pip install --system -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run Tassajara MOS Pipeline
         env:
@@ -31,5 +36,4 @@ jobs:
           git config user.name "Tassajara Weather Bot"
           git config user.email "weather-bot@tassajara.local"
           git add tassajara_weather.db
-          git diff --staged --quiet || git commit -m "Hourly weather & MOS update"
-          git push
+          git diff --staged --quiet || (git commit -m "Hourly weather & MOS update" && git push)
