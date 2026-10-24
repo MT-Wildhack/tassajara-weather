@@ -25,15 +25,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Backfill 90 Days of WeatherLink Pro Data & Train Model (Runs Only If Model Missing)
+        env:
+          WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
+          WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
+        run: |
+          if [ ! -f "models/tassajara_mos_v1.joblib" ]; then
+            echo "Trained MOS model not found. Running 90-day WeatherLink Pro backfill & training..."
+            python backfill_and_train.py --days 90
+          else
+            echo "Trained MOS model (models/tassajara_mos_v1.joblib) already active."
+          fi
+
       - name: Run Tassajara MOS Pipeline
         env:
           WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
           WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
         run: python run_hourly_mos_pipeline.py
 
-      - name: Save Updated Database Back to Repository
+      - name: Save Updated Database & Model Back to Repository
         run: |
           git config user.name "Tassajara Weather Bot"
           git config user.email "weather-bot@tassajara.local"
-          git add tassajara_weather.db
-          git diff --staged --quiet || (git commit -m "Hourly weather & MOS update" && git push)
+          git add tassajara_weather.db models/
+          git diff --staged --quiet || (git commit -m "Hourly weather & MOS model update" && git push)
