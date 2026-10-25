@@ -7,12 +7,10 @@ Hastings RAWS CAHC1), and performs spatial anomaly detection & lapse-rate calcul
 """
 
 import os
-import time
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 import requests
-import numpy as np
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,19 +19,27 @@ logging.basicConfig(
 logger = logging.getLogger("TassajaraIngest")
 
 # ---------------------------------------------------------------------------
-# Configuration & Credentials
+# Configuration & Credentials (Immune to empty-string "" env vars in CI)
 # ---------------------------------------------------------------------------
-WEATHERLINK_API_KEY = os.getenv("WL_API_KEY", "tigkhjhsweahdrae2cl0uenfuws3kv8k")
-WEATHERLINK_API_SECRET = os.getenv("WL_API_SECRET", "ffnphp69pdbsqwsahkdewvctewmxagwt")
+WEATHERLINK_API_KEY = (os.getenv("WL_API_KEY") or "").strip() or "tigkhjhsweahdrae2cl0uenfuws3kv8k"
+WEATHERLINK_API_SECRET = (os.getenv("WL_API_SECRET") or "").strip() or "ffnphp69pdbsqwsahkdewvctewmxagwt"
 WEATHERLINK_BASE_URL = "https://api.weatherlink.com/v2"
 
-# Optional Synoptic Data (MesoWest) public token for RAWS/CNRFC stations (CHWC1, CAHC1)
-SYNOPTIC_API_TOKEN = os.getenv("SYNOPTIC_TOKEN", "959822b9da094eabb0e41b8a5a7dcaa5")
+# Synoptic Data (MesoWest) public token for RAWS/CNRFC stations (CHWC1, CAHC1)
+SYNOPTIC_API_TOKEN = (os.getenv("SYNOPTIC_TOKEN") or "").strip() or "959822b9da094eabb0e41b8a5a7dcaa5"
 
 # Station Elevations (meters MSL)
 ELEV_TASSAJARA_M = 485.0    # Stone Office (1,590 ft)
 ELEV_CHEWS_RIDGE_M = 1536.0 # CHWC1 Chews Ridge (5,040 ft)
 ELEV_HASTINGS_M = 546.0     # CAHC1 Hastings Natural History Reservation (1,792 ft)
+
+
+def first_not_none(*vals):
+    """Returns the first argument that is not None (preserving 0 and 0.0)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
 
 
 def f_to_c(temp_f: Optional[float]) -> Optional[float]:
@@ -56,8 +62,8 @@ class WeatherLinkV2Client:
     """Client for Davis WeatherLink v2 API using X-Api-Secret header authentication."""
 
     def __init__(self, api_key: str, api_secret: str):
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key = (api_key or "").strip() or WEATHERLINK_API_KEY
+        self.api_secret = (api_secret or "").strip() or WEATHERLINK_API_SECRET
         self.session = requests.Session()
         self.session.headers.update({
             "X-Api-Secret": self.api_secret,
@@ -96,9 +102,9 @@ class WeatherLinkV2Client:
             "dewpoint_c": None,
             "wetbulb_c": None,
             "rh_pct": None,
-            "wind_speed_ms": None,
-            "wind_gust_ms": None,
-            "wind_dir_deg": None,
+            "wind_speed_ms": 0.0,
+            "wind_gust_ms": 0.0,
+            "wind_dir_deg": 0.0,
             "mslp_hpa": None,
             "pressure_trend_hpa": None,
             "precip_1hr_mm": 0.0,
@@ -107,52 +113,66 @@ class WeatherLinkV2Client:
             "uv_index": None,
         }
 
-        # WeatherLink v2 splits data across multiple sensor objects (ISS, Barometer, Console/Live)
         for sensor in payload.get("sensors", []):
             data_records = sensor.get("data", [])
             if not data_records:
                 continue
             latest = data_records[0]
 
-            # Timestamp synchronization
             if "ts" in latest:
                 parsed["valid_time_utc"] = datetime.fromtimestamp(
                     latest["ts"], tz=timezone.utc
                 ).isoformat()
 
-            # Barometric Pressure Sensor (sensor_type 242 or barometer structure)
-            if "bar_sea_level" in latest and latest["bar_sea_level"] is not None:
-                parsed["mslp_hpa"] = inhg_to_hpa(latest.get("bar_sea_level"))
+            bar_sl = first_not_none(
+                latest.get("bar_sea_level"),
+                latest.get("bar_absolute"),
+                latest.get("bar"),
+            )
+            if bar_sl is not None:
+                parsed["mslp_hpa"] = inhg_to_hpa(bar_sl)
                 if latest.get("bar_trend") is not None:
                     parsed["pressure_trend_hpa"] = inhg_to_hpa(latest.get("bar_trend"))
 
-            # Vantage Pro2 External ISS Sensor Suite (sensor_type 37 / 43 / 45 / etc.)
             if "temp" in latest and latest.get("temp") is not None:
                 parsed["temp_c"] = f_to_c(latest.get("temp"))
                 parsed["dewpoint_c"] = f_to_c(latest.get("dew_point"))
                 parsed["wetbulb_c"] = f_to_c(latest.get("wet_bulb"))
                 parsed["rh_pct"] = latest.get("hum")
 
-                # Wind speed & direction (supports both Live & Logger field names)
-                w_spd = latest.get("wind_speed_avg_last_10_min") or latest.get("wind_speed_last")
-                w_gst = latest.get("wind_speed_hi_last_10_min") or latest.get("wind_gust_10_min")
-                w_dir = latest.get("wind_dir_scalar_avg_last_10_min") or latest.get("wind_dir_last")
+                w_spd = first_not_none(
+                    latest.get("wind_speed_avg_last_10_min"),
+                    latest.get("wind_speed_last"),
+                    0.0,
+                )
+                w_gst = first_not_none(
+                    latest.get("wind_speed_hi_last_10_min"),
+                    latest.get("wind_gust_10_min"),
+                    w_spd,
+                    0.0,
+                )
+                w_dir = first_not_none(
+                    latest.get("wind_dir_scalar_avg_last_10_min"),
+                    latest.get("wind_dir_last"),
+                    0.0,
+                )
 
-                parsed["wind_speed_ms"] = mph_to_ms(w_spd)
-                parsed["wind_gust_ms"] = mph_to_ms(w_gst)
-                parsed["wind_dir_deg"] = w_dir
+                parsed["wind_speed_ms"] = mph_to_ms(w_spd) or 0.0
+                parsed["wind_gust_ms"] = mph_to_ms(w_gst) or 0.0
+                parsed["wind_dir_deg"] = float(w_dir)
 
-                # Precipitation (handles either pre-scaled inches or raw counts * 0.01")
                 rain_1hr_in = latest.get("rainfall_last_60_min_in")
                 if rain_1hr_in is None and latest.get("rainfall_last_60_min") is not None:
-                    # If rain_size == 1 (0.01 in), convert clicks to inches
                     rain_1hr_in = latest["rainfall_last_60_min"] * 0.01
-                parsed["precip_1hr_mm"] = in_to_mm(rain_1hr_in or 0.0)
+                parsed["precip_1hr_mm"] = in_to_mm(rain_1hr_in or 0.0) or 0.0
 
-                rain_rate_in = latest.get("rain_rate_hi_in") or latest.get("rain_rate_last_in") or 0.0
-                parsed["precip_rate_mm_hr"] = in_to_mm(rain_rate_in)
+                rain_rate_in = first_not_none(
+                    latest.get("rain_rate_hi_in"),
+                    latest.get("rain_rate_last_in"),
+                    0.0,
+                )
+                parsed["precip_rate_mm_hr"] = in_to_mm(rain_rate_in) or 0.0
 
-                # Optional Solar / UV Sensors
                 parsed["solar_rad_wm2"] = latest.get("solar_rad")
                 parsed["uv_index"] = latest.get("uv_index")
 
@@ -169,7 +189,7 @@ def fetch_regional_reference_stations(stids: List[str] = ["CHWC1", "CAHC1"]) -> 
         "stid": ",".join(stids),
         "vars": "air_temp,relative_humidity,wind_speed,wind_gust,wind_direction,precip_accum_one_hour",
         "units": "metric",
-        "within": 90,  # Accept observations within the last 90 minutes
+        "within": 90,
         "token": SYNOPTIC_API_TOKEN
     }
     references: Dict[str, Dict[str, Any]] = {}
@@ -214,15 +234,12 @@ def compute_microclimate_diagnostics(
     chews = ref_obs.get("CHWC1", {})
     hastings = ref_obs.get("CAHC1", {})
 
-    # 1. Vertical Lapse Rate between Chews Ridge (1536m) and Tassajara (485m)
     if t_tass is not None and chews.get("temp_c") is not None:
         dz_km = (ELEV_CHEWS_RIDGE_M - ELEV_TASSAJARA_M) / 1000.0  # 1.051 km
-        # Standard meteorological convention: positive when cooling with height
         lapse_rate = -1.0 * (chews["temp_c"] - t_tass) / dz_km
         diagnostics["lapse_rate_chews_c_km"] = round(lapse_rate, 2)
         diagnostics["inversion_active"] = bool(lapse_rate < 0.0)
 
-        # Flag excessive daytime super-adiabatic heating (> +12.5 C/km indicates roof plume/shield fouling)
         if lapse_rate > 12.5 and (tass_obs.get("wind_speed_ms") or 0.0) < 1.5:
             diagnostics["qc_flag"] = "WARN_RADIATION_SHIELD_BIAS"
             diagnostics["qc_notes"].append(
@@ -230,14 +247,11 @@ def compute_microclimate_diagnostics(
                 "Stone Office roof thermal plume or radiation shield fouling suspected."
             )
 
-    # 2. Canyon Confinement Index vs. Hastings RAWS (546m)
     if t_tass is not None and hastings.get("temp_c") is not None:
-        # Adjust Hastings temperature by standard dry-adiabatic lapse (+0.60 C for 61m elevation diff)
         t_hastings_adj = hastings["temp_c"] + 0.60
         diff_c = round(t_tass - t_hastings_adj, 2)
         diagnostics["canyon_confinement_diff_c"] = diff_c
 
-    # 3. Rain Collector Clog Detection
     if (chews.get("precip_1hr_mm") or 0) > 2.5 and (hastings.get("precip_1hr_mm") or 0) > 2.0:
         if (tass_obs.get("precip_1hr_mm") or 0) == 0.0:
             diagnostics["qc_flag"] = "ERR_RAIN_GAUGE_CLOG"
