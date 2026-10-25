@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-backfill_and_train.py (v2)
+backfill_and_train.py (v3)
 Backfills historical observations from the Stone Office Davis Vantage Pro2
 using the WeatherLink v2 Historic API (Pro Tier, 24-hour chunking), pairs them
 with archived NWP hourly forecasts and Chews Ridge / Hastings reference series,
-trains the TassajaraMOSCorrector Gradient Boosted Tree ensemble, and saves
-models/tassajara_mos_v1.joblib.
+trains the TassajaraMOSCorrector Gradient Boosted Tree ensemble, saves
+models/tassajara_mos_v1.joblib, and populates mos_corrected_forecasts across
+both historical verification timestamps and the active 7-day NWS forecast.
 """
 
-import os
 import time
 import sqlite3
 import logging
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 import requests
 import numpy as np
@@ -35,7 +35,7 @@ from mos_model import TassajaraMOSCorrector
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("TassajaraBackfill")
 
@@ -50,6 +50,14 @@ HAST_LAT = 36.3886
 HAST_LON = -121.5514
 
 
+def first_not_none(*vals):
+    """Returns the first value that is not None (preserving 0 and 0.0)."""
+    for v in vals:
+        if v is not None and not pd.isna(v):
+            return v
+    return None
+
+
 def clean_num(val: Any, default: Optional[float] = None) -> Optional[float]:
     """Safely converts pandas/numpy values (including NaN/None) to Python float or default."""
     if val is None or pd.isna(val):
@@ -61,7 +69,7 @@ def clean_num(val: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
-    """Ensures all tables and the updated vw_mos_training_dataset view exist in SQLite."""
+    """Ensures all tables and the leak-free vw_mos_training_dataset view exist in SQLite."""
     Path("models").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
     with sqlite3.connect(db_path) as conn:
@@ -95,18 +103,27 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
                 COALESCE(r_chews.temp_c, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
                 COALESCE(r_hast.temp_c, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
-                COALESCE(o_issue.temp_c, o.temp_c) AS issue_tass_temp_c,
-                COALESCE(o_issue.temp_c - f.nws_temp_c, 0.0) AS issue_persistence_bias_c
+                COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
+                COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c
             FROM nws_forecasts f
             INNER JOIN local_observations o
                 ON f.valid_time_utc = o.valid_time_utc
             LEFT JOIN local_observations o_issue
                 ON f.issue_time_utc = o_issue.valid_time_utc
+            LEFT JOIN (
+                SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
+                FROM nws_forecasts
+                GROUP BY valid_time_utc
+            ) f_issue
+                ON f.issue_time_utc = f_issue.valid_time_utc
             LEFT JOIN reference_observations r_chews
-                ON f.valid_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
+                ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
             LEFT JOIN reference_observations r_hast
-                ON f.valid_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
-            WHERE o.qc_flag = 'OK' AND o.temp_c IS NOT NULL AND f.nws_temp_c IS NOT NULL;
+                ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+            WHERE o.qc_flag = 'OK'
+              AND o.temp_c IS NOT NULL
+              AND f.nws_temp_c IS NOT NULL
+              AND f.lead_time_hours >= 1;
             """
         )
         conn.commit()
@@ -115,12 +132,11 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
 def fetch_weatherlink_history(
     client: WeatherLinkV2Client,
     station_id: int,
-    days_back: int = 90
+    days_back: int = 90,
 ) -> pd.DataFrame:
     """
     Pulls historical archive records from WeatherLink v2 API (/v2/historic/{station_id}).
-    Iterates in 24-hour chunks and coerces all numeric columns to float64 to prevent
-    NoneType arithmetic errors on missing barometer or solar records.
+    Preserves zero wind speeds and merges barometric/solar records across sensor structures.
     """
     end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(days=days_back)
@@ -174,9 +190,9 @@ def fetch_weatherlink_history(
                             "dewpoint_c": None,
                             "wetbulb_c": None,
                             "rh_pct": None,
-                            "wind_speed_ms": None,
-                            "wind_gust_ms": None,
-                            "wind_dir_deg": None,
+                            "wind_speed_ms": 0.0,
+                            "wind_gust_ms": 0.0,
+                            "wind_dir_deg": 0.0,
                             "mslp_hpa": None,
                             "precip_1hr_mm": 0.0,
                             "solar_rad_wm2": None,
@@ -185,52 +201,59 @@ def fetch_weatherlink_history(
 
                     b = hourly_buckets[hr_iso]
 
-                    # Barometric sensor fields (supports all Davis logger / WLL archive keys)
-                    bar_sl = (
-                        rec.get("bar_sea_level")
-                        or rec.get("bar_sea_level_last")
-                        or rec.get("bar_final")
-                        or rec.get("bar_absolute")
-                        or rec.get("bar")
+                    bar_sl = first_not_none(
+                        rec.get("bar_sea_level"),
+                        rec.get("bar_sea_level_last"),
+                        rec.get("bar_final"),
+                        rec.get("bar_absolute"),
+                        rec.get("bar"),
                     )
                     if bar_sl is not None:
                         b["mslp_hpa"] = inhg_to_hpa(bar_sl)
 
-                    # ISS temperature / humidity / wind / rain archive fields
-                    t_f = rec.get("temp_last") or rec.get("temp_avg") or rec.get("temp")
+                    t_f = first_not_none(rec.get("temp_last"), rec.get("temp_avg"), rec.get("temp"))
                     if t_f is not None:
                         b["temp_c"] = f_to_c(t_f)
-                        dew_f = rec.get("dew_point_last") or rec.get("dew_point_avg") or rec.get("dew_point")
-                        wet_f = rec.get("wet_bulb_last") or rec.get("wet_bulb")
-                        hum = rec.get("hum_last") or rec.get("hum_avg") or rec.get("hum")
+                        dew_f = first_not_none(
+                            rec.get("dew_point_last"), rec.get("dew_point_avg"), rec.get("dew_point")
+                        )
+                        wet_f = first_not_none(
+                            rec.get("wet_bulb_last"), rec.get("wet_bulb_avg"), rec.get("wet_bulb")
+                        )
+                        hum = first_not_none(rec.get("hum_last"), rec.get("hum_avg"), rec.get("hum"))
 
                         b["dewpoint_c"] = f_to_c(dew_f)
                         b["wetbulb_c"] = f_to_c(wet_f)
                         b["rh_pct"] = hum
 
-                        w_spd = rec.get("wind_speed_avg") or rec.get("wind_speed_last")
-                        w_gst = rec.get("wind_speed_hi") or rec.get("wind_gust_10_min")
-                        w_dir = (
-                            rec.get("wind_dir_of_prevail")
-                            or rec.get("wind_dir_scalar_avg")
-                            or rec.get("wind_dir_last")
+                        w_spd = first_not_none(
+                            rec.get("wind_speed_avg"), rec.get("wind_speed_last"), 0.0
+                        )
+                        w_gst = first_not_none(
+                            rec.get("wind_speed_hi"), rec.get("wind_gust_10_min"), w_spd, 0.0
+                        )
+                        w_dir = first_not_none(
+                            rec.get("wind_dir_of_prevail"),
+                            rec.get("wind_dir_scalar_avg"),
+                            rec.get("wind_dir_last"),
+                            0.0,
                         )
 
-                        b["wind_speed_ms"] = mph_to_ms(w_spd)
-                        if w_gst is not None:
-                            gst_ms = mph_to_ms(w_gst)
-                            if gst_ms is not None:
-                                b["wind_gust_ms"] = max(b["wind_gust_ms"] or 0.0, gst_ms)
-                        b["wind_dir_deg"] = w_dir
+                        b["wind_speed_ms"] = mph_to_ms(w_spd) or 0.0
+                        gst_ms = mph_to_ms(w_gst) or 0.0
+                        b["wind_gust_ms"] = max(b["wind_gust_ms"] or 0.0, gst_ms)
+                        b["wind_dir_deg"] = float(w_dir)
 
                         rain_in = rec.get("rainfall_in")
                         if rain_in is None and rec.get("rainfall_clicks") is not None:
                             rain_in = rec["rainfall_clicks"] * 0.01
                         if rain_in:
-                            b["precip_1hr_mm"] = round((b["precip_1hr_mm"] or 0.0) + (in_to_mm(rain_in) or 0.0), 2)
+                            b["precip_1hr_mm"] = round(
+                                (b["precip_1hr_mm"] or 0.0) + (in_to_mm(rain_in) or 0.0), 2
+                            )
 
-                        sol = rec.get("solar_rad_avg") or rec.get("solar_rad")
-                        uv = rec.get("uv_index_avg") or rec.get("uv_index")
+                        sol = first_not_none(rec.get("solar_rad_avg"), rec.get("solar_rad"))
+                        uv = first_not_none(rec.get("uv_index_avg"), rec.get("uv_index"))
                         if sol is not None:
                             b["solar_rad_wm2"] = sol
                         if uv is not None:
@@ -254,20 +277,20 @@ def fetch_weatherlink_history(
 
     df = df.sort_values("valid_time_utc").reset_index(drop=True)
 
-    # Coerce all telemetry columns to float64 so None values become np.nan
     numeric_cols = [
         "temp_c", "dewpoint_c", "wetbulb_c", "rh_pct",
         "wind_speed_ms", "wind_gust_ms", "wind_dir_deg",
-        "mslp_hpa", "precip_1hr_mm", "solar_rad_wm2", "uv_index"
+        "mslp_hpa", "precip_1hr_mm", "solar_rad_wm2", "uv_index",
     ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Compute 3-hour barometric pressure trend safely on float64 series
     if "mslp_hpa" in df.columns and df["mslp_hpa"].notna().any():
-        df["pressure_trend_3hr_hpa"] = df["mslp_hpa"].ffill().diff(3).round(2).fillna(0.0)
+        df["mslp_hpa"] = df["mslp_hpa"].ffill().bfill().fillna(1013.25)
+        df["pressure_trend_3hr_hpa"] = df["mslp_hpa"].diff(3).round(2).fillna(0.0)
     else:
+        df["mslp_hpa"] = 1013.25
         df["pressure_trend_3hr_hpa"] = 0.0
 
     return df
@@ -277,8 +300,11 @@ def fetch_historical_nwp_and_references(days_back: int = 90) -> Dict[str, pd.Dat
     """
     Fetches archived hourly NWP forecasts for Tassajara and reference series
     for Chews Ridge (1,536m) and Hastings RAWS (546m).
+    Clamps all returned rows to valid_time_utc <= now_utc so future hours
+    never pollute historical backfill tables.
     """
-    end_date = datetime.now(timezone.utc).date()
+    now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    end_date = now_utc.date()
     start_date = end_date - timedelta(days=days_back)
 
     def _pull_point(lat: float, lon: float, elev: float) -> pd.DataFrame:
@@ -299,7 +325,8 @@ def fetch_historical_nwp_and_references(days_back: int = 90) -> Dict[str, pd.Dat
         try:
             resp = requests.get(
                 "https://historical-forecast-api.open-meteo.com/v1/forecast",
-                params=params, timeout=30
+                params=params,
+                timeout=30,
             )
             resp.raise_for_status()
         except Exception:
@@ -311,7 +338,8 @@ def fetch_historical_nwp_and_references(days_back: int = 90) -> Dict[str, pd.Dat
             )
             resp = requests.get(
                 "https://archive-api.open-meteo.com/v1/archive",
-                params=fallback_params, timeout=30
+                params=fallback_params,
+                timeout=30,
             )
             resp.raise_for_status()
 
@@ -319,7 +347,10 @@ def fetch_historical_nwp_and_references(days_back: int = 90) -> Dict[str, pd.Dat
         df = pd.DataFrame(h)
         if "precipitation_probability" not in df.columns:
             df["precipitation_probability"] = 0.0
-        df["valid_time_utc"] = pd.to_datetime(df["time"], utc=True).map(lambda x: x.isoformat())
+        dt_series = pd.to_datetime(df["time"], utc=True)
+        df["valid_time_utc"] = dt_series.map(lambda x: x.isoformat())
+        # Clamp strictly to past/present hours (<= now_utc)
+        df = df[dt_series <= now_utc].reset_index(drop=True)
         return df
 
     logger.info("Fetching archived NWP hourly forecasts for Tassajara grid cell...")
@@ -335,10 +366,30 @@ def fetch_historical_nwp_and_references(days_back: int = 90) -> Dict[str, pd.Dat
 def store_backfill_to_sqlite(
     obs_df: pd.DataFrame,
     nwp_dict: Dict[str, pd.DataFrame],
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
 ) -> None:
     """Writes historical observations, reference stations, and NWP forecasts to SQLite."""
+    now_iso = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+
     with sqlite3.connect(db_path) as conn:
+        # Remove any future-dated backfill artifacts that could hijack MAX(issue_time_utc)
+        conn.execute(
+            """
+            DELETE FROM nws_forecasts
+            WHERE short_forecast = 'Archived NWP Grid' AND valid_time_utc > ?
+            """,
+            (now_iso,),
+        )
+        conn.execute(
+            """
+            DELETE FROM mos_corrected_forecasts
+            WHERE issue_time_utc IN (
+                SELECT issue_time_utc FROM mos_corrected_forecasts
+                GROUP BY issue_time_utc HAVING COUNT(*) < 10
+            )
+            """
+        )
+
         obs_rows = [
             (
                 str(r["valid_time_utc"]),
@@ -403,28 +454,31 @@ def store_backfill_to_sqlite(
         for _, r in tass_nwp.iterrows():
             if pd.isna(r["temperature_2m"]):
                 continue
-            valid_dt = pd.to_datetime(r["valid_time_utc"])
+            valid_dt = pd.to_datetime(r["valid_time_utc"], utc=True)
             for lead_hr in (6, 12):
                 issue_iso = (valid_dt - timedelta(hours=lead_hr)).isoformat()
-                fc_rows.append((
-                    issue_iso,
-                    str(r["valid_time_utc"]),
-                    lead_hr,
-                    round(float(r["temperature_2m"]), 2),
-                    round(float(r["dew_point_2m"]), 2) if pd.notna(r["dew_point_2m"]) else None,
-                    round(float(r["relative_humidity_2m"]), 1) if pd.notna(r["relative_humidity_2m"]) else 50.0,
-                    round(float(r["wind_speed_10m"]), 2) if pd.notna(r["wind_speed_10m"]) else 0.0,
-                    round(float(r["wind_gusts_10m"]), 2) if pd.notna(r["wind_gusts_10m"]) else 0.0,
-                    round(float(r["wind_direction_10m"]), 1) if pd.notna(r["wind_direction_10m"]) else 0.0,
-                    clean_num(r.get("precipitation_probability"), 0.0),
-                    clean_num(r.get("precipitation"), 0.0),
-                    clean_num(r.get("cloud_cover"), 20.0),
-                    "Archived NWP Grid",
-                ))
+                fc_rows.append(
+                    (
+                        issue_iso,
+                        str(r["valid_time_utc"]),
+                        lead_hr,
+                        round(float(r["temperature_2m"]), 2),
+                        round(float(r["dew_point_2m"]), 2) if pd.notna(r["dew_point_2m"]) else None,
+                        round(float(r["relative_humidity_2m"]), 1) if pd.notna(r["relative_humidity_2m"]) else 50.0,
+                        round(float(r["wind_speed_10m"]), 2) if pd.notna(r["wind_speed_10m"]) else 0.0,
+                        round(float(r["wind_gusts_10m"]), 2) if pd.notna(r["wind_gusts_10m"]) else 0.0,
+                        round(float(r["wind_direction_10m"]), 1) if pd.notna(r["wind_direction_10m"]) else 0.0,
+                        clean_num(r.get("precipitation_probability"), 0.0),
+                        clean_num(r.get("precipitation"), 0.0),
+                        clean_num(r.get("cloud_cover"), 20.0),
+                        "Archived NWP Grid",
+                    )
+                )
 
+        # Use INSERT OR IGNORE so real operational NWS forecasts are never overwritten by archived NWP
         conn.executemany(
             """
-            INSERT OR REPLACE INTO nws_forecasts (
+            INSERT OR IGNORE INTO nws_forecasts (
                 issue_time_utc, valid_time_utc, lead_time_hours,
                 nws_temp_c, nws_dewpoint_c, nws_rh_pct,
                 nws_wind_speed_ms, nws_wind_gust_ms, nws_wind_dir_deg,
@@ -440,28 +494,142 @@ def store_backfill_to_sqlite(
     )
 
 
+def populate_mos_verification_and_active_forecasts(
+    corrector: TassajaraMOSCorrector,
+    train_df: pd.DataFrame,
+    db_path: str = DB_PATH,
+) -> None:
+    """
+    Populates mos_corrected_forecasts across:
+    1. All paired historical verification timestamps in train_df, and
+    2. The latest complete operational NWS 7-day forecast batch.
+    """
+    hist_preds = corrector.predict(train_df)
+    hist_rows = [
+        (
+            str(r["issue_time_utc"]),
+            str(r["valid_time_utc"]),
+            "MOS_GBM_v1",
+            float(r["nws_temp_c"]),
+            float(r["pred_temp_error_c"]),
+            float(r["corrected_temp_c"]),
+            float(r["corrected_temp_p10_c"]),
+            float(r["corrected_temp_p90_c"]),
+            clean_num(train_df.loc[idx, "nws_rh_pct"], 50.0),
+            round(clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) * 1.35, 2),
+        )
+        for idx, r in hist_preds.iterrows()
+    ]
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO mos_corrected_forecasts (
+                issue_time_utc, valid_time_utc, model_version,
+                raw_nws_temp_c, pred_temp_error_c, corrected_temp_c,
+                corrected_temp_p10_c, corrected_temp_p90_c,
+                corrected_rh_pct, corrected_wind_gust_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            hist_rows,
+        )
+
+        # Also score the latest full operational NWS forecast (>= 48 hours)
+        latest_fc_df = pd.read_sql_query(
+            """
+            SELECT * FROM nws_forecasts
+            WHERE issue_time_utc = (
+                SELECT issue_time_utc
+                FROM nws_forecasts
+                WHERE short_forecast != 'Archived NWP Grid' OR short_forecast IS NULL
+                GROUP BY issue_time_utc
+                HAVING COUNT(*) >= 48
+                ORDER BY issue_time_utc DESC
+                LIMIT 1
+            )
+            ORDER BY valid_time_utc ASC
+            """,
+            conn,
+        )
+        if not latest_fc_df.empty:
+            obs_latest = pd.read_sql_query(
+                "SELECT * FROM local_observations WHERE temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1",
+                conn,
+            )
+            chews_latest = pd.read_sql_query(
+                "SELECT * FROM reference_observations WHERE station_id = 'CHWC1' AND temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1",
+                conn,
+            )
+            tass_t = float(obs_latest.iloc[0]["temp_c"]) if not obs_latest.empty else float(latest_fc_df["nws_temp_c"].iloc[0])
+            ptrend = clean_num(obs_latest.iloc[0].get("pressure_trend_3hr_hpa"), 0.0) if not obs_latest.empty else 0.0
+            chews_t = float(chews_latest.iloc[0]["temp_c"]) if not chews_latest.empty else (tass_t + 2.0)
+
+            latest_fc_df["pressure_trend_3hr_hpa"] = ptrend
+            latest_fc_df["issue_chews_temp_c"] = chews_t
+            latest_fc_df["issue_tass_temp_c"] = tass_t
+            latest_fc_df["issue_persistence_bias_c"] = tass_t - float(latest_fc_df["nws_temp_c"].iloc[0])
+
+            fut_preds = corrector.predict(latest_fc_df)
+            fut_rows = [
+                (
+                    str(r["issue_time_utc"]),
+                    str(r["valid_time_utc"]),
+                    "MOS_GBM_v1",
+                    float(r["nws_temp_c"]),
+                    float(r["pred_temp_error_c"]),
+                    float(r["corrected_temp_c"]),
+                    float(r["corrected_temp_p10_c"]),
+                    float(r["corrected_temp_p90_c"]),
+                    clean_num(latest_fc_df.loc[idx, "nws_rh_pct"], 50.0),
+                    round(clean_num(latest_fc_df.loc[idx, "nws_wind_speed_ms"], 0.0) * 1.35, 2),
+                )
+                for idx, r in fut_preds.iterrows()
+            ]
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO mos_corrected_forecasts (
+                    issue_time_utc, valid_time_utc, model_version,
+                    raw_nws_temp_c, pred_temp_error_c, corrected_temp_c,
+                    corrected_temp_p10_c, corrected_temp_p90_c,
+                    corrected_rh_pct, corrected_wind_gust_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                fut_rows,
+            )
+        conn.commit()
+    logger.info(f"Populated {len(hist_rows)} historical MOS verification rows in mos_corrected_forecasts.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backfill WeatherLink Pro history and train MOS model.")
     parser.add_argument("--days", type=int, default=90, help="Number of past days to backfill (default: 90)")
+    parser.add_argument(
+        "--skip-fetch",
+        action="store_true",
+        help="Train model and backfill MOS verification using existing SQLite rows without calling external APIs.",
+    )
     args = parser.parse_args()
 
     ensure_schema_and_view(DB_PATH)
 
-    wl_client = WeatherLinkV2Client(WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET)
-    station_id = wl_client.get_station_id()
-
-    obs_df = fetch_weatherlink_history(wl_client, station_id, days_back=args.days)
-    if obs_df.empty:
-        raise RuntimeError(
-            "No historical observations returned. Verify that your WeatherLink Pro subscription "
-            "is linked to station 36966."
-        )
-
-    nwp_dict = fetch_historical_nwp_and_references(days_back=args.days)
-    store_backfill_to_sqlite(obs_df, nwp_dict, DB_PATH)
+    if not args.skip_fetch:
+        try:
+            wl_client = WeatherLinkV2Client(WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET)
+            station_id = wl_client.get_station_id()
+            obs_df = fetch_weatherlink_history(wl_client, station_id, days_back=args.days)
+            nwp_dict = fetch_historical_nwp_and_references(days_back=args.days)
+            if not obs_df.empty:
+                store_backfill_to_sqlite(obs_df, nwp_dict, DB_PATH)
+            else:
+                logger.warning("WeatherLink Historic API returned 0 rows; proceeding with existing SQLite observations.")
+        except Exception as exc:
+            logger.warning(f"Live backfill API fetch encountered an error ({exc}); checking existing SQLite archive...")
 
     with sqlite3.connect(DB_PATH) as conn:
-        train_df = pd.read_sql_query("SELECT * FROM vw_mos_training_dataset ORDER BY valid_time_utc ASC", conn)
+        train_df = pd.read_sql_query(
+            "SELECT * FROM vw_mos_training_dataset ORDER BY valid_time_utc ASC",
+            conn,
+        )
 
     logger.info(f"Loaded {len(train_df)} aligned training pairs from vw_mos_training_dataset.")
     if len(train_df) < 100:
@@ -470,6 +638,8 @@ def main():
     corrector = TassajaraMOSCorrector()
     metrics = corrector.fit_and_evaluate(train_df)
     corrector.save(str(MODEL_PATH))
+
+    populate_mos_verification_and_active_forecasts(corrector, train_df, DB_PATH)
 
     logger.info("==========================================================")
     logger.info("TASSAJARA MOS PRODUCTION MODEL TRAINED SUCCESSFULLY!")
