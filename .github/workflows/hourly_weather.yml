@@ -1,51 +1,140 @@
-name: Hourly Tassajara Weather MOS Pipeline
+name: Tassajara Hourly Microclimate & MOS Pipeline
+
 on:
   schedule:
+    # Runs at minute 05 of every hour UTC (after top-of-hour Davis VP2 & RAWS logger commits)
     - cron: "5 * * * *"
   workflow_dispatch:
+    inputs:
+      run_backfill:
+        description: "Run 90-day historical backfill & retrain MOS ensemble (backfill_and_train.py)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      backfill_days:
+        description: "Number of historical days to backfill"
+        required: false
+        default: "90"
+        type: string
+
+# Serialize workflow runs so scheduled cron jobs and manual dispatches never race on git push
+concurrency:
+  group: tassajara-mos-sqlite-pipeline
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  update-weather:
+  ingest-forecast-verify:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    timeout-minutes: 25
 
-      - name: Set up Python
+    env:
+      WL_API_KEY: ${{ secrets.WL_API_KEY }}
+      WL_API_SECRET: ${{ secrets.WL_API_SECRET }}
+      SYNOPTIC_TOKEN: ${{ secrets.SYNOPTIC_TOKEN }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+      TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+      TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+      ALERT_SMS_TO_NUMBER: ${{ secrets.ALERT_SMS_TO_NUMBER }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository (main branch)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install scientific & meteorological dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Backfill 90 Days of WeatherLink Pro Data & Train Model (Runs Only If Model Missing)
-        env:
-          WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
-          WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
+      - name: Backfill Historical Observations & Train MOS Ensemble (If Requested or Model Missing)
         run: |
-          if [ ! -f "models/tassajara_mos_v1.joblib" ]; then
-            echo "Trained MOS model not found. Running 90-day WeatherLink Pro backfill & training..."
+          mkdir -p models logs
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_backfill }}" = "true" ]; then
+            echo "Manual dispatch requested historical backfill (${{ inputs.backfill_days }} days) & MOS training..."
+            python backfill_and_train.py --days "${{ inputs.backfill_days }}"
+          elif [ ! -f "models/tassajara_mos_v1.joblib" ]; then
+            echo "Production model weights (models/tassajara_mos_v1.joblib) not found; running backfill_and_train.py..."
             python backfill_and_train.py --days 90
           else
-            echo "Trained MOS model (models/tassajara_mos_v1.joblib) already active."
+            # Verify that historical paired rows in SQLite have MOS verification scores populated
+            python -c "
+          import sqlite3
+          conn = sqlite3.connect('tassajara_weather.db')
+          cur = conn.cursor()
+          cur.execute('''
+              SELECT COUNT(*) FROM local_observations o
+              INNER JOIN mos_corrected_forecasts m ON o.valid_time_utc = m.valid_time_utc
+              WHERE o.temp_c IS NOT NULL
+          ''')
+          paired_mos = cur.fetchone()[0]
+          print(f'Active paired MOS verification rows: {paired_mos}')
+          if paired_mos < 48:
+              raise SystemExit(1)
+          " || python backfill_and_train.py --skip-fetch
           fi
 
-      - name: Run Tassajara MOS Pipeline
-        env:
-          WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
-          WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
-        run: python run_hourly_mos_pipeline.py
-
-      - name: Save Updated Database & Model Back to Repository
+      - name: Execute Hourly Telemetry Ingest, NWS Forecast & MOS Correction
         run: |
-          git config user.name "Tassajara Weather Bot"
-          git config user.email "weather-bot@tassajara.local"
-          git add tassajara_weather.db models/
-          git diff --staged --quiet || (git commit -m "Hourly weather & MOS model update" && git push)
+          python run_hourly_mos_pipeline.py
+
+      - name: Checkpoint SQLite WAL & Verify Database Integrity
+        run: |
+          python -c "
+          import sqlite3
+          with sqlite3.connect('tassajara_weather.db') as conn:
+              conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+              conn.execute('VACUUM;')
+              obs_cnt = conn.execute('SELECT COUNT(*) FROM local_observations WHERE temp_c IS NOT NULL').fetchone()[0]
+              fc_cnt = conn.execute('SELECT COUNT(*) FROM nws_forecasts').fetchone()[0]
+              mos_cnt = conn.execute('SELECT COUNT(*) FROM mos_corrected_forecasts').fetchone()[0]
+              print(f'SQLite Integrity Verified -> Obs: {obs_cnt} | NWS: {fc_cnt} | MOS: {mos_cnt}')
+          "
+
+      - name: Commit and Push Updated SQLite Database & MOS Model Weights
+        run: |
+          git config user.name "tassajara-mos-bot"
+          git config user.email "weather-eng@sfzc.org"
+
+          git add tassajara_weather.db
+          if [ -f "models/tassajara_mos_v1.joblib" ]; then
+            git add -f models/tassajara_mos_v1.joblib
+          fi
+
+          if git diff --staged --quiet; then
+            echo "No changes to tassajara_weather.db or models/tassajara_mos_v1.joblib."
+            exit 0
+          fi
+
+          TIMESTAMP_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git commit -m "chore(telemetry): update tassajara_weather.db and MOS weights [${TIMESTAMP_UTC}] [skip ci]"
+
+          # Atomic rebase-retry loop to prevent race conditions against concurrent commits on main
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Successfully pushed updated database and model weights on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected on attempt ${attempt}; fetching and rebasing..."
+            git fetch origin main
+            git rebase -X theirs origin/main
+            sleep 2
+          done
+
+          echo "Failed to push after 3 attempts."
+          exit 1
