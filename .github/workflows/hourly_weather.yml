@@ -30,7 +30,7 @@ jobs:
           WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
           WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
         run: |
-          if [ ! -f "models/tassajara_mos_v1.joblib" ]; then
+          #if [ ! -f "models/tassajara_mos_v1.joblib" ]; then
             echo "Trained MOS model not found. Running 90-day WeatherLink Pro backfill & training..."
             python backfill_and_train.py --days 90
           else
