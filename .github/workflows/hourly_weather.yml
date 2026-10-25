@@ -25,12 +25,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Backfill 90 Days of WeatherLink Pro Data & Train Model
+      - name: Backfill 90 Days of WeatherLink Pro Data & Train Model (Runs Only If Model Missing)
         env:
           WL_API_KEY: "tigkhjhsweahdrae2cl0uenfuws3kv8k"
           WL_API_SECRET: "ffnphp69pdbsqwsahkdewvctewmxagwt"
         run: |
-          python backfill_and_train.py --days 90
+          if [ ! -f "models/tassajara_mos_v1.joblib" ]; then
+            echo "Trained MOS model not found. Running 90-day WeatherLink Pro backfill & training..."
+            python backfill_and_train.py --days 90
+          else
+            echo "Trained MOS model (models/tassajara_mos_v1.joblib) already active."
+          fi
 
       - name: Run Tassajara MOS Pipeline
         env:
