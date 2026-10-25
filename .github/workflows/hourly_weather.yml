@@ -34,6 +34,7 @@ jobs:
     timeout-minutes: 25
 
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       WL_API_KEY: ${{ secrets.WL_API_KEY }}
       WL_API_SECRET: ${{ secrets.WL_API_SECRET }}
       SYNOPTIC_TOKEN: ${{ secrets.SYNOPTIC_TOKEN }}
