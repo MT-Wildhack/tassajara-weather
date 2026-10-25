@@ -3,6 +3,7 @@
 app.py — Tassajara Zen Mountain Center Meteorological & MOS Forecast Monitor
 Publication-grade scientific monitoring suite for Station 36966 (Stone Office Vantage Pro2),
 Chews Ridge (CHWC1) & Hastings (CAHC1) boundary references, and MOS ensemble verification.
+Includes comprehensive meteorological and statistical hover tooltips across all readouts and tables.
 """
 
 import math
@@ -672,28 +673,53 @@ if not obs_df.empty:
 
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     r1c1.metric(
-        "Dry-Bulb Air Temperature",
+        "Stone Office Temperature",
         f"{temp_f:.1f} °F ({temp_c:.1f} °C)",
         f"24h Extremes: {lo_24_f:.1f}°F / {hi_24_f:.1f}°F",
         delta_color="off",
+        help=(
+            "Ambient dry-bulb air temperature measured inside the aspirated radiation shield on the Stone Office "
+            "roof gable (485 m / 1,590 ft MSL; 4.5 m AGL). Nocturnal minima are strongly governed by katabatic "
+            "cold-air drainage down Tassajara Creek Canyon, whereas afternoon maxima reflect early topographic "
+            "shadowing by the southwestern Pine Ridge / Black Cone wall."
+        ),
     )
     r1c2.metric(
         "Relative Humidity & Dewpoint",
         f"{rh_pct:.0f} % RH",
         f"Dewpoint: {dew_f:.1f} °F ({dew_c:.1f} °C)",
         delta_color="off",
+        help=(
+            "Relative Humidity (RH %) expresses the ratio of actual water vapor partial pressure to saturation "
+            "vapor pressure at the current dry-bulb temperature. Dewpoint temperature is the thermodynamic "
+            "temperature to which air must be cooled at constant pressure and water vapor content to reach saturation "
+            "(100% RH), serving as an absolute indicator of boundary-layer moisture."
+        ),
     )
     r1c3.metric(
         "Wet-Bulb & Vapor Pressure Deficit",
         f"{wetbulb_f:.1f} °F WB",
         f"VPD: {vpd_kpa:.2f} kPa ({'Arid' if vpd_kpa >= 1.6 else 'Moist/Moderate'})",
         delta_color="off",
+        help=(
+            "Psychrometric wet-bulb temperature (computed via Stull's 2011 formulation) represents the lowest "
+            "temperature attainable through evaporative cooling and governs precipitation phase and human thermal "
+            "stress. Vapor Pressure Deficit (VPD, in kilopascals) is the difference between saturation vapor pressure "
+            "(es) and actual vapor pressure (ea); VPD values exceeding 1.6 kPa indicate high atmospheric evaporative "
+            "demand and accelerated fine-fuel desiccation."
+        ),
     )
     r1c4.metric(
         "Anemometer Wind Vector",
         f"{wind_spd_mph:.1f} mph ({wind_card})",
         f"10m Peak Gust: {wind_gst_mph:.1f} mph",
         delta_color="off",
+        help=(
+            "10-minute sustained scalar wind speed, prevailing cardinal direction, and peak 3-second wind gust "
+            "recorded above the Stone Office gable. Local flow is topographically channeled along the ESE–WNW "
+            "(115°–295°) axis of Tassajara Creek Canyon, alternating between daytime up-canyon anabatic breezes "
+            "and nocturnal down-canyon katabatic drainage."
+        ),
     )
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
@@ -702,24 +728,48 @@ if not obs_df.empty:
         f"{mslp_inhg:.2f} inHg ({mslp_hpa:.1f} hPa)",
         ptrend_label,
         delta_color="off",
+        help=(
+            "Altimeter-reduced Mean Sea-Level Pressure (MSLP, in inches of mercury and hectopascals) and the "
+            "3-hour barometric tendency (ΔP/3h). Rapidly falling pressure (ΔP < -1.5 hPa/3h) signals approaching "
+            "extraterropical cyclonic troughing or frontal passage; rising pressure indicates post-frontal "
+            "subsidence and synoptic ridging."
+        ),
     )
     r2c2.metric(
         "Precipitation Accumulation (24h)",
         f"{rain_24_in:.2f} in ({rain_24_mm:.1f} mm)",
         f"1-Hr Rate: {last_hr_rain:.2f} in/hr",
         delta_color="off",
+        help=(
+            "Cumulative liquid-equivalent precipitation recorded over the past 24 hours by the 0.01-inch "
+            "(0.254 mm) resolution tipping-bucket rain collector on the Stone Office roof, paired with the "
+            "most recent 60-minute rainfall accumulation rate."
+        ),
     )
     r2c3.metric(
         "Vertical Lapse Rate (CHWC1 → TZMC)",
         lapse_str,
         stability_state,
         delta_color="off",
+        help=(
+            "Environmental temperature lapse rate (Γ = -ΔT/Δz, in °C/km) computed across the 1,051 m vertical "
+            "column between Chews Ridge RAWS (CHWC1, 1,536 m MSL) and Tassajara Stone Office (485 m MSL). "
+            "Negative values (Γ < 0 °C/km) indicate a surface-based thermal inversion where cold air is trapped "
+            "on the canyon floor beneath warmer ridge air; values approaching +9.8 °C/km indicate dry-adiabatic "
+            "vertical mixing and momentum transfer from ridge level."
+        ),
     )
     r2c4.metric(
         "Canyon Thermal Confinement",
         confinement_str,
         ref_sub_str,
         delta_color="off",
+        help=(
+            "Horizontal thermal anomaly (ΔT) between Tassajara Stone Office (485 m) and Hastings Natural History "
+            "Reservation RAWS (CAHC1, 546 m MSL in open Upper Carmel Valley). Strongly negative nocturnal values "
+            "quantify the intensity of local cold-air pool (CAP) confinement inside the steep Ventana Wilderness "
+            "gorge relative to unconstrained valley terrain at comparable elevation."
+        ),
     )
 
 st.markdown("---")
@@ -735,6 +785,10 @@ with ver_hdr_col2:
         "Verification Evaluation Window",
         options=["Past 24 Hours", "Past 72 Hours", "Past 7 Days (168h)", "Full Historical Archive"],
         index=1,
+        help=(
+            "Selects the temporal sample window of paired hourly observations and hindcasts used to compute "
+            "verification error statistics (MAE, RMSE, Mean Bias, Skill Score, and Quantile Coverage)."
+        ),
     )
 
 if not verify_df.empty and len(verify_df) >= 3:
@@ -779,30 +833,59 @@ if not verify_df.empty and len(verify_df) >= 3:
         f"± {nws_mae_f:.2f} °F",
         f"RMSE: ± {nws_rmse_f:.2f} °F | Bias: {nws_bias_f:+.2f} °F",
         delta_color="off",
+        help=(
+            "Mean Absolute Error (MAE = N⁻¹ Σ|F_nws - O|) of the uncorrected 2.5 km National Digital Forecast "
+            "Database (NDFD / NWS MTR) grid cell over the selected evaluation window. Because the regional NWP "
+            "terrain model smooths the Santa Lucia Mountains to ~880 m MSL, raw grid forecasts systematically "
+            "underpredict Tassajara's nocturnal cold-air pooling and afternoon canyon shadow cooling."
+        ),
     )
     s2.metric(
         "Tassajara MOS Error (MAE)",
         f"± {mos_mae_f:.2f} °F",
         f"{mos_mae_f - nws_mae_f:+.2f} °F MAE vs Raw NWP",
         delta_color="inverse",
+        help=(
+            "Mean Absolute Error (MAE = N⁻¹ Σ|F_mos - O|) of the Tassajara Model Output Statistics (MOS) "
+            "HistGradientBoosting ensemble after correcting for solar geometry, Black Cone ridge horizon shading, "
+            "along-canyon wind components, and Chews Ridge vertical stability. Lower values indicate superior "
+            "point-forecast accuracy at the Stone Office sensor."
+        ),
     )
     s3.metric(
         "MOS RMSE Skill Score",
         f"{skill_pct:+.1f} %",
         f"MOS RMSE: ± {mos_rmse_f:.2f} °F (Bias: {mos_bias_f:+.2f} °F)",
         delta_color="normal" if skill_pct >= 0 else "inverse",
+        help=(
+            "Root Mean Squared Error Skill Score defined as SS_RMSE = (1 - RMSE_mos / RMSE_nws) × 100%. "
+            "Because RMSE squares individual hourly residuals prior to averaging, it heavily penalizes large "
+            "outlier errors during extreme frost or heat events. Positive percentages quantify the percentage "
+            "reduction in RMSE achieved by the MOS ensemble over raw NWS guidance."
+        ),
     )
     s4.metric(
         "Hourly Win Frequency",
         f"{win_rate_pct:.1f} % ({hours_mos_won}/{total_eval_hrs}h)",
         f"Evaluated over {total_eval_hrs} paired hours",
         delta_color="off",
+        help=(
+            "Percentage of verified hourly timestamps in which the absolute residual of the Tassajara MOS "
+            "forecast was less than or equal to the absolute residual of the raw NWS grid forecast "
+            "(|F_mos - O| ≤ |F_nws - O|)."
+        ),
     )
     s5.metric(
         "P10–P90 Interval Coverage",
         f"{in_bounds:.1f} %",
         f"Nominal 80% Quantile Envelope",
         delta_color="off",
+        help=(
+            "Empirical calibration coverage of the probabilistic MOS quantile regression bounds, measuring "
+            "the percentage of observed Stone Office temperatures that fell within the predicted 10th-to-90th "
+            "percentile interval [P10, P90]. A well-calibrated 80% prediction interval exhibits empirical "
+            "coverage near 80%."
+        ),
     )
 
     with st.expander(f"Inspect Paired Hourly Verification Table & Residual Diagnostics ({total_eval_hrs} Hours)", expanded=False):
@@ -820,7 +903,60 @@ if not verify_df.empty and len(verify_df) >= 3:
             "|MOS| Gain (°F)": (v_sub["nws_abs_err_f"] - v_sub["mos_abs_err_f"]).round(2),
             "Superior Model": np.where(v_sub["mos_abs_err_f"] <= v_sub["nws_abs_err_f"], "Tassajara MOS", "Raw NWS"),
         }).iloc[::-1].reset_index(drop=True)
-        st.dataframe(ver_table, use_container_width=True, hide_index=True)
+
+        st.dataframe(
+            ver_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Valid Time (Local)": st.column_config.TextColumn(
+                    "Valid Time (Local)",
+                    help="Top-of-the-hour verification timestamp in local Pacific Time (America/Los_Angeles).",
+                ),
+                "Lead (hr)": st.column_config.NumberColumn(
+                    "Lead (hr)",
+                    help="Forecast projection lead time (in hours) elapsed between model initialization and valid time.",
+                ),
+                "Actual (°F)": st.column_config.NumberColumn(
+                    "Actual (°F)",
+                    format="%.1f °F",
+                    help="Ground-truth dry-bulb temperature recorded by the Stone Office Davis Vantage Pro2 ISS.",
+                ),
+                "MOS Forecast (°F)": st.column_config.NumberColumn(
+                    "MOS Forecast (°F)",
+                    format="%.1f °F",
+                    help="Tassajara MOS ensemble mean temperature prediction for the valid hour.",
+                ),
+                "MOS [P10, P90] (°F)": st.column_config.TextColumn(
+                    "MOS [P10, P90] (°F)",
+                    help="Predicted 10th and 90th percentile uncertainty bounds (80% confidence interval) from pinball-loss quantile regression.",
+                ),
+                "Raw NWS/NWP (°F)": st.column_config.NumberColumn(
+                    "Raw NWS/NWP (°F)",
+                    format="%.1f °F",
+                    help="Uncorrected baseline grid point temperature forecast from the National Weather Service / NWP archive.",
+                ),
+                "MOS Residual (°F)": st.column_config.NumberColumn(
+                    "MOS Residual (°F)",
+                    format="%+.2f °F",
+                    help="Signed forecast error of the Tassajara MOS model (F_mos - Actual). Negative values indicate cold bias; positive values indicate warm bias.",
+                ),
+                "NWS Residual (°F)": st.column_config.NumberColumn(
+                    "NWS Residual (°F)",
+                    format="%+.2f °F",
+                    help="Signed forecast error of the raw NWS grid forecast (F_nws - Actual).",
+                ),
+                "|MOS| Gain (°F)": st.column_config.NumberColumn(
+                    "|MOS| Gain (°F)",
+                    format="%+.2f °F",
+                    help="Absolute error reduction achieved by MOS over Raw NWS (|Error_nws| - |Error_mos|). Positive values denote MOS accuracy gain.",
+                ),
+                "Superior Model": st.column_config.TextColumn(
+                    "Superior Model",
+                    help="Indicates which forecast system achieved the smaller absolute temperature residual for the given hour.",
+                ),
+            },
+        )
 else:
     st.warning(
         "No paired observation-forecast records found in tassajara_weather.db. "
@@ -840,6 +976,10 @@ with ctrl_col2:
         "Timeline Horizon",
         options=["72h Forecast + Past 48h Hindcast", "7-Day Forecast + Past 72h Hindcast"],
         index=0,
+        help=(
+            "Controls the temporal span of the 3-panel interactive meteogram, combining historical verification "
+            "hindcasts (left of the vertical initialization line) with future operational forecasts (right)."
+        ),
     )
 
 if not future_fc_df.empty or not verify_df.empty:
@@ -1211,4 +1351,68 @@ if not future_fc_df.empty:
         }
     )
 
-    st.dataframe(display_daily, use_container_width=True, hide_index=True)
+    st.dataframe(
+        display_daily,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Date": st.column_config.TextColumn(
+                "Date",
+                help="Local calendar date (America/Los_Angeles) for the 24-hour diurnal aggregation period.",
+            ),
+            "MOS High (°F)": st.column_config.NumberColumn(
+                "MOS High (°F)",
+                format="%.1f °F",
+                help="Daily maximum dry-bulb temperature predicted by the Tassajara MOS ensemble mean, accounting for afternoon canyon wall shadowing.",
+            ),
+            "MOS Low (°F)": st.column_config.NumberColumn(
+                "MOS Low (°F)",
+                format="%.1f °F",
+                help="Daily minimum dry-bulb temperature predicted by the Tassajara MOS ensemble mean under nocturnal katabatic drainage.",
+            ),
+            "P10 Floor (°F)": st.column_config.NumberColumn(
+                "P10 Floor (°F)",
+                format="%.1f °F",
+                help="10th-percentile quantile regression lower bound for daily minimum temperature. Used as the conservative operational threshold for hard-freeze pipe protection (≤ 32.0 °F).",
+            ),
+            "P90 Ceiling (°F)": st.column_config.NumberColumn(
+                "P90 Ceiling (°F)",
+                format="%.1f °F",
+                help="90th-percentile quantile regression upper bound for daily maximum temperature under clear-sky super-adiabatic heating.",
+            ),
+            "Raw NWS High (°F)": st.column_config.NumberColumn(
+                "Raw NWS High (°F)",
+                format="%.1f °F",
+                help="Uncorrected daily maximum temperature from the baseline 2.5 km National Weather Service (NDFD) grid forecast.",
+            ),
+            "Raw NWS Low (°F)": st.column_config.NumberColumn(
+                "Raw NWS Low (°F)",
+                format="%.1f °F",
+                help="Uncorrected daily minimum temperature from the baseline 2.5 km National Weather Service (NDFD) grid forecast.",
+            ),
+            "Max PoP (%)": st.column_config.NumberColumn(
+                "Max PoP (%)",
+                format="%d %%",
+                help="Maximum hourly Probability of Precipitation (≥ 0.01 inch) during the 24-hour calendar day.",
+            ),
+            "QPF Total (in)": st.column_config.NumberColumn(
+                "QPF Total (in)",
+                format="%.2f in",
+                help="24-hour cumulative Quantitative Precipitation Forecast (liquid-equivalent inches).",
+            ),
+            "Min RH (%)": st.column_config.NumberColumn(
+                "Min RH (%)",
+                format="%d %%",
+                help="Minimum hourly Relative Humidity (%) forecast during the diurnal heating cycle; values ≤ 20% indicate elevated fire-weather desiccation.",
+            ),
+            "Peak Gust (mph)": st.column_config.NumberColumn(
+                "Peak Gust (mph)",
+                format="%.1f mph",
+                help="Maximum 10-meter wind gust speed forecast within the canyon during the 24-hour period.",
+            ),
+            "Canyon Meteorological Regime": st.column_config.TextColumn(
+                "Canyon Meteorological Regime",
+                help="Automated synoptic and microclimatic classification synthesized from P10 freeze thresholds, QPF/PoP frontal moisture, and RH/gust fire-weather criteria.",
+            ),
+        },
+    )
