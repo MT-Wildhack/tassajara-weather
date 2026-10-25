@@ -77,14 +77,22 @@ def log_observations():
 
 def generate_mos_forecast(tass, refs):
     """Applies the MOS model (or physics baseline during initial data collection)."""
-    with sqlite3.connect(DB_PATH) as conn:
+   with sqlite3.connect(DB_PATH) as conn:
         fc_df = pd.read_sql_query(
             """
             SELECT * FROM nws_forecasts
-            WHERE issue_time_utc = (SELECT MAX(issue_time_utc) FROM nws_forecasts)
+            WHERE issue_time_utc = (
+                SELECT issue_time_utc
+                FROM nws_forecasts
+                WHERE short_forecast != 'Archived NWP Grid' OR short_forecast IS NULL
+                GROUP BY issue_time_utc
+                HAVING COUNT(*) >= 48
+                ORDER BY issue_time_utc DESC
+                LIMIT 1
+            )
             ORDER BY valid_time_utc ASC
             """,
-            conn
+            conn,
         )
     if fc_df.empty:
         return pd.DataFrame()
