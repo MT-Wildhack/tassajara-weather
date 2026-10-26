@@ -1,0 +1,78 @@
+name: Weekly MOS Ensemble Retraining
+
+on:
+  schedule:
+    # Optimal Meteorological & CI Schedule:
+    # Runs every Sunday at 11:25 UTC (03:25 AM PST / 04:25 AM PDT).
+    # - Weekly (168h) cadence captures a full synoptic Rossby wave cycle without overfitting.
+    # - Minute :25 avoids GitHub Actions top-of-the-hour (:00) queue congestion and
+    #   prevents SQLite/git lock collisions with hourly_weather.yml.
+    # - 03:25 AM local time occurs during Tassajara's calm nocturnal katabatic regime.
+    - cron: '25 11 * * 0'
+  workflow_dispatch:
+    inputs:
+      days_to_fetch:
+        description: 'Days of API archive to pull (use 0 for fast --skip-fetch on existing SQLite)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tzmc-weather-pipeline
+  cancel-in-progress: false
+
+jobs:
+  retrain-mos-ensemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      WL_API_KEY: ${{ secrets.WL_API_KEY }}
+      WL_API_SECRET: ${{ secrets.WL_API_SECRET }}
+      SYNOPTIC_TOKEN: ${{ secrets.SYNOPTIC_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install scientific & ML dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests numpy pandas scikit-learn statsmodels joblib streamlit plotly
+          fi
+
+      - name: Retrain Tassajara MOS Ensemble & Update Verification Tables
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.days_to_fetch }}" != "0" ] && [ -n "${{ github.event.inputs.days_to_fetch }}" ]; then
+            echo "Running API backfill for ${{ github.event.inputs.days_to_fetch }} days + MOS retraining..."
+            python backfill_and_train.py --days ${{ github.event.inputs.days_to_fetch }}
+          else
+            echo "Running fast weekly retraining (--skip-fetch) on cumulative SQLite observations..."
+            python backfill_and_train.py --skip-fetch
+          fi
+
+      - name: Commit & Push Updated Model Artifact and Database
+        run: |
+          git config user.name "TZMC Automated Weather Bot"
+          git config user.email "weather-bot@sfzc.org"
+          git add models/tassajara_mos_v1.joblib tassajara_weather.db
+          if git diff --staged --quiet; then
+            echo "No changes to model weights or database."
+          else
+            git commit -m "Automated weekly MOS ensemble retrain ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git pull --rebase -X ours origin main
+            git push origin main
+          fi
