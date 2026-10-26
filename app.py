@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-app.py — Tassajara Zen Mountain Center Meteorological & MOS Forecast Monitor
+app.py — Tassajara Zen Mountain Center Meteorological & Hydrological MOS Forecast Monitor
 Publication-grade scientific monitoring suite for Station 36966 (Stone Office Vantage Pro2),
-Chews Ridge (CHWC1) & Hastings (CAHC1) boundary references, and MOS ensemble verification.
-Includes comprehensive meteorological and statistical hover tooltips across all readouts and tables.
+Chews Ridge (CHWC1) & Hastings (CAHC1) boundary references, and Thermal + Hydrological MOS verification.
 """
 
 import math
@@ -18,8 +17,10 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from mos_model import engineer_mos_features, analytical_hydro_hurdle_fallback
+
 st.set_page_config(
-    page_title="TZMC Atmospheric & MOS Forecast Monitor",
+    page_title="TZMC Atmospheric & Hydrological MOS Monitor",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -220,7 +221,7 @@ def compute_canyon_solar_state(dt_utc: datetime):
 
 
 def fallback_physics_mos(df: pd.DataFrame) -> pd.DataFrame:
-    """Topographic radiation-drainage physical MOS fallback when model weights are absent."""
+    """Topographic radiation-drainage + Orographic-Virga physical MOS fallback."""
     out = df.copy()
     dt_utc = pd.to_datetime(out["valid_time_utc"], utc=True)
     dt_local = dt_utc.dt.tz_convert(LOCAL_TZ)
@@ -241,23 +242,37 @@ def fallback_physics_mos(df: pd.DataFrame) -> pd.DataFrame:
     out["corrected_temp_c"] = (raw_c + offset_c).round(2)
     out["corrected_temp_p10_c"] = (out["corrected_temp_c"] - 2.1).round(2)
     out["corrected_temp_p90_c"] = (out["corrected_temp_c"] + 2.1).round(2)
+
+    X_feats = engineer_mos_features(out)
+    hydro_fb = analytical_hydro_hurdle_fallback(X_feats)
+    out["raw_nws_pop_pct"] = get_col(out, "nws_pop_pct", 0.0).round(1)
+    out["mos_pop_pct"] = hydro_fb["mos_pop_pct"].values
+    out["raw_nws_qpf_mm"] = get_col(out, "nws_qpf_1hr_mm", 0.0).round(2)
+    out["mos_qpf_mm"] = hydro_fb["mos_qpf_mm"].values
+    out["mos_qpf_p90_mm"] = hydro_fb["mos_qpf_p90_mm"].values
     return out
 
 
 def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensures every row in `df` has MOS corrected_temp_c, p10, and p90.
-    Uses trained `models/tassajara_mos_v1.joblib` if available, else physical baseline.
+    Ensures every row in `df` has MOS corrected_temp_c, p10, p90, mos_pop_pct,
+    mos_qpf_mm, and mos_qpf_p90_mm.
     """
     if df.empty:
         return df
     out = df.copy()
-    if "corrected_temp_c" not in out.columns:
-        out["corrected_temp_c"] = np.nan
-        out["corrected_temp_p10_c"] = np.nan
-        out["corrected_temp_p90_c"] = np.nan
+    for col in [
+        "corrected_temp_c",
+        "corrected_temp_p10_c",
+        "corrected_temp_p90_c",
+        "mos_pop_pct",
+        "mos_qpf_mm",
+        "mos_qpf_p90_mm",
+    ]:
+        if col not in out.columns:
+            out[col] = np.nan
 
-    missing_mask = out["corrected_temp_c"].isna()
+    missing_mask = out["corrected_temp_c"].isna() | out["mos_qpf_mm"].isna() | out["mos_pop_pct"].isna()
     if not missing_mask.any():
         return out
 
@@ -267,41 +282,58 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     if "raw_nws_temp_c" not in sub.columns and "nws_temp_c" in sub.columns:
         sub["raw_nws_temp_c"] = sub["nws_temp_c"]
 
+    sub["lead_time_hours"] = get_col(sub, "lead_time_hours", 6.0)
+    sub["nws_rh_pct"] = get_col(sub, "nws_rh_pct", 50.0)
+    sub["nws_wind_speed_ms"] = get_col(sub, "nws_wind_speed_ms", 1.5)
+    sub["nws_wind_dir_deg"] = get_col(sub, "nws_wind_dir_deg", 295.0)
+    sub["nws_pop_pct"] = get_col(sub, "nws_pop_pct", 0.0)
+    sub["nws_qpf_1hr_mm"] = get_col(sub, "nws_qpf_1hr_mm", 0.0)
+    sub["nws_sky_cover_pct"] = get_col(sub, "nws_sky_cover_pct", 20.0)
+    sub["pressure_trend_3hr_hpa"] = get_col(sub, "pressure_trend_3hr_hpa", 0.0)
+    sub["issue_chews_temp_c"] = get_col(sub, "issue_chews_temp_c", sub["nws_temp_c"] + 2.0)
+    sub["issue_chews_precip_mm"] = get_col(sub, "issue_chews_precip_mm", 0.0)
+    sub["issue_tass_temp_c"] = get_col(sub, "issue_tass_temp_c", sub["nws_temp_c"])
+    sub["issue_persistence_bias_c"] = get_col(sub, "issue_persistence_bias_c", 0.0)
+    if "issue_time_utc" not in sub.columns:
+        sub["issue_time_utc"] = sub["valid_time_utc"]
+
     if MODEL_PATH.exists():
         try:
             mos_model = joblib.load(MODEL_PATH)
-            if "lead_time_hours" not in sub.columns:
-                sub["lead_time_hours"] = 6
-            sub["lead_time_hours"] = pd.to_numeric(sub["lead_time_hours"], errors="coerce").fillna(6)
-            sub["nws_rh_pct"] = get_col(sub, "nws_rh_pct", 50.0)
-            sub["nws_wind_speed_ms"] = get_col(sub, "nws_wind_speed_ms", 1.5)
-            sub["nws_wind_dir_deg"] = get_col(sub, "nws_wind_dir_deg", 295.0)
-            sub["nws_pop_pct"] = get_col(sub, "nws_pop_pct", 0.0)
-            sub["nws_sky_cover_pct"] = get_col(sub, "nws_sky_cover_pct", 20.0)
-            sub["pressure_trend_3hr_hpa"] = get_col(sub, "pressure_trend_3hr_hpa", 0.0)
-            sub["issue_chews_temp_c"] = get_col(sub, "issue_chews_temp_c", sub["nws_temp_c"] + 2.0)
-            sub["issue_tass_temp_c"] = get_col(sub, "issue_tass_temp_c", sub["nws_temp_c"])
-            sub["issue_persistence_bias_c"] = get_col(sub, "issue_persistence_bias_c", 0.0)
-            if "issue_time_utc" not in sub.columns:
-                sub["issue_time_utc"] = sub["valid_time_utc"]
-
             preds = mos_model.predict(sub)
-            out.loc[missing_mask, "pred_temp_error_c"] = preds["pred_temp_error_c"].values
-            out.loc[missing_mask, "corrected_temp_c"] = preds["corrected_temp_c"].values
-            out.loc[missing_mask, "corrected_temp_p10_c"] = preds["corrected_temp_p10_c"].values
-            out.loc[missing_mask, "corrected_temp_p90_c"] = preds["corrected_temp_p90_c"].values
-            if "model_version" not in out.columns:
-                out["model_version"] = "MOS_GBM_v1"
-            else:
-                out.loc[missing_mask, "model_version"] = "MOS_GBM_v1"
+            for c in [
+                "pred_temp_error_c",
+                "corrected_temp_c",
+                "corrected_temp_p10_c",
+                "corrected_temp_p90_c",
+                "raw_nws_pop_pct",
+                "mos_pop_pct",
+                "raw_nws_qpf_mm",
+                "mos_qpf_mm",
+                "mos_qpf_p90_mm",
+            ]:
+                if c in preds.columns:
+                    out.loc[missing_mask, c] = preds[c].values
+                elif c not in out.columns or out.loc[missing_mask, c].isna().any():
+                    fb = fallback_physics_mos(sub)
+                    out.loc[missing_mask, c] = fb[c].values
             return out
         except Exception:
             pass
 
     fb = fallback_physics_mos(sub)
-    out.loc[missing_mask, "corrected_temp_c"] = fb["corrected_temp_c"].values
-    out.loc[missing_mask, "corrected_temp_p10_c"] = fb["corrected_temp_p10_c"].values
-    out.loc[missing_mask, "corrected_temp_p90_c"] = fb["corrected_temp_p90_c"].values
+    for c in [
+        "pred_temp_error_c",
+        "corrected_temp_c",
+        "corrected_temp_p10_c",
+        "corrected_temp_p90_c",
+        "raw_nws_pop_pct",
+        "mos_pop_pct",
+        "raw_nws_qpf_mm",
+        "mos_qpf_mm",
+        "mos_qpf_p90_mm",
+    ]:
+        out.loc[missing_mask, c] = fb[c].values
     return out
 
 
@@ -311,7 +343,7 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=120)
 def load_all_dashboard_data():
     if not Path(DB_PATH).exists():
-        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
 
     with sqlite3.connect(DB_PATH) as conn:
         # 1. Recent Local Observations (Stone Office Vantage Pro2)
@@ -327,6 +359,30 @@ def load_all_dashboard_data():
             )
         except Exception:
             obs_df = pd.DataFrame()
+
+        # Archive-wide Precipitation Stats (Water Year / Total Archive)
+        archive_stats = {"total_obs_hours": 0, "wet_hours": 0, "total_rain_mm": 0.0, "max_1hr_mm": 0.0}
+        try:
+            row_st = conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN COALESCE(precip_1hr_mm, 0.0) >= 0.254 THEN 1 ELSE 0 END),
+                    COALESCE(SUM(precip_1hr_mm), 0.0),
+                    COALESCE(MAX(precip_1hr_mm), 0.0)
+                FROM local_observations
+                WHERE temp_c IS NOT NULL
+                """
+            ).fetchone()
+            if row_st:
+                archive_stats = {
+                    "total_obs_hours": int(row_st[0] or 0),
+                    "wet_hours": int(row_st[1] or 0),
+                    "total_rain_mm": float(row_st[2] or 0.0),
+                    "max_1hr_mm": float(row_st[3] or 0.0),
+                }
+        except Exception:
+            pass
 
         # 2. Latest Reference Station Observations (CHWC1 & CAHC1)
         ref_dict = {}
@@ -354,7 +410,23 @@ def load_all_dashboard_data():
         except Exception:
             ref_dict = {}
 
-        # 3. Future 7-Day Forecast Series (Select latest complete issue batch >= 48 hours)
+        # Inspect mos_corrected_forecasts columns for backward-compatible SQL queries
+        mos_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()
+        }
+        has_hydro_cols = "mos_qpf_mm" in mos_cols and "mos_pop_pct" in mos_cols
+        hydro_select_sql = (
+            "m.mos_pop_pct, m.mos_qpf_mm, m.mos_qpf_p90_mm"
+            if has_hydro_cols
+            else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
+        )
+        hydro_inner_sql = (
+            "mos_pop_pct, mos_qpf_mm, mos_qpf_p90_mm"
+            if has_hydro_cols
+            else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
+        )
+
+        # 3. Future 7-Day Forecast Series
         future_fc_df = pd.DataFrame()
         try:
             nws_issue_row = pd.read_sql_query(
@@ -385,7 +457,7 @@ def load_all_dashboard_data():
             if not nws_issue_row.empty:
                 latest_nws_issue = str(nws_issue_row.iloc[0]["issue_time_utc"])
                 future_fc_df = pd.read_sql_query(
-                    """
+                    f"""
                     SELECT
                         f.issue_time_utc,
                         f.valid_time_utc,
@@ -407,7 +479,8 @@ def load_all_dashboard_data():
                         m.corrected_temp_p10_c,
                         m.corrected_temp_p90_c,
                         m.corrected_rh_pct,
-                        m.corrected_wind_gust_ms
+                        m.corrected_wind_gust_ms,
+                        {hydro_select_sql}
                     FROM nws_forecasts f
                     LEFT JOIN (
                         SELECT
@@ -418,7 +491,8 @@ def load_all_dashboard_data():
                             corrected_temp_p10_c,
                             corrected_temp_p90_c,
                             corrected_rh_pct,
-                            corrected_wind_gust_ms
+                            corrected_wind_gust_ms,
+                            {hydro_inner_sql}
                         FROM mos_corrected_forecasts
                         WHERE issue_time_utc = (
                             SELECT issue_time_utc
@@ -447,11 +521,11 @@ def load_all_dashboard_data():
         except Exception:
             future_fc_df = pd.DataFrame()
 
-        # 4. Paired Historical Verification Dataset (Direct SQL INNER JOIN)
+        # 4. Paired Historical Verification Dataset
         verify_df = pd.DataFrame()
         try:
             verify_df = pd.read_sql_query(
-                """
+                f"""
                 SELECT
                     o.valid_time_utc,
                     o.temp_c AS actual_temp_c,
@@ -478,6 +552,7 @@ def load_all_dashboard_data():
                     COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
                     f.short_forecast,
                     COALESCE(r_chews.temp_c, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                    COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
                     COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
                     COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c,
                     m.corrected_temp_c,
@@ -485,6 +560,7 @@ def load_all_dashboard_data():
                     m.corrected_temp_p90_c,
                     m.corrected_rh_pct,
                     m.corrected_wind_gust_ms,
+                    {hydro_select_sql},
                     m.model_version
                 FROM local_observations o
                 INNER JOIN (
@@ -530,11 +606,12 @@ def load_all_dashboard_data():
                         corrected_temp_p90_c,
                         corrected_rh_pct,
                         corrected_wind_gust_ms,
+                        {hydro_inner_sql},
                         model_version,
                         ROW_NUMBER() OVER (
                             PARTITION BY valid_time_utc
                             ORDER BY
-                                CASE WHEN model_version = 'MOS_GBM_v1' THEN 0 ELSE 1 END ASC,
+                                CASE WHEN model_version LIKE 'MOS_GBM%' THEN 0 ELSE 1 END ASC,
                                 issue_time_utc DESC
                         ) AS rn
                     FROM mos_corrected_forecasts
@@ -549,22 +626,26 @@ def load_all_dashboard_data():
         except Exception:
             verify_df = pd.DataFrame()
 
-    return ref_dict, obs_df, future_fc_df, verify_df
+    return ref_dict, obs_df, future_fc_df, verify_df, archive_stats
 
 
 # ---------------------------------------------------------------------------
 # Header & Station Metadata Banner
 # ---------------------------------------------------------------------------
-ref_dict, obs_df, future_fc_df, verify_df = load_all_dashboard_data()
+ref_dict, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
 
 now_utc = datetime.now(timezone.utc)
 solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_utc)
 
-active_model_name = "MOS_GBM_v1 (HistGradientBoosting Quantile Ensemble)" if MODEL_PATH.exists() else "TOPO_PHYSICS (Analytical Baseline)"
+active_model_name = (
+    "MOS_GBM_v2_HYDRO (Thermal Quantile + Two-Stage Hurdle PoP/QPF)"
+    if MODEL_PATH.exists()
+    else "TOPO_HYDRO_PHYSICS (Analytical Baseline)"
+)
 
 st.markdown(
     '<div class="met-header-bar">'
-    '<h2 style="margin-bottom:0.2rem;">Tassajara Zen Mountain Center — Microclimate & MOS Forecast Suite</h2>'
+    '<h2 style="margin-bottom:0.2rem;">Tassajara Zen Mountain Center — Microclimate & Hydrological MOS Forecast Suite</h2>'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -594,7 +675,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# Section 1: Live Meteorological & Boundary-Layer Telemetry (8-Card Grid)
+# Section 1: Live Meteorological & Hydrological Telemetry (8-Card Grid)
 # ---------------------------------------------------------------------------
 if not obs_df.empty:
     latest = obs_df.iloc[0]
@@ -618,7 +699,6 @@ if not obs_df.empty:
     wetbulb_f = c_to_f(wetbulb_c)
     vpd_kpa = compute_vpd_kpa(temp_c, rh_pct)
 
-    # Backfill wind/barometer from most recent valid reading if current sensor packet omitted them
     valid_wind_rows = last_24[last_24["wind_speed_ms"].notna()] if "wind_speed_ms" in last_24.columns else pd.DataFrame()
     wind_spd_ms = safe_float(latest.get("wind_speed_ms"), safe_float(valid_wind_rows.iloc[0]["wind_speed_ms"], 0.0) if not valid_wind_rows.empty else 0.0)
     wind_gst_ms = safe_float(latest.get("wind_gust_ms"), safe_float(valid_wind_rows.iloc[0]["wind_gust_ms"], 0.0) if not valid_wind_rows.empty else 0.0)
@@ -645,9 +725,21 @@ if not obs_df.empty:
     rain_24_in = mm_to_in(rain_24_mm)
     last_hr_rain = mm_to_in(safe_float(latest.get("precip_1hr_mm"), 0.0))
 
-    # Boundary-layer vertical lapse rate & canyon confinement
+    # Next 72h MOS Calibrated QPF & PoP Summary
+    if not future_fc_df.empty:
+        next_72 = future_fc_df.head(72)
+        mos_qpf_72_mm = float(get_col(next_72, "mos_qpf_mm", get_col(next_72, "nws_qpf_1hr_mm", 0.0)).sum())
+        mos_qpf_72_in = mm_to_in(mos_qpf_72_mm)
+        raw_qpf_72_in = mm_to_in(float(get_col(next_72, "nws_qpf_1hr_mm", 0.0).sum()))
+        max_mos_pop_72 = float(get_col(next_72, "mos_pop_pct", get_col(next_72, "nws_pop_pct", 0.0)).max())
+        qpf_delta_str = f"Max PoP: {max_mos_pop_72:.0f}% | Raw NWS: {raw_qpf_72_in:.2f} in"
+    else:
+        mos_qpf_72_in = 0.0
+        mos_qpf_72_mm = 0.0
+        qpf_delta_str = "Awaiting Forecast Batch"
+
     chews_temp_c = safe_float(ref_dict.get("CHWC1", {}).get("temp_c"), np.nan)
-    hast_temp_c = safe_float(ref_dict.get("CAHC1", {}).get("temp_c"), np.nan)
+    chews_rain_mm = safe_float(ref_dict.get("CHWC1", {}).get("precip_1hr_mm"), 0.0)
 
     if not math.isnan(chews_temp_c):
         dz_km = (ELEV_CHEWS_M - ELEV_TASS_M) / 1000.0  # 1.051 km
@@ -662,64 +754,30 @@ if not obs_df.empty:
         lapse_str = "N/A"
         stability_state = "Awaiting CHWC1"
 
-    if not math.isnan(hast_temp_c):
-        hast_f = c_to_f(hast_temp_c)
-        canyon_delta_f = temp_f - hast_f
-        confinement_str = f"{canyon_delta_f:+.1f} °F vs CAHC1"
-        ref_sub_str = f"CHWC1: {c_to_f(chews_temp_c):.1f}°F | CAHC1: {hast_f:.1f}°F" if not math.isnan(chews_temp_c) else f"CAHC1: {hast_f:.1f}°F"
-    else:
-        confinement_str = "N/A"
-        ref_sub_str = "Reference RAWS offline"
-
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     r1c1.metric(
-        "Stone Office Temperature",
+        "Dry-Bulb Air Temperature",
         f"{temp_f:.1f} °F ({temp_c:.1f} °C)",
         f"24h Extremes: {lo_24_f:.1f}°F / {hi_24_f:.1f}°F",
         delta_color="off",
-        help=(
-            "Ambient dry-bulb air temperature measured inside the aspirated radiation shield on the Stone Office "
-            "roof gable (485 m / 1,590 ft MSL; 4.5 m AGL). Nocturnal minima are strongly governed by katabatic "
-            "cold-air drainage down Tassajara Creek Canyon, whereas afternoon maxima reflect early topographic "
-            "shadowing by the southwestern Pine Ridge / Black Cone wall."
-        ),
     )
     r1c2.metric(
         "Relative Humidity & Dewpoint",
         f"{rh_pct:.0f} % RH",
         f"Dewpoint: {dew_f:.1f} °F ({dew_c:.1f} °C)",
         delta_color="off",
-        help=(
-            "Relative Humidity (RH %) expresses the ratio of actual water vapor partial pressure to saturation "
-            "vapor pressure at the current dry-bulb temperature. Dewpoint temperature is the thermodynamic "
-            "temperature to which air must be cooled at constant pressure and water vapor content to reach saturation "
-            "(100% RH), serving as an absolute indicator of boundary-layer moisture."
-        ),
     )
     r1c3.metric(
-        "Wet-Bulb & Vapor Pressure Deficit",
+        "Wet-Bulb & Sub-Cloud Virga VPD",
         f"{wetbulb_f:.1f} °F WB",
-        f"VPD: {vpd_kpa:.2f} kPa ({'Arid' if vpd_kpa >= 1.6 else 'Moist/Moderate'})",
+        f"VPD: {vpd_kpa:.2f} kPa ({'High Virga Evap' if vpd_kpa >= 1.2 else 'Moist/Low Evap'})",
         delta_color="off",
-        help=(
-            "Psychrometric wet-bulb temperature (computed via Stull's 2011 formulation) represents the lowest "
-            "temperature attainable through evaporative cooling and governs precipitation phase and human thermal "
-            "stress. Vapor Pressure Deficit (VPD, in kilopascals) is the difference between saturation vapor pressure "
-            "(es) and actual vapor pressure (ea); VPD values exceeding 1.6 kPa indicate high atmospheric evaporative "
-            "demand and accelerated fine-fuel desiccation."
-        ),
     )
     r1c4.metric(
         "Anemometer Wind Vector",
         f"{wind_spd_mph:.1f} mph ({wind_card})",
         f"10m Peak Gust: {wind_gst_mph:.1f} mph",
         delta_color="off",
-        help=(
-            "10-minute sustained scalar wind speed, prevailing cardinal direction, and peak 3-second wind gust "
-            "recorded above the Stone Office gable. Local flow is topographically channeled along the ESE–WNW "
-            "(115°–295°) axis of Tassajara Creek Canyon, alternating between daytime up-canyon anabatic breezes "
-            "and nocturnal down-canyon katabatic drainage."
-        ),
     )
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
@@ -728,54 +786,30 @@ if not obs_df.empty:
         f"{mslp_inhg:.2f} inHg ({mslp_hpa:.1f} hPa)",
         ptrend_label,
         delta_color="off",
-        help=(
-            "Altimeter-reduced Mean Sea-Level Pressure (MSLP, in inches of mercury and hectopascals) and the "
-            "3-hour barometric tendency (ΔP/3h). Rapidly falling pressure (ΔP < -1.5 hPa/3h) signals approaching "
-            "extraterropical cyclonic troughing or frontal passage; rising pressure indicates post-frontal "
-            "subsidence and synoptic ridging."
-        ),
     )
     r2c2.metric(
-        "Precipitation Accumulation (24h)",
+        "Observed Rainfall (24h / Archive)",
         f"{rain_24_in:.2f} in ({rain_24_mm:.1f} mm)",
-        f"1-Hr Rate: {last_hr_rain:.2f} in/hr",
+        f"1h: {last_hr_rain:.2f} in | Archive: {mm_to_in(archive_stats['total_rain_mm']):.2f} in ({archive_stats['wet_hours']}h wet)",
         delta_color="off",
-        help=(
-            "Cumulative liquid-equivalent precipitation recorded over the past 24 hours by the 0.01-inch "
-            "(0.254 mm) resolution tipping-bucket rain collector on the Stone Office roof, paired with the "
-            "most recent 60-minute rainfall accumulation rate."
-        ),
     )
     r2c3.metric(
-        "Vertical Lapse Rate (CHWC1 → TZMC)",
-        lapse_str,
-        stability_state,
+        "72h MOS-Calibrated QPF Outlook",
+        f"{mos_qpf_72_in:.2f} in ({mos_qpf_72_mm:.1f} mm)",
+        qpf_delta_str,
         delta_color="off",
-        help=(
-            "Environmental temperature lapse rate (Γ = -ΔT/Δz, in °C/km) computed across the 1,051 m vertical "
-            "column between Chews Ridge RAWS (CHWC1, 1,536 m MSL) and Tassajara Stone Office (485 m MSL). "
-            "Negative values (Γ < 0 °C/km) indicate a surface-based thermal inversion where cold air is trapped "
-            "on the canyon floor beneath warmer ridge air; values approaching +9.8 °C/km indicate dry-adiabatic "
-            "vertical mixing and momentum transfer from ridge level."
-        ),
     )
     r2c4.metric(
-        "Canyon Thermal Confinement",
-        confinement_str,
-        ref_sub_str,
+        "Vertical Lapse Rate (CHWC1 → TZMC)",
+        lapse_str,
+        f"{stability_state} | CHWC1 1h Rain: {mm_to_in(chews_rain_mm):.2f} in",
         delta_color="off",
-        help=(
-            "Horizontal thermal anomaly (ΔT) between Tassajara Stone Office (485 m) and Hastings Natural History "
-            "Reservation RAWS (CAHC1, 546 m MSL in open Upper Carmel Valley). Strongly negative nocturnal values "
-            "quantify the intensity of local cold-air pool (CAP) confinement inside the steep Ventana Wilderness "
-            "gorge relative to unconstrained valley terrain at comparable elevation."
-        ),
     )
 
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
-# Section 2: Forecast Accuracy Verification Scorecard (MOS vs. NWS)
+# Section 2: Forecast Accuracy Verification Scorecard (Thermal & Hydrological)
 # ---------------------------------------------------------------------------
 ver_hdr_col1, ver_hdr_col2 = st.columns([3, 1])
 with ver_hdr_col1:
@@ -784,11 +818,7 @@ with ver_hdr_col2:
     eval_window = st.selectbox(
         "Verification Evaluation Window",
         options=["Past 24 Hours", "Past 72 Hours", "Past 7 Days (168h)", "Full Historical Archive"],
-        index=1,
-        help=(
-            "Selects the temporal sample window of paired hourly observations and hindcasts used to compute "
-            "verification error statistics (MAE, RMSE, Mean Bias, Skill Score, and Quantile Coverage)."
-        ),
+        index=3,
     )
 
 if not verify_df.empty and len(verify_df) >= 3:
@@ -798,7 +828,7 @@ if not verify_df.empty and len(verify_df) >= 3:
         "Past 7 Days (168h)": 168,
         "Full Historical Archive": len(verify_df),
     }
-    n_eval = window_map.get(eval_window, 72)
+    n_eval = window_map.get(eval_window, len(verify_df))
     v_sub = verify_df.tail(n_eval).copy()
     v_sub["valid_local"] = pd.to_datetime(v_sub["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
 
@@ -825,161 +855,86 @@ if not verify_df.empty and len(verify_df) >= 3:
     total_eval_hrs = len(v_sub)
     win_rate_pct = (hours_mos_won / max(total_eval_hrs, 1)) * 100.0
 
-    in_bounds = ((v_sub["actual_f"] >= v_sub["p10_f"]) & (v_sub["actual_f"] <= v_sub["p90_f"])).mean() * 100.0
+    # Hydrological Verification (QPF & PoP Brier Score)
+    v_sub["obs_rain_mm"] = get_col(v_sub, "actual_precip_mm", 0.0)
+    v_sub["raw_qpf_mm"] = get_col(v_sub, "nws_qpf_1hr_mm", 0.0)
+    v_sub["mos_qpf_mm_val"] = get_col(v_sub, "mos_qpf_mm", v_sub["raw_qpf_mm"])
+    v_sub["raw_pop_val"] = get_col(v_sub, "nws_pop_pct", 0.0).clip(0.0, 100.0)
+    v_sub["mos_pop_val"] = get_col(v_sub, "mos_pop_pct", v_sub["raw_pop_val"]).clip(0.0, 100.0)
+
+    obs_wet_bin = (v_sub["obs_rain_mm"] >= 0.254).astype(float)
+    raw_brier = float(np.mean(((v_sub["raw_pop_val"] / 100.0) - obs_wet_bin) ** 2))
+    mos_brier = float(np.mean(((v_sub["mos_pop_val"] / 100.0) - obs_wet_bin) ** 2))
+    obs_total_in = mm_to_in(float(v_sub["obs_rain_mm"].sum()))
+    mos_total_in = mm_to_in(float(v_sub["mos_qpf_mm_val"].sum()))
+    raw_total_in = mm_to_in(float(v_sub["raw_qpf_mm"].sum()))
 
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric(
-        "Raw NWP/NWS Error (MAE)",
+        "Raw NWP/NWS Temp Error (MAE)",
         f"± {nws_mae_f:.2f} °F",
         f"RMSE: ± {nws_rmse_f:.2f} °F | Bias: {nws_bias_f:+.2f} °F",
         delta_color="off",
-        help=(
-            "Mean Absolute Error (MAE = N⁻¹ Σ|F_nws - O|) of the uncorrected 2.5 km National Digital Forecast "
-            "Database (NDFD / NWS MTR) grid cell over the selected evaluation window. Because the regional NWP "
-            "terrain model smooths the Santa Lucia Mountains to ~880 m MSL, raw grid forecasts systematically "
-            "underpredict Tassajara's nocturnal cold-air pooling and afternoon canyon shadow cooling."
-        ),
     )
     s2.metric(
-        "Tassajara MOS Error (MAE)",
+        "Tassajara MOS Temp Error (MAE)",
         f"± {mos_mae_f:.2f} °F",
         f"{mos_mae_f - nws_mae_f:+.2f} °F MAE vs Raw NWP",
         delta_color="inverse",
-        help=(
-            "Mean Absolute Error (MAE = N⁻¹ Σ|F_mos - O|) of the Tassajara Model Output Statistics (MOS) "
-            "HistGradientBoosting ensemble after correcting for solar geometry, Black Cone ridge horizon shading, "
-            "along-canyon wind components, and Chews Ridge vertical stability. Lower values indicate superior "
-            "point-forecast accuracy at the Stone Office sensor."
-        ),
     )
     s3.metric(
-        "MOS RMSE Skill Score",
+        "MOS Thermal Skill Score",
         f"{skill_pct:+.1f} %",
-        f"MOS RMSE: ± {mos_rmse_f:.2f} °F (Bias: {mos_bias_f:+.2f} °F)",
+        f"Win Rate: {win_rate_pct:.1f}% ({hours_mos_won}/{total_eval_hrs}h)",
         delta_color="normal" if skill_pct >= 0 else "inverse",
-        help=(
-            "Root Mean Squared Error Skill Score defined as SS_RMSE = (1 - RMSE_mos / RMSE_nws) × 100%. "
-            "Because RMSE squares individual hourly residuals prior to averaging, it heavily penalizes large "
-            "outlier errors during extreme frost or heat events. Positive percentages quantify the percentage "
-            "reduction in RMSE achieved by the MOS ensemble over raw NWS guidance."
-        ),
     )
     s4.metric(
-        "Hourly Win Frequency",
-        f"{win_rate_pct:.1f} % ({hours_mos_won}/{total_eval_hrs}h)",
-        f"Evaluated over {total_eval_hrs} paired hours",
-        delta_color="off",
-        help=(
-            "Percentage of verified hourly timestamps in which the absolute residual of the Tassajara MOS "
-            "forecast was less than or equal to the absolute residual of the raw NWS grid forecast "
-            "(|F_mos - O| ≤ |F_nws - O|)."
-        ),
+        "PoP Reliability (Brier Score)",
+        f"{mos_brier:.4f}",
+        f"{mos_brier - raw_brier:+.4f} vs Raw NWP ({raw_brier:.4f})",
+        delta_color="inverse",
     )
     s5.metric(
-        "P10–P90 Interval Coverage",
-        f"{in_bounds:.1f} %",
-        f"Nominal 80% Quantile Envelope",
+        "Cumulative Rain (Obs vs MOS)",
+        f"{obs_total_in:.2f} in Obs",
+        f"MOS QPF: {mos_total_in:.2f} in | Raw NWP: {raw_total_in:.2f} in",
         delta_color="off",
-        help=(
-            "Empirical calibration coverage of the probabilistic MOS quantile regression bounds, measuring "
-            "the percentage of observed Stone Office temperatures that fell within the predicted 10th-to-90th "
-            "percentile interval [P10, P90]. A well-calibrated 80% prediction interval exhibits empirical "
-            "coverage near 80%."
-        ),
     )
 
-    with st.expander(f"Inspect Paired Hourly Verification Table & Residual Diagnostics ({total_eval_hrs} Hours)", expanded=False):
+    with st.expander(f"Inspect Paired Hourly Verification Table & Hydrological Residuals ({total_eval_hrs} Hours)", expanded=False):
         ver_table = pd.DataFrame({
             "Valid Time (Local)": v_sub["valid_local"].dt.strftime("%Y-%m-%d %H:%M"),
             "Lead (hr)": pd.to_numeric(v_sub["lead_time_hours"], errors="coerce").fillna(6).astype(int),
             "Actual (°F)": v_sub["actual_f"].round(1),
-            "MOS Forecast (°F)": v_sub["mos_f"].round(1),
-            "MOS [P10, P90] (°F)": (
-                "[" + v_sub["p10_f"].round(1).astype(str) + ", " + v_sub["p90_f"].round(1).astype(str) + "]"
-            ),
-            "Raw NWS/NWP (°F)": v_sub["nws_f"].round(1),
-            "MOS Residual (°F)": v_sub["mos_err_f"].round(2),
-            "NWS Residual (°F)": v_sub["nws_err_f"].round(2),
-            "|MOS| Gain (°F)": (v_sub["nws_abs_err_f"] - v_sub["mos_abs_err_f"]).round(2),
-            "Superior Model": np.where(v_sub["mos_abs_err_f"] <= v_sub["nws_abs_err_f"], "Tassajara MOS", "Raw NWS"),
+            "MOS (°F)": v_sub["mos_f"].round(1),
+            "Raw NWS (°F)": v_sub["nws_f"].round(1),
+            "Obs Rain (in)": (v_sub["obs_rain_mm"] / 25.4).round(3),
+            "MOS QPF (in)": (v_sub["mos_qpf_mm_val"] / 25.4).round(3),
+            "Raw QPF (in)": (v_sub["raw_qpf_mm"] / 25.4).round(3),
+            "MOS PoP (%)": v_sub["mos_pop_val"].round(0).astype(int),
+            "Raw PoP (%)": v_sub["raw_pop_val"].round(0).astype(int),
+            "Superior Temp Model": np.where(v_sub["mos_abs_err_f"] <= v_sub["nws_abs_err_f"], "Tassajara MOS", "Raw NWS"),
         }).iloc[::-1].reset_index(drop=True)
-
-        st.dataframe(
-            ver_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Valid Time (Local)": st.column_config.TextColumn(
-                    "Valid Time (Local)",
-                    help="Top-of-the-hour verification timestamp in local Pacific Time (America/Los_Angeles).",
-                ),
-                "Lead (hr)": st.column_config.NumberColumn(
-                    "Lead (hr)",
-                    help="Forecast projection lead time (in hours) elapsed between model initialization and valid time.",
-                ),
-                "Actual (°F)": st.column_config.NumberColumn(
-                    "Actual (°F)",
-                    format="%.1f °F",
-                    help="Ground-truth dry-bulb temperature recorded by the Stone Office Davis Vantage Pro2 ISS.",
-                ),
-                "MOS Forecast (°F)": st.column_config.NumberColumn(
-                    "MOS Forecast (°F)",
-                    format="%.1f °F",
-                    help="Tassajara MOS ensemble mean temperature prediction for the valid hour.",
-                ),
-                "MOS [P10, P90] (°F)": st.column_config.TextColumn(
-                    "MOS [P10, P90] (°F)",
-                    help="Predicted 10th and 90th percentile uncertainty bounds (80% confidence interval) from pinball-loss quantile regression.",
-                ),
-                "Raw NWS/NWP (°F)": st.column_config.NumberColumn(
-                    "Raw NWS/NWP (°F)",
-                    format="%.1f °F",
-                    help="Uncorrected baseline grid point temperature forecast from the National Weather Service / NWP archive.",
-                ),
-                "MOS Residual (°F)": st.column_config.NumberColumn(
-                    "MOS Residual (°F)",
-                    format="%+.2f °F",
-                    help="Signed forecast error of the Tassajara MOS model (F_mos - Actual). Negative values indicate cold bias; positive values indicate warm bias.",
-                ),
-                "NWS Residual (°F)": st.column_config.NumberColumn(
-                    "NWS Residual (°F)",
-                    format="%+.2f °F",
-                    help="Signed forecast error of the raw NWS grid forecast (F_nws - Actual).",
-                ),
-                "|MOS| Gain (°F)": st.column_config.NumberColumn(
-                    "|MOS| Gain (°F)",
-                    format="%+.2f °F",
-                    help="Absolute error reduction achieved by MOS over Raw NWS (|Error_nws| - |Error_mos|). Positive values denote MOS accuracy gain.",
-                ),
-                "Superior Model": st.column_config.TextColumn(
-                    "Superior Model",
-                    help="Indicates which forecast system achieved the smaller absolute temperature residual for the given hour.",
-                ),
-            },
-        )
+        st.dataframe(ver_table, use_container_width=True, hide_index=True)
 else:
     st.warning(
         "No paired observation-forecast records found in tassajara_weather.db. "
-        "Trigger the GitHub Actions workflow (`hourly_weather.yml`) with backfill enabled."
+        "Run `python backfill_and_train.py --days 730` to ingest multi-year history and train the MOS ensemble."
     )
 
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
-# Section 3: 3-Panel Interactive Plotly Microclimate & Forecast Suite
+# Section 3: 3-Panel Interactive Plotly Microclimate & Hydrological Suite
 # ---------------------------------------------------------------------------
 ctrl_col1, ctrl_col2 = st.columns([3, 1])
 with ctrl_col1:
-    st.subheader("Microclimate Time-Series: Verification Hindcast & Operational Forecast")
+    st.subheader("Microclimate & Hydrological Time-Series: Verification Hindcast & Operational Forecast")
 with ctrl_col2:
     horizon_choice = st.selectbox(
         "Timeline Horizon",
         options=["72h Forecast + Past 48h Hindcast", "7-Day Forecast + Past 72h Hindcast"],
         index=0,
-        help=(
-            "Controls the temporal span of the 3-panel interactive meteogram, combining historical verification "
-            "hindcasts (left of the vertical initialization line) with future operational forecasts (right)."
-        ),
     )
 
 if not future_fc_df.empty or not verify_df.empty:
@@ -1001,7 +956,7 @@ if not future_fc_df.empty or not verify_df.empty:
     combined_df = combined_df.sort_values("valid_time_utc").reset_index(drop=True)
     combined_df["valid_local"] = pd.to_datetime(combined_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
 
-    # Overlay any latest actuals from obs_df onto combined_df
+    # Overlay latest actuals from obs_df onto combined_df
     if not obs_df.empty and "valid_time_utc" in obs_df.columns:
         obs_dedup = obs_df.drop_duplicates(subset=["valid_time_utc"]).set_index("valid_time_utc")
         for col_dest, col_src in [
@@ -1022,12 +977,12 @@ if not future_fc_df.empty or not verify_df.empty:
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.065,
-        row_heights=[0.50, 0.25, 0.25],
+        row_heights=[0.46, 0.24, 0.30],
         specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": True}]],
         subplot_titles=(
             "Temperature & Dewpoint Profile (°F): Stone Office Actuals vs. MOS Quantile Fan (P10–P90) vs. Raw NWS",
             "Boundary-Layer Kinematics & Moisture: 10m Peak Wind Gusts (mph) & Relative Humidity (%)",
-            "Hydrological Outlook: Hourly Precipitation Rate (in/hr) & Probability of Precipitation (%)",
+            "Canyon Hydrological Outlook: MOS Calibrated QPF (in/hr), P90 Extreme Rate, Observed Rain & Calibrated PoP (%)",
         ),
     )
 
@@ -1162,20 +1117,24 @@ if not future_fc_df.empty or not verify_df.empty:
         secondary_y=True,
     )
 
-    # Panel 3: Precipitation & PoP%
-    nws_rain_in = (get_col(combined_df, "nws_qpf_1hr_mm", 0.0) / 25.4).round(3)
+    # Panel 3: Hydrological MOS QPF, Raw QPF, Observed Tipping Bucket & Calibrated PoP%
+    raw_rain_in = (get_col(combined_df, "nws_qpf_1hr_mm", 0.0) / 25.4).round(3)
+    mos_rain_in = (get_col(combined_df, "mos_qpf_mm", get_col(combined_df, "nws_qpf_1hr_mm", 0.0)) / 25.4).round(3)
+    mos_p90_rain_in = (get_col(combined_df, "mos_qpf_p90_mm", mos_rain_in * 25.4 * 1.5) / 25.4).round(3)
     actual_rain_in = (get_col(combined_df, "actual_precip_mm", 0.0) / 25.4).round(3)
-    pop_pct = get_col(combined_df, "nws_pop_pct", 0.0).clip(0.0, 100.0)
+
+    raw_pop_pct = get_col(combined_df, "nws_pop_pct", 0.0).clip(0.0, 100.0)
+    mos_pop_pct = get_col(combined_df, "mos_pop_pct", raw_pop_pct).clip(0.0, 100.0)
 
     fig.add_trace(
         go.Scatter(
             x=combined_df["valid_local"],
-            y=pop_pct.round(0),
+            y=mos_pop_pct.round(0),
             mode="lines",
             fill="tozeroy",
-            fillcolor="rgba(56, 189, 248, 0.12)",
-            line=dict(color="rgba(56, 189, 248, 0.70)", width=1.5),
-            name="Precipitation Probability (%)",
+            fillcolor="rgba(56, 189, 248, 0.14)",
+            line=dict(color="#38bdf8", width=2.0),
+            name="MOS Calibrated PoP (%)",
         ),
         row=3,
         col=1,
@@ -1183,12 +1142,49 @@ if not future_fc_df.empty or not verify_df.empty:
     )
 
     fig.add_trace(
+        go.Scatter(
+            x=combined_df["valid_local"],
+            y=raw_pop_pct.round(0),
+            mode="lines",
+            line=dict(color="rgba(148, 163, 184, 0.55)", width=1.3, dash="dot"),
+            name="Raw NWS PoP (%)",
+        ),
+        row=3,
+        col=1,
+        secondary_y=True,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=combined_df["valid_local"],
+            y=mos_p90_rain_in,
+            mode="lines",
+            line=dict(color="rgba(244, 63, 94, 0.65)", width=1.4, dash="dash"),
+            name="MOS P90 Extreme Rate (in/hr)",
+        ),
+        row=3,
+        col=1,
+        secondary_y=False,
+    )
+
+    fig.add_trace(
         go.Bar(
             x=combined_df["valid_local"],
-            y=nws_rain_in,
-            name="Forecast QPF (in/hr)",
-            marker_color="#38bdf8",
-            opacity=0.8,
+            y=raw_rain_in,
+            name="Raw NWS QPF (in/hr)",
+            marker_color="rgba(96, 165, 250, 0.45)",
+        ),
+        row=3,
+        col=1,
+        secondary_y=False,
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=combined_df["valid_local"],
+            y=mos_rain_in,
+            name="MOS Calibrated QPF (in/hr)",
+            marker_color="#0ea5e9",
         ),
         row=3,
         col=1,
@@ -1207,7 +1203,6 @@ if not future_fc_df.empty or not verify_df.empty:
         secondary_y=False,
     )
 
-    # Vertical initialization boundary marker
     if not obs_df.empty:
         divider_ts = pd.to_datetime(obs_df.iloc[0]["valid_time_utc"], utc=True).tz_convert(LOCAL_TZ)
         for r_idx in (1, 2, 3):
@@ -1220,7 +1215,7 @@ if not future_fc_df.empty or not verify_df.empty:
                 col=1,
             )
 
-    max_rain_val = float(max(nws_rain_in.max(), actual_rain_in.max(), 0.0))
+    max_rain_val = float(max(mos_p90_rain_in.max(), mos_rain_in.max(), raw_rain_in.max(), actual_rain_in.max(), 0.0))
     rain_y_top = max(0.20, round(max_rain_val * 1.25, 2))
     max_gust_val = float(max(gust_mph_series.max(), 15.0))
 
@@ -1246,7 +1241,7 @@ if not future_fc_df.empty or not verify_df.empty:
     fig.update_xaxes(title_text="Local Time (America/Los_Angeles)", gridcolor="rgba(148,163,184,0.12)", row=3, col=1)
 
     fig.update_layout(
-        height=840,
+        height=880,
         margin=dict(t=60, b=40, l=55, r=55),
         hovermode="x unified",
         barmode="group",
@@ -1260,10 +1255,10 @@ if not future_fc_df.empty or not verify_df.empty:
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
-# Section 4: 7-Day Meteorological Planning Summary Table
+# Section 4: 7-Day Synoptic, Hydrological & Road Risk Planning Table
 # ---------------------------------------------------------------------------
 if not future_fc_df.empty:
-    st.subheader("7-Day Synoptic & Microclimate Planning Outlook")
+    st.subheader("7-Day Synoptic, Hydrological & Canyon Road Risk Outlook")
     daily_df = future_fc_df.copy()
     daily_df["valid_local"] = pd.to_datetime(daily_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
     daily_df["Date_Key"] = daily_df["valid_local"].dt.strftime("%a, %b %d")
@@ -1273,8 +1268,11 @@ if not future_fc_df.empty:
     daily_df["_p10_t"] = get_col(daily_df, "corrected_temp_p10_c", daily_df["_corr_t"] - 2.1)
     daily_df["_p90_t"] = get_col(daily_df, "corrected_temp_p90_c", daily_df["_corr_t"] + 2.1)
     daily_df["_nws_t"] = get_col(daily_df, "raw_nws_temp_c", daily_df["_corr_t"])
-    daily_df["_pop"] = get_col(daily_df, "nws_pop_pct", 0.0)
-    daily_df["_qpf"] = get_col(daily_df, "nws_qpf_1hr_mm", 0.0)
+    daily_df["_raw_pop"] = get_col(daily_df, "nws_pop_pct", 0.0)
+    daily_df["_mos_pop"] = get_col(daily_df, "mos_pop_pct", daily_df["_raw_pop"])
+    daily_df["_raw_qpf"] = get_col(daily_df, "nws_qpf_1hr_mm", 0.0)
+    daily_df["_mos_qpf"] = get_col(daily_df, "mos_qpf_mm", daily_df["_raw_qpf"])
+    daily_df["_mos_qpf_p90"] = get_col(daily_df, "mos_qpf_p90_mm", daily_df["_mos_qpf"] * 1.5)
     daily_df["_rh"] = get_col(daily_df, "corrected_rh_pct", np.nan).combine_first(
         get_col(daily_df, "nws_rh_pct", 45.0)
     )
@@ -1290,35 +1288,42 @@ if not future_fc_df.empty:
             MOS_High_F=("_corr_t", lambda s: round(c_to_f(float(s.max())), 1)),
             MOS_Low_F=("_corr_t", lambda s: round(c_to_f(float(s.min())), 1)),
             Cold_Pool_Floor_F=("_p10_t", lambda s: round(c_to_f(float(s.min())), 1)),
-            Thermal_Peak_P90_F=("_p90_t", lambda s: round(c_to_f(float(s.max())), 1)),
             NWS_High_F=("_nws_t", lambda s: round(c_to_f(float(s.max())), 1)),
             NWS_Low_F=("_nws_t", lambda s: round(c_to_f(float(s.min())), 1)),
-            Max_PoP_Pct=("_pop", lambda s: int(round(safe_float(s.max(), 0.0), 0))),
-            Total_Precip_In=("_qpf", lambda s: round(mm_to_in(float(s.sum())), 2)),
+            MOS_Max_PoP_Pct=("_mos_pop", lambda s: int(round(safe_float(s.max(), 0.0), 0))),
+            Raw_Max_PoP_Pct=("_raw_pop", lambda s: int(round(safe_float(s.max(), 0.0), 0))),
+            MOS_QPF_In=("_mos_qpf", lambda s: round(mm_to_in(float(s.sum())), 2)),
+            MOS_P90_QPF_In=("_mos_qpf_p90", lambda s: round(mm_to_in(float(s.sum())), 2)),
+            Raw_QPF_In=("_raw_qpf", lambda s: round(mm_to_in(float(s.sum())), 2)),
             Min_RH_Pct=("_rh", lambda s: int(round(safe_float(s.min(), 40.0), 0))),
             Peak_Gust_MPH=("_gust", lambda s: round(ms_to_mph(safe_float(s.max(), 0.0)), 1)),
-            Hours_Count=("_corr_t", "count"),
         )
         .sort_values("Sort_Date")
     )
 
     def _met_regime(row):
         notes = []
+        if row["MOS_QPF_In"] >= 1.25 or row["MOS_P90_QPF_In"] >= 2.0:
+            notes.append("Heavy Orographic Rain / Tassajara Rd Slip & Creek Rise Risk")
+        elif row["MOS_QPF_In"] >= 0.25 or row["MOS_Max_PoP_Pct"] >= 55:
+            notes.append("Wetting Frontal Rain Likely")
+        elif row["Raw_Max_PoP_Pct"] >= 35 and row["MOS_Max_PoP_Pct"] < 20:
+            notes.append("Sub-Cloud Virga Suppression (Dry Canyon Boundary Layer)")
+        elif row["MOS_Max_PoP_Pct"] >= 25:
+            notes.append("Slight Chance Light Canyon Showers")
+
         if row["Cold_Pool_Floor_F"] <= 32.0:
             notes.append("Hard Freeze Risk (P10 ≤ 32°F)")
         elif row["Cold_Pool_Floor_F"] <= 36.0:
             notes.append("Nocturnal Cold-Pool Frost Risk")
-        if row["Total_Precip_In"] >= 0.25 or row["Max_PoP_Pct"] >= 50:
-            notes.append("Frontal Precipitation Likely")
-        elif row["Max_PoP_Pct"] >= 25:
-            notes.append("Slight Chance Light Rain")
+
         if row["Min_RH_Pct"] <= 20 and row["Peak_Gust_MPH"] >= 20:
             notes.append("Elevated Fire-Weather Subsidence")
         if not notes:
             notes.append("Diurnal Katabatic / Anabatic Valley Regime")
         return " | ".join(notes)
 
-    daily_summary["Canyon Meteorological Regime"] = daily_summary.apply(_met_regime, axis=1)
+    daily_summary["Canyon Meteorological & Hydrological Regime"] = daily_summary.apply(_met_regime, axis=1)
 
     display_daily = daily_summary[
         [
@@ -1326,14 +1331,13 @@ if not future_fc_df.empty:
             "MOS_High_F",
             "MOS_Low_F",
             "Cold_Pool_Floor_F",
-            "Thermal_Peak_P90_F",
-            "NWS_High_F",
-            "NWS_Low_F",
-            "Max_PoP_Pct",
-            "Total_Precip_In",
+            "MOS_Max_PoP_Pct",
+            "MOS_QPF_In",
+            "MOS_P90_QPF_In",
+            "Raw_QPF_In",
             "Min_RH_Pct",
             "Peak_Gust_MPH",
-            "Canyon Meteorological Regime",
+            "Canyon Meteorological & Hydrological Regime",
         ]
     ].rename(
         columns={
@@ -1341,78 +1345,13 @@ if not future_fc_df.empty:
             "MOS_High_F": "MOS High (°F)",
             "MOS_Low_F": "MOS Low (°F)",
             "Cold_Pool_Floor_F": "P10 Floor (°F)",
-            "Thermal_Peak_P90_F": "P90 Ceiling (°F)",
-            "NWS_High_F": "Raw NWS High (°F)",
-            "NWS_Low_F": "Raw NWS Low (°F)",
-            "Max_PoP_Pct": "Max PoP (%)",
-            "Total_Precip_In": "QPF Total (in)",
+            "MOS_Max_PoP_Pct": "MOS PoP (%)",
+            "MOS_QPF_In": "MOS QPF (in)",
+            "MOS_P90_QPF_In": "P90 Ceiling QPF (in)",
+            "Raw_QPF_In": "Raw NWS QPF (in)",
             "Min_RH_Pct": "Min RH (%)",
             "Peak_Gust_MPH": "Peak Gust (mph)",
         }
     )
 
-    st.dataframe(
-        display_daily,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Date": st.column_config.TextColumn(
-                "Date",
-                help="Local calendar date (America/Los_Angeles) for the 24-hour diurnal aggregation period.",
-            ),
-            "MOS High (°F)": st.column_config.NumberColumn(
-                "MOS High (°F)",
-                format="%.1f °F",
-                help="Daily maximum dry-bulb temperature predicted by the Tassajara MOS ensemble mean, accounting for afternoon canyon wall shadowing.",
-            ),
-            "MOS Low (°F)": st.column_config.NumberColumn(
-                "MOS Low (°F)",
-                format="%.1f °F",
-                help="Daily minimum dry-bulb temperature predicted by the Tassajara MOS ensemble mean under nocturnal katabatic drainage.",
-            ),
-            "P10 Floor (°F)": st.column_config.NumberColumn(
-                "P10 Floor (°F)",
-                format="%.1f °F",
-                help="10th-percentile quantile regression lower bound for daily minimum temperature. Used as the conservative operational threshold for hard-freeze pipe protection (≤ 32.0 °F).",
-            ),
-            "P90 Ceiling (°F)": st.column_config.NumberColumn(
-                "P90 Ceiling (°F)",
-                format="%.1f °F",
-                help="90th-percentile quantile regression upper bound for daily maximum temperature under clear-sky super-adiabatic heating.",
-            ),
-            "Raw NWS High (°F)": st.column_config.NumberColumn(
-                "Raw NWS High (°F)",
-                format="%.1f °F",
-                help="Uncorrected daily maximum temperature from the baseline 2.5 km National Weather Service (NDFD) grid forecast.",
-            ),
-            "Raw NWS Low (°F)": st.column_config.NumberColumn(
-                "Raw NWS Low (°F)",
-                format="%.1f °F",
-                help="Uncorrected daily minimum temperature from the baseline 2.5 km National Weather Service (NDFD) grid forecast.",
-            ),
-            "Max PoP (%)": st.column_config.NumberColumn(
-                "Max PoP (%)",
-                format="%d %%",
-                help="Maximum hourly Probability of Precipitation (≥ 0.01 inch) during the 24-hour calendar day.",
-            ),
-            "QPF Total (in)": st.column_config.NumberColumn(
-                "QPF Total (in)",
-                format="%.2f in",
-                help="24-hour cumulative Quantitative Precipitation Forecast (liquid-equivalent inches).",
-            ),
-            "Min RH (%)": st.column_config.NumberColumn(
-                "Min RH (%)",
-                format="%d %%",
-                help="Minimum hourly Relative Humidity (%) forecast during the diurnal heating cycle; values ≤ 20% indicate elevated fire-weather desiccation.",
-            ),
-            "Peak Gust (mph)": st.column_config.NumberColumn(
-                "Peak Gust (mph)",
-                format="%.1f mph",
-                help="Maximum 10-meter wind gust speed forecast within the canyon during the 24-hour period.",
-            ),
-            "Canyon Meteorological Regime": st.column_config.TextColumn(
-                "Canyon Meteorological Regime",
-                help="Automated synoptic and microclimatic classification synthesized from P10 freeze thresholds, QPF/PoP frontal moisture, and RH/gust fire-weather criteria.",
-            ),
-        },
-    )
+    st.dataframe(display_daily, use_container_width=True, hide_index=True)

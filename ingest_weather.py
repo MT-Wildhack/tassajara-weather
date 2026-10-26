@@ -7,6 +7,7 @@ Hastings RAWS CAHC1), and performs spatial anomaly detection & lapse-rate calcul
 """
 
 import os
+import math
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
@@ -27,6 +28,9 @@ WEATHERLINK_BASE_URL = "https://api.weatherlink.com/v2"
 
 # Synoptic Data (MesoWest) public token for RAWS/CNRFC stations (CHWC1, CAHC1)
 SYNOPTIC_API_TOKEN = (os.getenv("SYNOPTIC_TOKEN") or "").strip() or "959822b9da094eabb0e41b8a5a7dcaa5"
+
+# Primary Tassajara Station ID (Stone Office Vantage Pro2)
+DEFAULT_TASSAJARA_STATION_ID = 36966
 
 # Station Elevations (meters MSL)
 ELEV_TASSAJARA_M = 485.0    # Stone Office (1,590 ft)
@@ -58,10 +62,19 @@ def inhg_to_hpa(press_inhg: Optional[float]) -> Optional[float]:
     return round(press_inhg * 33.86389, 2) if press_inhg is not None else None
 
 
+def compute_vpd_kpa(temp_c: Optional[float], rh_pct: Optional[float]) -> Optional[float]:
+    """Computes saturation Vapor Pressure Deficit (kPa) via Tetens equation."""
+    if temp_c is None or rh_pct is None:
+        return None
+    es = 0.61078 * math.exp((17.27 * float(temp_c)) / (float(temp_c) + 237.3))
+    ea = es * (max(0.0, min(100.0, float(rh_pct))) / 100.0)
+    return round(max(0.0, es - ea), 3)
+
+
 class WeatherLinkV2Client:
     """Client for Davis WeatherLink v2 API using X-Api-Secret header authentication."""
 
-    def __init__(self, api_key: str, api_secret: str):
+    def __init__(self, api_key: str = WEATHERLINK_API_KEY, api_secret: str = WEATHERLINK_API_SECRET):
         self.api_key = (api_key or "").strip() or WEATHERLINK_API_KEY
         self.api_secret = (api_secret or "").strip() or WEATHERLINK_API_SECRET
         self.session = requests.Session()
@@ -71,16 +84,30 @@ class WeatherLinkV2Client:
         })
 
     def get_station_id(self) -> int:
-        """Discovers the first active station_id associated with the API key."""
+        """Discovers the active station_id associated with the API key, defaulting to 36966."""
         url = f"{WEATHERLINK_BASE_URL}/stations"
-        resp = self.session.get(url, params={"api-key": self.api_key}, timeout=15)
-        resp.raise_for_status()
-        stations = resp.json().get("stations", [])
-        if not stations:
-            raise RuntimeError("No active stations found for provided WeatherLink API Key.")
-        station_id = stations[0]["station_id"]
-        logger.info(f"Discovered WeatherLink station: {stations[0].get('station_name')} (ID: {station_id})")
-        return station_id
+        try:
+            resp = self.session.get(url, params={"api-key": self.api_key}, timeout=15)
+            resp.raise_for_status()
+            stations = resp.json().get("stations", [])
+            if stations:
+                for stn in stations:
+                    if int(stn.get("station_id", 0)) == DEFAULT_TASSAJARA_STATION_ID:
+                        logger.info(
+                            f"Verified Tassajara WeatherLink station: "
+                            f"{stn.get('station_name')} (ID: {DEFAULT_TASSAJARA_STATION_ID})"
+                        )
+                        return DEFAULT_TASSAJARA_STATION_ID
+                station_id = int(stations[0]["station_id"])
+                logger.info(
+                    f"Discovered WeatherLink station: {stations[0].get('station_name')} (ID: {station_id})"
+                )
+                return station_id
+        except Exception as exc:
+            logger.warning(
+                f"Station discovery query failed ({exc}); using default Station ID {DEFAULT_TASSAJARA_STATION_ID}."
+            )
+        return DEFAULT_TASSAJARA_STATION_ID
 
     def fetch_current_observations(self, station_id: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -108,6 +135,8 @@ class WeatherLinkV2Client:
             "mslp_hpa": None,
             "pressure_trend_hpa": None,
             "precip_1hr_mm": 0.0,
+            "precip_24hr_mm": 0.0,
+            "precip_storm_mm": 0.0,
             "precip_rate_mm_hr": 0.0,
             "solar_rad_wm2": None,
             "uv_index": None,
@@ -161,10 +190,26 @@ class WeatherLinkV2Client:
                 parsed["wind_gust_ms"] = mph_to_ms(w_gst) or 0.0
                 parsed["wind_dir_deg"] = float(w_dir)
 
+                # 1-Hour Rainfall
                 rain_1hr_in = latest.get("rainfall_last_60_min_in")
                 if rain_1hr_in is None and latest.get("rainfall_last_60_min") is not None:
                     rain_1hr_in = latest["rainfall_last_60_min"] * 0.01
                 parsed["precip_1hr_mm"] = in_to_mm(rain_1hr_in or 0.0) or 0.0
+
+                # 24-Hour & Storm Rainfall
+                rain_24hr_in = first_not_none(
+                    latest.get("rainfall_last_24_hr_in"),
+                    (latest.get("rainfall_last_24_hr") * 0.01) if latest.get("rainfall_last_24_hr") is not None else None,
+                    0.0,
+                )
+                parsed["precip_24hr_mm"] = in_to_mm(rain_24hr_in) or 0.0
+
+                rain_storm_in = first_not_none(
+                    latest.get("rain_storm_in"),
+                    latest.get("rain_storm_last_in"),
+                    0.0,
+                )
+                parsed["precip_storm_mm"] = in_to_mm(rain_storm_in) or 0.0
 
                 rain_rate_in = first_not_none(
                     latest.get("rain_rate_hi_in"),
@@ -189,7 +234,7 @@ def fetch_regional_reference_stations(stids: List[str] = ["CHWC1", "CAHC1"]) -> 
         "stid": ",".join(stids),
         "vars": "air_temp,relative_humidity,wind_speed,wind_gust,wind_direction,precip_accum_one_hour",
         "units": "metric",
-        "within": 90,
+        "within": 120,
         "token": SYNOPTIC_API_TOKEN
     }
     references: Dict[str, Dict[str, Any]] = {}
@@ -207,7 +252,7 @@ def fetch_regional_reference_stations(stids: List[str] = ["CHWC1", "CAHC1"]) -> 
                 "wind_speed_ms": obs.get("wind_speed_value_1", {}).get("value"),
                 "wind_gust_ms": obs.get("wind_gust_value_1", {}).get("value"),
                 "wind_dir_deg": obs.get("wind_direction_value_1", {}).get("value"),
-                "precip_1hr_mm": obs.get("precip_accum_one_hour_value_1", {}).get("value", 0.0)
+                "precip_1hr_mm": obs.get("precip_accum_one_hour_value_1", {}).get("value", 0.0) or 0.0
             }
     except Exception as exc:
         logger.warning(f"Reference station fetch failed or token unconfigured: {exc}")
@@ -220,17 +265,20 @@ def compute_microclimate_diagnostics(
 ) -> Dict[str, Any]:
     """
     Cross-references Tassajara actuals against Chews Ridge (CHWC1) and Hastings (CAHC1)
-    to compute boundary-layer stability and hardware QC flags.
+    to compute boundary-layer stability, orographic enhancement ratios, and hardware QC flags.
     """
     diagnostics = {
         "lapse_rate_chews_c_km": None,
         "canyon_confinement_diff_c": None,
+        "vpd_kpa": compute_vpd_kpa(tass_obs.get("temp_c"), tass_obs.get("rh_pct")),
         "inversion_active": False,
+        "virga_regime_active": False,
         "qc_flag": "OK",
         "qc_notes": []
     }
 
     t_tass = tass_obs.get("temp_c")
+    rh_tass = tass_obs.get("rh_pct")
     chews = ref_obs.get("CHWC1", {})
     hastings = ref_obs.get("CAHC1", {})
 
@@ -252,13 +300,24 @@ def compute_microclimate_diagnostics(
         diff_c = round(t_tass - t_hastings_adj, 2)
         diagnostics["canyon_confinement_diff_c"] = diff_c
 
-    if (chews.get("precip_1hr_mm") or 0) > 2.5 and (hastings.get("precip_1hr_mm") or 0) > 2.0:
-        if (tass_obs.get("precip_1hr_mm") or 0) == 0.0:
-            diagnostics["qc_flag"] = "ERR_RAIN_GAUGE_CLOG"
-            diagnostics["qc_notes"].append(
-                "Zero precipitation recorded at Stone Office while both CHWC1 and CAHC1 report >2mm/hr. "
-                "Inspect rain cone for sycamore leaf blockage."
-            )
+    chews_p = chews.get("precip_1hr_mm") or 0.0
+    hast_p = hastings.get("precip_1hr_mm") or 0.0
+    tass_p = tass_obs.get("precip_1hr_mm") or 0.0
+
+    # Distinguish sub-cloud canyon virga (low RH at Stone Office while ridge precipitates)
+    # from mechanical tipping-bucket blockage (high RH >= 88% at Stone Office but 0 tips)
+    if chews_p > 1.0 and tass_p == 0.0 and (rh_tass or 100.0) < 75.0:
+        diagnostics["virga_regime_active"] = True
+        diagnostics["qc_notes"].append(
+            f"Sub-cloud virga active: Chews Ridge reporting {chews_p:.1f} mm/hr while "
+            f"canyon boundary layer remains dry (RH {rh_tass:.0f}%)."
+        )
+    elif chews_p > 2.5 and hast_p > 2.0 and tass_p == 0.0 and (rh_tass or 0.0) >= 88.0:
+        diagnostics["qc_flag"] = "ERR_RAIN_GAUGE_CLOG"
+        diagnostics["qc_notes"].append(
+            "Zero precipitation recorded at Stone Office under saturated conditions (RH >= 88%) "
+            "while both CHWC1 and CAHC1 report >2mm/hr. Inspect rain cone for sycamore leaf blockage."
+        )
 
     return diagnostics
 
