@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-run_hourly_mos_pipeline.py (v3 - Defensively Resilient)
+run_hourly_mos_pipeline.py (v4 — Thermal + Two-Stage Hydrological Hurdle Edition)
 Master hourly runner script for the Tassajara Zen Mountain Center (TZMC)
 Microclimate Forecasting Pipeline. Initializes SQLite schema/views, logs
 Stone Office Vantage Pro2 and RAWS reference observations (with API fallback),
-ingests operational NWS hourly grids, generates MOS quantile forecasts, and
-evaluates facility alert thresholds.
+ingests operational NWS hourly grids, generates MOS quantile thermal and
+hydrological (PoP/QPF) forecasts, and evaluates facility alert thresholds.
 """
 
 import sqlite3
@@ -22,7 +22,11 @@ from ingest_weather import (
     compute_microclimate_diagnostics,
 )
 from ingest_nws import fetch_and_store_nws_hourly
-from mos_model import compute_solar_and_canyon_shadow
+from mos_model import (
+    compute_solar_and_canyon_shadow,
+    engineer_mos_features,
+    analytical_hydro_hurdle_fallback,
+)
 from alert_engine import FacilityAlertManager
 from backfill_and_train import ensure_schema_and_view
 
@@ -34,7 +38,7 @@ MODEL_PATH = Path("models/tassajara_mos_v1.joblib")
 
 
 def init_db_if_needed():
-    """Ensures all SQLite tables and the leak-free vw_mos_training_dataset view exist."""
+    """Ensures all SQLite tables, hydrological columns, and vw_mos_training_dataset exist."""
     ensure_schema_and_view(DB_PATH)
 
 
@@ -52,7 +56,9 @@ def log_observations():
         client = WeatherLinkV2Client(WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET)
         tass = client.fetch_current_observations()
     except Exception as exc:
-        logger.warning(f"Live WeatherLink API fetch failed ({exc}); falling back to latest SQLite observation...")
+        logger.warning(
+            f"Live WeatherLink API fetch failed ({exc}); falling back to latest SQLite observation..."
+        )
 
     # 2. Try Live Synoptic Reference Ingest
     try:
@@ -61,10 +67,16 @@ def log_observations():
         logger.warning(f"Live reference RAWS fetch failed ({exc}); using SQLite archive...")
 
     with sqlite3.connect(DB_PATH) as conn:
-        # If live tass observation failed or is incomplete, pull latest from SQLite
         if not tass or tass.get("temp_c") is None:
             row_t = conn.execute(
-                "SELECT valid_time_utc, temp_c, dewpoint_c, wetbulb_c, rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg, mslp_hpa, pressure_trend_3hr_hpa, precip_1hr_mm, solar_rad_wm2, uv_index, qc_flag FROM local_observations ORDER BY valid_time_utc DESC LIMIT 1"
+                """
+                SELECT valid_time_utc, temp_c, dewpoint_c, wetbulb_c, rh_pct,
+                       wind_speed_ms, wind_gust_ms, wind_dir_deg, mslp_hpa,
+                       pressure_trend_3hr_hpa, precip_1hr_mm, solar_rad_wm2,
+                       uv_index, qc_flag
+                FROM local_observations
+                ORDER BY valid_time_utc DESC LIMIT 1
+                """
             ).fetchone()
             if row_t:
                 tass = {
@@ -85,9 +97,10 @@ def log_observations():
                 diag["qc_flag"] = row_t[13] or "OK"
 
         if not tass or tass.get("temp_c") is None:
-            # Absolute fallback if database is empty
             tass = {
-                "valid_time_utc": pd.Timestamp.now(tz="UTC").replace(minute=0, second=0, microsecond=0).isoformat(),
+                "valid_time_utc": pd.Timestamp.now(tz="UTC")
+                .replace(minute=0, second=0, microsecond=0)
+                .isoformat(),
                 "temp_c": 15.0,
                 "dewpoint_c": 5.0,
                 "rh_pct": 50.0,
@@ -99,11 +112,16 @@ def log_observations():
                 "precip_1hr_mm": 0.0,
             }
 
-        # Ensure reference dict has CHWC1 and CAHC1
         for stid in ["CHWC1", "CAHC1"]:
             if stid not in refs or not refs[stid].get("temp_c"):
                 r_row = conn.execute(
-                    "SELECT temp_c, rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg, precip_1hr_mm FROM reference_observations WHERE station_id = ? AND temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1",
+                    """
+                    SELECT temp_c, rh_pct, wind_speed_ms, wind_gust_ms,
+                           wind_dir_deg, precip_1hr_mm
+                    FROM reference_observations
+                    WHERE station_id = ? AND temp_c IS NOT NULL
+                    ORDER BY valid_time_utc DESC LIMIT 1
+                    """,
                     (stid,),
                 ).fetchone()
                 if r_row:
@@ -121,7 +139,9 @@ def log_observations():
 
         dt_hour = pd.to_datetime(tass["valid_time_utc"], utc=True).floor("h").isoformat()
         wind_speed_ms = tass.get("wind_speed_ms") if tass.get("wind_speed_ms") is not None else 0.0
-        wind_gust_ms = tass.get("wind_gust_ms") if tass.get("wind_gust_ms") is not None else wind_speed_ms
+        wind_gust_ms = (
+            tass.get("wind_gust_ms") if tass.get("wind_gust_ms") is not None else wind_speed_ms
+        )
         wind_dir_deg = tass.get("wind_dir_deg") if tass.get("wind_dir_deg") is not None else 0.0
         precip_1hr_mm = tass.get("precip_1hr_mm") if tass.get("precip_1hr_mm") is not None else 0.0
 
@@ -192,7 +212,7 @@ def log_observations():
 
 
 def generate_mos_forecast(tass, refs):
-    """Applies the trained MOS ensemble (or topographic physics fallback) to the latest full NWS forecast."""
+    """Applies the trained MOS ensemble (thermal + hydrological hurdle) to the latest full NWS forecast."""
     with sqlite3.connect(DB_PATH) as conn:
         fc_df = pd.read_sql_query(
             """
@@ -214,17 +234,27 @@ def generate_mos_forecast(tass, refs):
             return pd.DataFrame()
 
         chews_temp_c = refs.get("CHWC1", {}).get("temp_c")
+        chews_precip_mm = refs.get("CHWC1", {}).get("precip_1hr_mm")
         if chews_temp_c is None:
             row_ch = conn.execute(
-                "SELECT temp_c FROM reference_observations WHERE station_id = 'CHWC1' AND temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1"
+                """
+                SELECT temp_c, precip_1hr_mm FROM reference_observations
+                WHERE station_id = 'CHWC1' AND temp_c IS NOT NULL
+                ORDER BY valid_time_utc DESC LIMIT 1
+                """
             ).fetchone()
-            chews_temp_c = float(row_ch[0]) if row_ch else None
+            if row_ch:
+                chews_temp_c = float(row_ch[0])
+                chews_precip_mm = float(row_ch[1] or 0.0)
 
     fc_df["pressure_trend_3hr_hpa"] = (
         tass.get("pressure_trend_hpa") if tass.get("pressure_trend_hpa") is not None else 0.0
     )
     fc_df["issue_chews_temp_c"] = (
         chews_temp_c if chews_temp_c is not None else (fc_df["nws_temp_c"] + 2.0)
+    )
+    fc_df["issue_chews_precip_mm"] = (
+        chews_precip_mm if chews_precip_mm is not None else 0.0
     )
     fc_df["issue_tass_temp_c"] = (
         tass.get("temp_c") if tass.get("temp_c") is not None else fc_df["nws_temp_c"]
@@ -236,7 +266,7 @@ def generate_mos_forecast(tass, refs):
     if MODEL_PATH.exists():
         mos = joblib.load(MODEL_PATH)
         preds = mos.predict(fc_df)
-        model_ver = "MOS_GBM_v1"
+        model_ver = "MOS_GBM_v2_HYDRO"
     else:
         solar = compute_solar_and_canyon_shadow(fc_df["valid_time_utc"])
         bias = (
@@ -244,12 +274,30 @@ def generate_mos_forecast(tass, refs):
             - 2.5 * solar["in_canyon_shadow"]
             + 1.5 * (solar["effective_insolation"] > 0.65).astype(float)
         )
+        X_feats = engineer_mos_features(fc_df)
+        hydro_fb = analytical_hydro_hurdle_fallback(X_feats)
+
         preds = fc_df[["issue_time_utc", "valid_time_utc", "nws_temp_c"]].copy()
         preds["pred_temp_error_c"] = bias.round(2)
         preds["corrected_temp_c"] = (fc_df["nws_temp_c"] + bias).round(2)
         preds["corrected_temp_p10_c"] = (preds["corrected_temp_c"] - 2.2).round(2)
         preds["corrected_temp_p90_c"] = (preds["corrected_temp_c"] + 2.2).round(2)
+        preds["raw_nws_pop_pct"] = X_feats["nws_pop_pct"].round(1).values
+        preds["mos_pop_pct"] = hydro_fb["mos_pop_pct"].values
+        preds["raw_nws_qpf_mm"] = X_feats["nws_qpf_1hr_mm"].round(2).values
+        preds["mos_qpf_mm"] = hydro_fb["mos_qpf_mm"].values
+        preds["mos_qpf_p90_mm"] = hydro_fb["mos_qpf_p90_mm"].values
         model_ver = "TOPO_PHYSICS_COLDSTART"
+
+    # Ensure hydrological columns are present even if an older .joblib artifact was loaded
+    if "mos_qpf_mm" not in preds.columns:
+        X_feats = engineer_mos_features(fc_df)
+        hydro_fb = analytical_hydro_hurdle_fallback(X_feats)
+        preds["raw_nws_pop_pct"] = X_feats["nws_pop_pct"].round(1).values
+        preds["mos_pop_pct"] = hydro_fb["mos_pop_pct"].values
+        preds["raw_nws_qpf_mm"] = X_feats["nws_qpf_1hr_mm"].round(2).values
+        preds["mos_qpf_mm"] = hydro_fb["mos_qpf_mm"].values
+        preds["mos_qpf_p90_mm"] = hydro_fb["mos_qpf_p90_mm"].values
 
     rows = [
         (
@@ -263,6 +311,11 @@ def generate_mos_forecast(tass, refs):
             float(r["corrected_temp_p90_c"]),
             float(fc_df.loc[idx, "nws_rh_pct"]) if pd.notna(fc_df.loc[idx, "nws_rh_pct"]) else 50.0,
             round(float(fc_df.loc[idx, "nws_wind_speed_ms"] or 0.0) * 1.35, 2),
+            float(r["raw_nws_pop_pct"]),
+            float(r["mos_pop_pct"]),
+            float(r["raw_nws_qpf_mm"]),
+            float(r["mos_qpf_mm"]),
+            float(r["mos_qpf_p90_mm"]),
         )
         for idx, r in preds.iterrows()
     ]
@@ -273,8 +326,10 @@ def generate_mos_forecast(tass, refs):
                 issue_time_utc, valid_time_utc, model_version,
                 raw_nws_temp_c, pred_temp_error_c, corrected_temp_c,
                 corrected_temp_p10_c, corrected_temp_p90_c,
-                corrected_rh_pct, corrected_wind_gust_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                corrected_rh_pct, corrected_wind_gust_ms,
+                raw_nws_pop_pct, mos_pop_pct,
+                raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -298,7 +353,9 @@ if __name__ == "__main__":
     try:
         fetch_and_store_nws_hourly(DB_PATH)
     except Exception as exc:
-        logger.warning(f"NWS forecast ingest API unreachable ({exc}); proceeding with existing SQLite forecast archive...")
+        logger.warning(
+            f"NWS forecast ingest API unreachable ({exc}); proceeding with existing SQLite forecast archive..."
+        )
 
     print("4. Computing Tassajara canyon-corrected forecast...")
     mos_df = generate_mos_forecast(tass_obs, ref_obs)
