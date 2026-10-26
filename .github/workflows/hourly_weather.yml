@@ -4,10 +4,21 @@ on:
   schedule:
     # Runs at minute 05 of every hour UTC (after top-of-hour Davis VP2 & RAWS logger commits)
     - cron: "5 * * * *"
+    # Optimal Weekly Retraining Schedule:
+    # Runs every Sunday at 11:25 UTC (03:25 AM PST / 04:25 AM PDT) during nocturnal katabatic regime
+    - cron: "25 11 * * 0"
   workflow_dispatch:
     inputs:
       run_backfill:
-        description: "Run 90-day historical backfill & retrain MOS ensemble (backfill_and_train.py)"
+        description: "Run historical API backfill & retrain MOS ensemble (backfill_and_train.py)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      retrain_only:
+        description: "Fast retrain MOS ensemble on existing SQLite archive (--skip-fetch)"
         required: false
         default: "true"
         type: choice
@@ -15,9 +26,9 @@ on:
           - "true"
           - "false"
       backfill_days:
-        description: "Number of historical days to backfill"
+        description: "Number of historical days to backfill (if run_backfill is true)"
         required: false
-        default: "90"
+        default: "730"
         type: string
 
 # Serialize workflow runs so scheduled cron jobs and manual dispatches never race on git push
@@ -63,25 +74,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Backfill Historical Observations & Train MOS Ensemble (If Requested or Model Missing)
+      - name: Backfill or Weekly Retrain MOS Ensemble (Scheduled Weekly, Manual, or Model Missing)
         run: |
           mkdir -p models logs
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_backfill }}" = "true" ]; then
-            echo "Manual dispatch requested historical backfill (${{ inputs.backfill_days }} days) & MOS training..."
+            echo "Manual dispatch requested historical API backfill (${{ inputs.backfill_days }} days) & MOS training..."
             python backfill_and_train.py --days "${{ inputs.backfill_days }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.retrain_only }}" = "true" ]; then
+            echo "Manual dispatch requested fast MOS retraining (--skip-fetch) on cumulative SQLite database..."
+            python backfill_and_train.py --skip-fetch
+          elif [ "${{ github.event.schedule }}" = "25 11 * * 0" ]; then
+            echo "Scheduled Sunday 11:25 UTC weekly MOS retraining (--skip-fetch) on cumulative SQLite archive..."
+            python backfill_and_train.py --skip-fetch
           elif [ ! -f "models/tassajara_mos_v1.joblib" ]; then
             echo "Production model weights (models/tassajara_mos_v1.joblib) not found; running backfill_and_train.py..."
-            python backfill_and_train.py --days 90
+            python backfill_and_train.py --days 730
           else
-            # Verify that historical paired rows in SQLite have MOS verification scores populated
+            # Verify that historical paired rows in SQLite have both thermal and hydrological MOS scores populated
             python -c "
           import sqlite3
           conn = sqlite3.connect('tassajara_weather.db')
           cur = conn.cursor()
+          cols = {r[1] for r in cur.execute('PRAGMA table_info(mos_corrected_forecasts)').fetchall()}
+          if 'mos_qpf_mm' not in cols or 'mos_pop_pct' not in cols:
+              print('Hydrological MOS columns missing; triggering fast retrain...')
+              raise SystemExit(1)
           cur.execute('''
               SELECT COUNT(*) FROM local_observations o
               INNER JOIN mos_corrected_forecasts m ON o.valid_time_utc = m.valid_time_utc
-              WHERE o.temp_c IS NOT NULL
+              WHERE o.temp_c IS NOT NULL AND m.mos_qpf_mm IS NOT NULL
           ''')
           paired_mos = cur.fetchone()[0]
           print(f'Active paired MOS verification rows: {paired_mos}')
@@ -123,7 +144,11 @@ jobs:
           fi
 
           TIMESTAMP_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git commit -m "chore(telemetry): update tassajara_weather.db and MOS weights [${TIMESTAMP_UTC}] [skip ci]"
+          if [ "${{ github.event.schedule }}" = "25 11 * * 0" ]; then
+            git commit -m "chore(model): weekly MOS ensemble retrain & database update [${TIMESTAMP_UTC}] [skip ci]"
+          else
+            git commit -m "chore(telemetry): update tassajara_weather.db and MOS weights [${TIMESTAMP_UTC}] [skip ci]"
+          fi
 
           # Atomic rebase-retry loop to prevent race conditions against concurrent commits on main
           for attempt in 1 2 3; do
