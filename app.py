@@ -20,7 +20,6 @@ from plotly.subplots import make_subplots
 from sklearn.inspection import permutation_importance
 import statsmodels.api as sm
 
-from mos_model import engineer_mos_features, analytical_hydro_hurdle_fallback
 
 st.set_page_config(
     page_title="TZMC Atmospheric & Hydrological MOS Monitor",
@@ -333,6 +332,229 @@ def compute_canyon_solar_state(dt_utc: datetime):
     return "Direct Canyon Insolation", el_deg, az_deg, horizon_deg
 
 
+TASS_LAT_RAD = np.radians(36.2337)
+TASS_LON_DEG = -121.5501
+CANYON_AXIS_RAD = np.radians(115.0)        # ESE-WNW primary axis of Tassajara Creek Canyon
+OROGRAPHIC_UPSLOPE_RAD = np.radians(215.0) # SSW (215 deg) perpendicular to Santa Lucia crest
+TIPPING_BUCKET_MM = 0.254                  # 0.01 inch Davis Vantage Pro2 rain spoon threshold
+
+
+def compute_solar_and_canyon_shadow(timestamps_utc: pd.Series) -> pd.DataFrame:
+    """Calculates solar altitude, azimuth, and Black Cone Trail / Pine Ridge canyon shadow."""
+    dt = pd.to_datetime(timestamps_utc, utc=True)
+    doy = dt.dt.dayofyear.values
+    hour_utc = dt.dt.hour.values + dt.dt.minute.values / 60.0
+
+    gamma = 2.0 * np.pi / 365.0 * (doy - 1 + (hour_utc - 12.0) / 24.0)
+    decl = (
+        0.006918
+        - 0.399912 * np.cos(gamma)
+        + 0.070257 * np.sin(gamma)
+        - 0.006758 * np.cos(2 * gamma)
+        + 0.000907 * np.sin(2 * gamma)
+    )
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * np.cos(gamma)
+        - 0.032077 * np.sin(gamma)
+        - 0.014615 * np.cos(2 * gamma)
+        - 0.040849 * np.sin(2 * gamma)
+    )
+
+    tst = (hour_utc * 60.0 + eqtime + 4.0 * TASS_LON_DEG) % 1440.0
+    ha_rad = np.radians((tst / 4.0) - 180.0)
+
+    sin_el = (
+        np.sin(TASS_LAT_RAD) * np.sin(decl)
+        + np.cos(TASS_LAT_RAD) * np.cos(decl) * np.cos(ha_rad)
+    )
+    solar_el_deg = np.degrees(np.arcsin(np.clip(sin_el, -1.0, 1.0)))
+
+    cos_az = (
+        (np.sin(decl) - np.sin(TASS_LAT_RAD) * sin_el)
+        / (np.cos(TASS_LAT_RAD) * np.cos(np.arcsin(np.clip(sin_el, -1.0, 1.0))) + 1e-6)
+    )
+    az_deg = np.degrees(np.arccos(np.clip(cos_az, -1.0, 1.0)))
+    solar_az_deg = np.where(ha_rad > 0, (360.0 - az_deg) % 360.0, az_deg)
+
+    horizon_deg = np.full_like(solar_az_deg, 18.0)
+    horizon_deg = np.where((solar_az_deg >= 145.0) & (solar_az_deg <= 255.0), 32.0, horizon_deg)
+    horizon_deg = np.where((solar_az_deg >= 45.0) & (solar_az_deg <= 115.0), 23.0, horizon_deg)
+
+    in_canyon_shadow = ((solar_el_deg > 0.0) & (solar_el_deg < horizon_deg)).astype(float)
+    effective_insolation = np.where(
+        solar_el_deg >= horizon_deg, np.sin(np.radians(solar_el_deg)), 0.0
+    )
+
+    return pd.DataFrame(
+        {
+            "solar_el_deg": solar_el_deg,
+            "solar_az_deg": solar_az_deg,
+            "in_canyon_shadow": in_canyon_shadow,
+            "effective_insolation": effective_insolation,
+        },
+        index=timestamps_utc.index,
+    )
+
+
+def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds physical, cyclical, topographic, and hydrological features for both
+    canyon temperature bias and orographic/virga precipitation calibration.
+    Synthesizes a baseline QPF prior when raw NWP QPF is 0.0 but PoP >= 20%.
+    """
+    out = pd.DataFrame(index=df.index)
+    dt_valid = pd.to_datetime(df["valid_time_utc"], utc=True)
+    dt_local = dt_valid.dt.tz_convert("America/Los_Angeles")
+
+    hour = dt_local.dt.hour + dt_local.dt.minute / 60.0
+    doy = dt_local.dt.dayofyear
+
+    out["sin_hour"] = np.sin(2.0 * np.pi * hour / 24.0)
+    out["cos_hour"] = np.cos(2.0 * np.pi * hour / 24.0)
+    out["sin_doy"] = np.sin(2.0 * np.pi * doy / 365.25)
+    out["cos_doy"] = np.cos(2.0 * np.pi * doy / 365.25)
+
+    solar_df = compute_solar_and_canyon_shadow(df["valid_time_utc"])
+    out["solar_el_deg"] = solar_df["solar_el_deg"]
+    out["in_canyon_shadow"] = solar_df["in_canyon_shadow"]
+    out["effective_insolation"] = solar_df["effective_insolation"]
+
+    lead_hrs = get_col(df, "lead_time_hours", 6.0).clip(lower=1.0)
+    t_c = get_col(df, "nws_temp_c", get_col(df, "raw_nws_temp_c", 15.0))
+    rh_pct = get_col(df, "nws_rh_pct", 50.0).clip(1.0, 100.0)
+    dew_c = get_col(df, "nws_dewpoint_c", np.nan).fillna(t_c - ((100.0 - rh_pct) / 5.0))
+
+    pop_pct = get_col(df, "nws_pop_pct", 0.0).clip(0.0, 100.0)
+    raw_qpf_mm = get_col(df, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0)
+    sky_pct = get_col(df, "nws_sky_cover_pct", 20.0).clip(0.0, 100.0)
+
+    # Synthesize physical QPF prior when raw NWP QPF is 0.0 but PoP >= 20%
+    pop_frac = pop_pct / 100.0
+    rh_frac = np.clip(rh_pct / 100.0, 0.30, 1.0)
+    synth_qpf_prior = np.where(
+        pop_pct >= 20.0,
+        np.where(
+            pop_pct >= 60.0,
+            1.35 * (pop_frac ** 1.15) * rh_frac,
+            0.65 * (pop_frac ** 1.35) * rh_frac,
+        ),
+        0.0,
+    )
+    qpf_mm = np.where(raw_qpf_mm > 0.0, raw_qpf_mm, synth_qpf_prior)
+
+    out["lead_time_hours"] = lead_hrs
+    out["nws_temp_c"] = t_c
+    out["nws_rh_pct"] = rh_pct
+    out["nws_pop_pct"] = pop_pct
+    out["nws_qpf_1hr_mm"] = qpf_mm
+    out["nws_sky_cover_pct"] = sky_pct
+
+    w_spd = get_col(df, "nws_wind_speed_ms", 0.0).clip(lower=0.0)
+    w_dir_rad = np.radians(get_col(df, "nws_wind_dir_deg", 0.0))
+    out["wind_along_canyon_ms"] = w_spd * np.cos(w_dir_rad - CANYON_AXIS_RAD)
+    out["wind_cross_canyon_ms"] = w_spd * np.sin(w_dir_rad - CANYON_AXIS_RAD)
+    upslope_wind_ms = np.maximum(0.0, w_spd * np.cos(w_dir_rad - OROGRAPHIC_UPSLOPE_RAD))
+    out["orographic_upslope_wind_ms"] = upslope_wind_ms
+
+    es_kpa = 0.61078 * np.exp((17.27 * t_c) / (t_c + 237.3))
+    ea_kpa = es_kpa * (rh_pct / 100.0)
+    vpd_kpa = np.maximum(0.0, es_kpa - ea_kpa)
+    dew_depr_c = np.maximum(0.0, t_c - dew_c)
+
+    out["dewpoint_depression_c"] = dew_depr_c
+    out["vpd_kpa"] = vpd_kpa
+    out["virga_evap_index"] = vpd_kpa * dew_depr_c * (1.0 - (rh_pct / 100.0))
+    out["orographic_moisture_flux"] = upslope_wind_ms * ea_kpa
+    out["qpf_moisture_scaling"] = qpf_mm * ((rh_pct / 100.0) ** 2)
+
+    ptrend_3h = get_col(df, "pressure_trend_3hr_hpa", 0.0)
+    out["pressure_trend_3hr_hpa"] = ptrend_3h
+    out["frontal_pressure_fall_hpa"] = np.minimum(0.0, ptrend_3h)
+
+    issue_chews_t = get_col(df, "issue_chews_temp_c", np.nan).fillna(t_c + 2.0)
+    issue_tass_t = get_col(df, "issue_tass_temp_c", np.nan).fillna(t_c)
+    out["issue_lapse_chews_c_km"] = (
+        -1.0 * (issue_chews_t - issue_tass_t) / 1.051
+    ).fillna(6.5)
+
+    issue_chews_p = get_col(df, "issue_chews_precip_mm", 0.0)
+    out["decayed_chews_precip_mm"] = issue_chews_p * np.exp(-lead_hrs / 6.0)
+
+    init_bias = get_col(df, "issue_persistence_bias_c", 0.0)
+    out["decayed_init_bias_c"] = init_bias * np.exp(-lead_hrs / 12.0)
+
+    return out
+
+
+def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Zero-Trap-Immune Physical Orographic-Virga Hurdle baseline.
+    Synthesizes conditional accumulation whenever canyon-calibrated PoP >= 20%
+    and boundary-layer moisture supports hydrometeor survival to 485m MSL.
+    """
+    raw_pop = X["nws_pop_pct"].values
+    raw_qpf = X["nws_qpf_1hr_mm"].values
+    rh = X["nws_rh_pct"].values
+    vpd = X["vpd_kpa"].values
+    upslope_flux = X["orographic_moisture_flux"].values
+    p_fall = X["frontal_pressure_fall_hpa"].values
+    chews_seed = X["decayed_chews_precip_mm"].values
+
+    virga_factor = np.where(
+        (rh < 70.0) & (raw_qpf < 1.5),
+        np.exp(-0.48 * vpd),
+        1.0,
+    )
+
+    orographic_factor = (
+        1.0
+        + 0.08 * np.clip(upslope_flux, 0.0, 5.0)
+        + 0.05 * np.clip(-p_fall, 0.0, 4.0)
+        + 0.06 * np.clip(chews_seed, 0.0, 3.0)
+    )
+
+    net_multiplier = np.clip(virga_factor * orographic_factor, 0.20, 1.85)
+
+    mos_pop = np.clip(
+        raw_pop * np.clip(virga_factor * (1.0 + 0.04 * upslope_flux), 0.30, 1.35)
+        + np.where(raw_qpf >= TIPPING_BUCKET_MM, 10.0 * (rh / 100.0), -5.0 * (vpd > 1.3)),
+        0.0,
+        100.0,
+    )
+
+    pop_frac = mos_pop / 100.0
+    rh_factor = np.clip((rh - 35.0) / 65.0, 0.25, 1.0)
+    conditional_qpf_prior = np.where(
+        mos_pop >= 20.0,
+        np.where(
+            mos_pop >= 60.0,
+            1.25 * (pop_frac ** 1.15) * rh_factor,
+            0.55 * (pop_frac ** 1.30) * rh_factor,
+        ),
+        0.0,
+    )
+    effective_base_qpf = np.maximum(raw_qpf, conditional_qpf_prior)
+
+    mos_qpf = effective_base_qpf * net_multiplier
+    mos_qpf = np.where(mos_pop < 15.0, 0.0, mos_qpf)
+
+    mos_qpf_p90 = np.where(
+        mos_pop >= 12.0,
+        np.maximum(mos_qpf * 1.65, mos_qpf + 0.45 * pop_frac * orographic_factor),
+        0.0,
+    )
+
+    return pd.DataFrame(
+        {
+            "mos_pop_pct": np.round(mos_pop, 1),
+            "mos_qpf_mm": np.round(mos_qpf, 3),
+            "mos_qpf_p90_mm": np.round(mos_qpf_p90, 3),
+        },
+        index=X.index,
+    )
+
+
 def fallback_physics_mos(df: pd.DataFrame) -> pd.DataFrame:
     """Topographic radiation-drainage + Orographic-Virga physical MOS fallback."""
     out = df.copy()
@@ -370,6 +592,8 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensures every row in `df` has MOS corrected_temp_c, p10, p90, mos_pop_pct,
     mos_qpf_mm, and mos_qpf_p90_mm.
+    Includes Fix 4: Re-triggers hydrological inference on migrated rows where
+    SQLite DEFAULT 0.0 or legacy zero-QPF traps left mos_qpf_mm at 0.0 during active PoP.
     """
     if df.empty:
         return df
@@ -385,10 +609,20 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = np.nan
 
+    # Fix 4: Detect both NaN columns AND migrated rows stuck at 0.0 when PoP/QPF is active
+    raw_pop_s = get_col(out, "nws_pop_pct", 0.0)
+    raw_qpf_s = get_col(out, "nws_qpf_1hr_mm", 0.0)
+    mos_pop_s = get_col(out, "mos_pop_pct", np.nan)
+    mos_qpf_s = get_col(out, "mos_qpf_mm", np.nan)
+
     missing_mask = (
         out["corrected_temp_c"].isna()
-        | out["mos_qpf_mm"].isna()
-        | out["mos_pop_pct"].isna()
+        | mos_qpf_s.isna()
+        | mos_pop_s.isna()
+        | ((raw_pop_s >= 15.0) & (mos_pop_s <= 0.0))
+        | ((raw_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+        | ((mos_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+        | ((raw_qpf_s > 0.0) & (mos_qpf_s <= 0.0))
     )
     if not missing_mask.any():
         return out
@@ -414,6 +648,8 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     if "issue_time_utc" not in sub.columns:
         sub["issue_time_utc"] = sub["valid_time_utc"]
 
+    fb = fallback_physics_mos(sub)
+
     if MODEL_PATH.exists():
         try:
             mos_model = joblib.load(MODEL_PATH)
@@ -431,14 +667,25 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
             ]:
                 if c in preds.columns:
                     out.loc[missing_mask, c] = preds[c].values
-                elif c not in out.columns or out.loc[missing_mask, c].isna().any():
-                    fb = fallback_physics_mos(sub)
+                else:
                     out.loc[missing_mask, c] = fb[c].values
+
+            # Self-healing guard: if the loaded .joblib artifact was trained prior to Fix 2
+            # and returned 0.0 for mos_qpf_mm during >=20% PoP hours, patch with zero-safe hurdle
+            sub_mos_pop = get_col(out.loc[missing_mask], "mos_pop_pct", 0.0)
+            sub_mos_qpf = get_col(out.loc[missing_mask], "mos_qpf_mm", 0.0)
+            zero_trapped = (sub_mos_pop >= 20.0) & (sub_mos_qpf <= 0.0)
+            if zero_trapped.any():
+                trap_idx = out.loc[missing_mask].index[zero_trapped]
+                out.loc[trap_idx, "mos_qpf_mm"] = fb.loc[trap_idx, "mos_qpf_mm"].values
+                out.loc[trap_idx, "mos_qpf_p90_mm"] = np.maximum(
+                    get_col(out.loc[trap_idx], "mos_qpf_p90_mm", 0.0).values,
+                    fb.loc[trap_idx, "mos_qpf_p90_mm"].values,
+                )
             return out
         except Exception:
             pass
 
-    fb = fallback_physics_mos(sub)
     for c in [
         "pred_temp_error_c",
         "corrected_temp_c",
@@ -1258,7 +1505,7 @@ def render_layman_forecast_view(
         )
         fc_48["mos_rain_in"] = (
             get_col(fc_48, "mos_qpf_mm", get_col(fc_48, "nws_qpf_1hr_mm", 0.0)) / 25.4
-        ).round(2)
+        ).round(3)
 
         fig_layman = make_subplots(specs=[[{"secondary_y": True}]])
 
