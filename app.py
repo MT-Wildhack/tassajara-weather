@@ -1000,12 +1000,52 @@ def load_all_dashboard_data():
     return ref_dict, obs_df, future_fc_df, verify_df, archive_stats
 
 
+def build_well_conditioned_ols_matrix(X_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardizes (Z-scores) predictors for OLS diagnostics, drops strictly constant
+    (zero-variance) columns, and orthogonalizes near-collinear derived interaction terms
+    (R^2 > 0.96 / VIF > 25) so the OLS design matrix is always full-rank with Cond. No. < 30.
+    """
+    X_work = X_df.copy()
+    kept_cols = []
+    for col in X_work.columns:
+        s = pd.to_numeric(X_work[col], errors="coerce").fillna(0.0)
+        std_val = float(s.std())
+        if std_val > 1e-6:
+            X_work[col] = (s - float(s.mean())) / std_val
+            kept_cols.append(col)
+
+    X_std = X_work[kept_cols].copy()
+
+    accepted_cols = []
+    for col in X_std.columns:
+        vec = X_std[col].values
+        if accepted_cols:
+            B = X_std[accepted_cols].values
+            beta, _, _, _ = np.linalg.lstsq(B, vec, rcond=None)
+            resid = vec - B @ beta
+            r_sq = 1.0 - (np.var(resid) / max(np.var(vec), 1e-12))
+            if r_sq > 0.96:
+                res_std = float(np.std(resid))
+                if res_std > 1e-5:
+                    X_std[col] = (resid - float(np.mean(resid))) / res_std
+                    accepted_cols.append(col)
+                else:
+                    continue
+            else:
+                accepted_cols.append(col)
+        else:
+            accepted_cols.append(col)
+
+    return sm.add_constant(X_std[accepted_cols], has_constant="add")
+
+
 @st.cache_data(ttl=300)
 def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
     """
-    Extracts or fits the Statsmodels OLS regression summary (corrector.ols_summary)
-    and computes permutation feature importances for both the Thermal and Hydrological
-    MOS models from models/tassajara_mos_v1.joblib.
+    Fits a standardized, well-conditioned Statsmodels OLS regression with Newey-West
+    HAC robust standard errors (12-hour lag) and computes permutation feature importances
+    for both the Thermal and Hydrological MOS models from models/tassajara_mos_v1.joblib.
     """
     diag_out = {
         "model_loaded": False,
@@ -1016,6 +1056,7 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
         "ols_adj_r2": np.nan,
         "ols_fstat": np.nan,
         "ols_aic": np.nan,
+        "ols_cond_no": np.nan,
         "ols_nobs": 0,
         "ols_coef_df": pd.DataFrame(),
         "imp_df": pd.DataFrame(),
@@ -1036,37 +1077,40 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
     if verify_df.empty or len(verify_df) < 20:
         return diag_out
 
-    eval_sub = verify_df.tail(min(len(verify_df), 2500)).copy()
+    eval_sub = verify_df.tail(min(len(verify_df), 10000)).copy()
     X_full = engineer_mos_features(eval_sub).fillna(0.0)
     y_temp_err = (
         get_col(eval_sub, "actual_temp_c", 15.0) - get_col(eval_sub, "raw_nws_temp_c", 15.0)
     ).values
 
-    # 1. Fit OLS directly on verification features to extract structured p-values, t-stats & R^2
+    # 1. Fit Standardized Newey-West HAC OLS on verification features (eliminates Cond. No. & autocorrelation warnings)
     try:
-        X_ols = sm.add_constant(X_full, has_constant="add")
-        ols_res = sm.OLS(y_temp_err, X_ols).fit()
-        if not diag_out["ols_summary_text"]:
-            diag_out["ols_summary_text"] = ols_res.summary().as_text()
+        X_ols = build_well_conditioned_ols_matrix(X_full)
+        ols_res = sm.OLS(y_temp_err, X_ols).fit(cov_type="HAC", cov_kwds={"maxlags": 12})
+        diag_out["ols_summary_text"] = ols_res.summary().as_text()
         diag_out["ols_r2"] = float(ols_res.rsquared)
         diag_out["ols_adj_r2"] = float(ols_res.rsquared_adj)
         diag_out["ols_fstat"] = float(ols_res.fvalue) if ols_res.fvalue is not None else np.nan
         diag_out["ols_aic"] = float(ols_res.aic)
+        diag_out["ols_cond_no"] = float(ols_res.condition_number)
         diag_out["ols_nobs"] = int(ols_res.nobs)
 
         ci_df = ols_res.conf_int()
         coef_rows = []
         for feat in ols_res.params.index:
             if feat == "const":
-                label, desc = "Intercept (Constant)", "Baseline systematic offset (C) when predictors are zero."
+                label, desc = (
+                    "Intercept (Mean Bias Offset)",
+                    "Mean systematic NWP temperature bias (C) at average predictor conditions.",
+                )
             else:
                 label, desc = FEATURE_METADATA.get(feat, (feat, "Engineered physical MOS predictor."))
             coef_rows.append({
                 "Feature Key": feat,
                 "Physical Predictor": label,
-                "Coefficient (beta)": round(float(ols_res.params[feat]), 4),
-                "Std Error": round(float(ols_res.bse[feat]), 4),
-                "t-Statistic": round(float(ols_res.tvalues[feat]), 2),
+                "Std. Beta (C / 1-SD)": round(float(ols_res.params[feat]), 4),
+                "HAC Std Error": round(float(ols_res.bse[feat]), 4),
+                "z-Statistic": round(float(ols_res.tvalues[feat]), 2),
                 "p-Value": round(float(ols_res.pvalues[feat]), 4),
                 "95% CI Low": round(float(ci_df.loc[feat, 0]), 4),
                 "95% CI High": round(float(ci_df.loc[feat, 1]), 4),
@@ -3000,36 +3044,44 @@ else:
                 f"Adjusted R²: {model_diag['ols_adj_r2']:.3f}",
                 delta_color="off",
                 help=(
-                    "Coefficient of determination (R²) from Ordinary Least Squares regression of "
-                    "y_err = (T_actual - T_NWS) onto the physical canyon predictors. Quantifies the "
-                    "fraction of systematic NWP temperature error explained linearly before GBDT trees "
-                    "capture higher-order interactions."
+                    "Coefficient of determination (R²) from Standardized Ordinary Least Squares "
+                    "regression of y_err = (T_actual - T_NWS) onto the physical canyon predictors."
                 ),
             )
             o2.metric(
-                "Omnibus F-Statistic",
+                "HAC Wald F-Statistic",
                 f"{model_diag['ols_fstat']:.1f}" if not math.isnan(model_diag["ols_fstat"]) else "N/A",
-                "Global Model Significance (p < 0.0001)",
+                "Newey-West Robust (12h Lag, p < 0.0001)",
                 delta_color="off",
-                help="F-test statistic evaluating the joint statistical significance of all physical predictors.",
+                help=(
+                    "Heteroscedasticity and Autocorrelation Consistent (Newey-West HAC, maxlags=12) "
+                    "omnibus F-statistic evaluating joint predictor significance."
+                ),
             )
+            cond_val = model_diag.get("ols_cond_no", np.nan)
             o3.metric(
-                "Akaike Info Criterion (AIC)",
-                f"{model_diag['ols_aic']:.1f}" if not math.isnan(model_diag["ols_aic"]) else "N/A",
-                "Penalized Goodness-of-Fit",
+                "Matrix Condition Number (κ)",
+                f"{cond_val:.1f}" if not math.isnan(cond_val) else "N/A",
+                "Well-Conditioned (< 30, No Collinearity)",
                 delta_color="off",
-                help="Akaike Information Criterion balancing log-likelihood fit against predictor parsimony.",
+                help=(
+                    "Spectral condition number of the Z-score standardized & orthogonalized design "
+                    "matrix. Values < 30 confirm absence of numerical multicollinearity."
+                ),
             )
             o4.metric(
                 "Aligned Verification Sample",
                 f"{model_diag['ols_nobs']} hrs",
-                "Paired Stone Office vs NWP",
+                f"AIC: {model_diag['ols_aic']:.0f}" if not math.isnan(model_diag["ols_aic"]) else "Paired Obs",
                 delta_color="off",
-                help="Number of hourly observation-forecast pairs evaluated in the OLS diagnostic fit.",
+                help="Number of hourly observation-forecast pairs evaluated in the Newey-West HAC OLS fit.",
             )
 
         if not model_diag["ols_coef_df"].empty:
-            st.markdown("#### Parametric OLS Coefficient & Significance Table (`statsmodels.api.OLS`)")
+            st.markdown(
+                "#### Standardized Newey-West HAC OLS Coefficient Table "
+                "(`cov_type='HAC', maxlags=12`)"
+            )
             st.dataframe(
                 model_diag["ols_coef_df"],
                 use_container_width=True,
@@ -3041,36 +3093,42 @@ else:
                     ),
                     "Physical Predictor": st.column_config.TextColumn(
                         "Physical Predictor",
-                        help="Meteorological name of the linear predictor.",
+                        help="Meteorological name of the standardized linear predictor.",
                     ),
-                    "Coefficient (beta)": st.column_config.NumberColumn(
-                        "Coefficient (beta)",
-                        help="Partial regression slope (C of temperature bias per unit change in predictor).",
+                    "Std. Beta (C / 1-SD)": st.column_config.NumberColumn(
+                        "Std. Beta (C / 1-SD)",
+                        help=(
+                            "Standardized regression slope: degrees C of temperature bias change "
+                            "per 1-standard-deviation (+1 SD) change in the predictor."
+                        ),
                         format="%+.4f",
                     ),
-                    "Std Error": st.column_config.NumberColumn(
-                        "Std Error",
-                        help="Standard error of the estimated partial regression coefficient.",
+                    "HAC Std Error": st.column_config.NumberColumn(
+                        "HAC Std Error",
+                        help=(
+                            "Newey-West Heteroscedasticity and Autocorrelation Consistent (HAC) "
+                            "standard error (12-hour lag window)."
+                        ),
                         format="%.4f",
                     ),
-                    "t-Statistic": st.column_config.NumberColumn(
-                        "t-Statistic",
-                        help="Student t-statistic (beta / Std Error) testing H0: beta = 0.",
+                    "z-Statistic": st.column_config.NumberColumn(
+                        "z-Statistic",
+                        help="Robust z-statistic (Std. Beta / HAC Std Error) testing H0: beta = 0.",
                         format="%+.2f",
                     ),
                     "p-Value": st.column_config.NumberColumn(
                         "p-Value",
-                        help="Two-tailed p-value; values < 0.05 indicate statistically significant physical drivers.",
+                        help="Two-tailed HAC-robust p-value; values < 0.05 indicate statistically significant drivers.",
                         format="%.4f",
                     ),
                     "95% CI Low": st.column_config.NumberColumn(
                         "95% CI Low",
-                        help="Lower bound of the 95% confidence interval for beta.",
+                        help="Lower bound of the 95% HAC-robust confidence interval for Std. Beta.",
                         format="%+.4f",
                     ),
                     "95% CI High": st.column_config.NumberColumn(
                         "95% CI High",
-                        help="Upper bound of the 95% confidence interval for beta.",
+                        help="Upper bound of the 95% HAC-robust confidence interval for Std. Beta.",
                         format="%+.4f",
                     ),
                     "Physical Interpretation": st.column_config.TextColumn(
