@@ -2354,12 +2354,17 @@ else:
     with ctrl_col2:
         horizon_choice = st.selectbox(
             "Timeline Horizon",
-            options=["72h Forecast + Past 48h Hindcast", "7-Day Forecast + Past 72h Hindcast"],
+            options=[
+                "72h Forecast + Past 48h Hindcast",
+                "7-Day Forecast + Past 72h Hindcast",
+                "7-Day Forecast + Past 7-Day Hindcast",
+                "24h Forecast + Past 24h Hindcast",
+            ],
             index=0,
             help=(
-                "Toggles the time-series viewport between a high-resolution 5-day window "
-                "(48h verification hindcast + 72h operational forecast) and an extended 10-day "
-                "synoptic window (72h hindcast + 168h forecast)."
+                "Toggles the time-series viewport between a 48h diurnal zoom, a 5-day window "
+                "(48h hindcast + 72h forecast), a 10-day synoptic window (72h hindcast + 7-day "
+                "forecast), or a full 14-day window (7-day hindcast + 7-day forecast)."
             ),
         )
 
@@ -2387,11 +2392,23 @@ else:
         )
 
     if not future_fc_df.empty or not verify_df.empty:
-        is_short_horizon = "72h" in horizon_choice
-        max_future_hrs = 72 if is_short_horizon else 168
-        past_hrs = 48 if is_short_horizon else 72
+        horizon_map = {
+            "24h Forecast + Past 24h Hindcast": (24, 24),
+            "72h Forecast + Past 48h Hindcast": (72, 48),
+            "7-Day Forecast + Past 72h Hindcast": (168, 72),
+            "7-Day Forecast + Past 7-Day Hindcast": (168, 168),
+        }
+        max_future_hrs, past_hrs = horizon_map.get(horizon_choice, (72, 48))
 
-        fut_sub = future_fc_df.head(max_future_hrs).copy() if not future_fc_df.empty else pd.DataFrame()
+        if not obs_df.empty and "valid_time_utc" in obs_df.columns and not future_fc_df.empty:
+            latest_obs_utc = str(obs_df.iloc[0]["valid_time_utc"])
+            fut_pool = future_fc_df[future_fc_df["valid_time_utc"] > latest_obs_utc]
+            if fut_pool.empty:
+                fut_pool = future_fc_df
+        else:
+            fut_pool = future_fc_df
+
+        fut_sub = fut_pool.head(max_future_hrs).copy() if not fut_pool.empty else pd.DataFrame()
         past_sub = verify_df.tail(past_hrs).copy() if not verify_df.empty else pd.DataFrame()
 
         if not past_sub.empty and not fut_sub.empty:
@@ -2708,9 +2725,17 @@ else:
             secondary_y=False,
         )
         fig.update_yaxes(title_text="PoP (%)", range=[0, 105], showgrid=False, row=3, col=1, secondary_y=True)
+        x_min = combined_df["valid_local"].min()
+        x_max = combined_df["valid_local"].max()
+        for r_idx in (1, 2, 3):
+            fig.update_xaxes(
+                range=[x_min, x_max],
+                gridcolor="rgba(148,163,184,0.12)",
+                row=r_idx,
+                col=1,
+            )
         fig.update_xaxes(
             title_text="Local Time (America/Los_Angeles)",
-            gridcolor="rgba(148,163,184,0.12)",
             row=3,
             col=1,
         )
