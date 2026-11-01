@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-mos_model.py (v3 — Zero-Trap Immune Hydrological Hurdle + Standardized Newey-West HAC OLS)
+mos_model.py (v4 — Multi-Station Santa Lucia Spatial Gradients + Hydrological Hurdle + HAC OLS)
 Trains and evaluates the Tassajara Model Output Statistics (MOS) Gradient Boosted Ensemble:
   1. Thermal Subsystem: Mean error + P10/P90 quantile bounds (HistGradientBoostingRegressor)
+     incorporating 5-station Santa Lucia boundary gradients (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1).
   2. Hydrological Hurdle Subsystem:
      - Stage 1 PoP Classifier: Calibrated HistGradientBoostingClassifier for P(Rain >= 0.254mm)
      - Stage 2 QPF Regressor: Poisson deviance & P90 extreme quantile HistGradientBoostingRegressor
-       accounting for Santa Lucia orographic moisture flux, Chews Ridge spillover, and canyon virga,
+       accounting for Santa Lucia orographic moisture flux, Ventana/Big Sur spillover, and canyon virga,
        with automatic conditional QPF synthesis when raw NWP QPF is zero during high-PoP regimes.
   3. Econometric Baseline: Z-score standardized, orthogonalized Ordinary Least Squares (OLS) with
      Newey-West HAC robust standard errors (12-hour lag), eliminating multicollinearity warnings.
@@ -94,8 +95,8 @@ def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
 
 def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Builds physical, cyclical, topographic, and hydrological features for both
-    canyon temperature bias and orographic/virga precipitation calibration.
+    Builds 25 physical, cyclical, topographic, multi-station spatial gradient,
+    and hydrological features for canyon temperature bias and PoP/QPF calibration.
     Automatically synthesizes a baseline QPF prior when raw NWP QPF is 0.0 but PoP >= 20%.
     """
     out = pd.DataFrame(index=df.index)
@@ -116,7 +117,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["effective_insolation"] = solar_df["effective_insolation"]
 
     lead_hrs = _num_series(df, "lead_time_hours", 6.0).clip(lower=1.0)
-    t_c = _num_series(df, "nws_temp_c", 15.0)
+    t_c = _num_series(df, "nws_temp_c", _num_series(df, "raw_nws_temp_c", 15.0))
     rh_pct = _num_series(df, "nws_rh_pct", 50.0).clip(1.0, 100.0)
     dew_c = _num_series(df, "nws_dewpoint_c", np.nan)
     dew_fallback = t_c - ((100.0 - rh_pct) / 5.0)
@@ -168,14 +169,61 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["pressure_trend_3hr_hpa"] = ptrend_3h
     out["frontal_pressure_fall_hpa"] = np.minimum(0.0, ptrend_3h)
 
-    issue_chews_t = _num_series(df, "issue_chews_temp_c", np.nan).fillna(t_c + 2.0)
+    # -----------------------------------------------------------------------
+    # 5-Station Santa Lucia Spatial & Vertical Boundary-Layer Gradients
+    # Symmetric cross-station fallback chaining (CHWC1 <-> VTCC1, CAHC1 <-> ASRC1)
+    # -----------------------------------------------------------------------
     issue_tass_t = _num_series(df, "issue_tass_temp_c", np.nan).fillna(t_c)
-    out["issue_lapse_chews_c_km"] = (
-        -1.0 * (issue_chews_t - issue_tass_t) / 1.051
-    ).fillna(6.5)
 
-    issue_chews_p = _num_series(df, "issue_chews_precip_mm", 0.0)
+    raw_chews_t = _num_series(df, "issue_chews_temp_c", np.nan)
+    raw_ventana_t = _num_series(df, "issue_ventana_temp_c", np.nan)
+    issue_chews_t = raw_chews_t.fillna(raw_ventana_t - 0.54).fillna(t_c + 2.0)
+    issue_ventana_t = raw_ventana_t.fillna(issue_chews_t + 0.54)
+
+    raw_hast_t = _num_series(df, "issue_hastings_temp_c", np.nan)
+    raw_arroyo_t = _num_series(df, "issue_arroyo_temp_c", np.nan)
+    issue_hast_t = raw_hast_t.fillna(raw_arroyo_t - 1.80).fillna(t_c + 0.5)
+    issue_arroyo_t = raw_arroyo_t.fillna(issue_hast_t + 1.80)
+
+    issue_bigsur_t = _num_series(df, "issue_bigsur_temp_c", np.nan).fillna(t_c + 0.8)
+
+    # 1. Upper-Column Vertical Lapse Rate (CHWC1 1536m & VTCC1 1453m -> TZMC 485m)
+    lapse_chews = (-1.0 * (issue_chews_t - issue_tass_t) / 1.051).fillna(6.5)
+    lapse_ventana = (-1.0 * (issue_ventana_t - issue_tass_t) / 0.968).fillna(6.5)
+    out["issue_lapse_chews_c_km"] = lapse_chews
+
+    # 2. Gorge & Foothill Cold-Pool Confinement (TZMC 485m vs. CAHC1 546m & ASRC1 268m)
+    confine_hast_c = issue_tass_t - (issue_hast_t + 0.60)
+    confine_arroyo_c = issue_tass_t - (issue_arroyo_t - 1.41)
+    composite_confinement_c = 0.55 * confine_arroyo_c + 0.45 * confine_hast_c
+    out["decayed_canyon_confinement_c"] = composite_confinement_c * np.exp(-lead_hrs / 8.0)
+
+    # 3. Cross-Range Coastal-to-Interior Thermal Gradient (Big Sur PPSC1 vs. Arroyo Seco ASRC1)
+    coastal_inland_grad_c = (issue_bigsur_t - 1.04) - issue_arroyo_t
+    out["decayed_coastal_inland_grad_c"] = coastal_inland_grad_c * np.exp(-lead_hrs / 12.0)
+
+    # 4. Marine-Layer Stratus Cap Index (Big Sur PPSC1 RH vs. Chews Ridge CHWC1 RH * Inversion)
+    issue_chews_rh = _num_series(df, "issue_chews_rh_pct", np.nan).fillna(rh_pct).clip(1.0, 100.0)
+    issue_bigsur_rh = _num_series(df, "issue_bigsur_rh_pct", np.nan).fillna(issue_chews_rh).clip(1.0, 100.0)
+    rh_coastal_contrast = (issue_bigsur_rh - issue_chews_rh) / 100.0
+    inversion_strength = np.maximum(0.0, 6.5 - (0.5 * (lapse_chews + lapse_ventana)))
+    out["issue_marine_layer_cap_idx"] = (
+        rh_coastal_contrast * inversion_strength * np.exp(-lead_hrs / 10.0)
+    )
+
+    # 5. Upstream Feeder-Seeder Precipitation (CHWC1 + Windward Ventana VTCC1 & Big Sur PPSC1)
+    issue_chews_p = _num_series(df, "issue_chews_precip_mm", 0.0).clip(lower=0.0)
+    issue_ventana_p = _num_series(df, "issue_ventana_precip_mm", np.nan).fillna(issue_chews_p).clip(lower=0.0)
+    issue_bigsur_p = _num_series(df, "issue_bigsur_precip_mm", np.nan).fillna(0.0).clip(lower=0.0)
+
     out["decayed_chews_precip_mm"] = issue_chews_p * np.exp(-lead_hrs / 6.0)
+
+    ssw_weight = np.clip(0.5 + 0.15 * upslope_wind_ms, 0.5, 1.5)
+    windward_crest_p = np.maximum(
+        issue_chews_p,
+        np.maximum(issue_ventana_p, 0.75 * issue_bigsur_p) * ssw_weight,
+    )
+    out["decayed_ssw_spillover_precip_mm"] = windward_crest_p * np.exp(-lead_hrs / 6.0)
 
     init_bias = _num_series(df, "issue_persistence_bias_c", 0.0)
     out["decayed_init_bias_c"] = init_bias * np.exp(-lead_hrs / 12.0)
@@ -235,7 +283,11 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
     vpd = X["vpd_kpa"].values
     upslope_flux = X["orographic_moisture_flux"].values
     p_fall = X["frontal_pressure_fall_hpa"].values
-    chews_seed = X["decayed_chews_precip_mm"].values
+    spillover_seed = (
+        X["decayed_ssw_spillover_precip_mm"].values
+        if "decayed_ssw_spillover_precip_mm" in X.columns
+        else X["decayed_chews_precip_mm"].values
+    )
 
     virga_factor = np.where(
         (rh < 70.0) & (raw_qpf < 1.5),
@@ -247,7 +299,7 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
         1.0
         + 0.08 * np.clip(upslope_flux, 0.0, 5.0)
         + 0.05 * np.clip(-p_fall, 0.0, 4.0)
-        + 0.06 * np.clip(chews_seed, 0.0, 3.0)
+        + 0.07 * np.clip(spillover_seed, 0.0, 3.5)
     )
 
     net_multiplier = np.clip(virga_factor * orographic_factor, 0.20, 1.85)
@@ -452,7 +504,8 @@ class TassajaraMOSCorrector:
             return phys_df
 
         try:
-            prob_wet = self.model_pop.predict_proba(X_fut)[:, 1]
+            X_aligned = X_fut[self.feature_names] if self.feature_names else X_fut
+            prob_wet = self.model_pop.predict_proba(X_aligned)[:, 1]
             mos_pop_pct = np.clip(
                 np.maximum(
                     0.60 * (prob_wet * 100.0) + 0.40 * phys_df["mos_pop_pct"].values,
@@ -462,8 +515,8 @@ class TassajaraMOSCorrector:
                 100.0,
             )
 
-            cond_qpf = np.clip(self.model_qpf_mean.predict(X_fut), 0.0, None)
-            cond_p90 = np.clip(self.model_qpf_p90.predict(X_fut), 0.0, None)
+            cond_qpf = np.clip(self.model_qpf_mean.predict(X_aligned), 0.0, None)
+            cond_p90 = np.clip(self.model_qpf_p90.predict(X_aligned), 0.0, None)
 
             hurdle_gate = np.where(mos_pop_pct < 15.0, 0.0, np.clip(mos_pop_pct / 45.0, 0.20, 1.0))
             ml_qpf_mm = cond_qpf * hurdle_gate
@@ -492,13 +545,13 @@ class TassajaraMOSCorrector:
         for col in self.feature_names:
             if col not in X_full.columns:
                 X_full[col] = 0.0
-        X_fut = X_full[self.feature_names]
+        X_fut = X_full[self.feature_names] if self.feature_names else X_full
 
         err_mean = self.model_mean.predict(X_fut)
         err_p10 = self.model_p10.predict(X_fut)
         err_p90 = self.model_p90.predict(X_fut)
 
-        hydro_df = self._predict_hydro(X_full)
+        hydro_df = self._predict_hydro(X_fut)
 
         res = df_future[["issue_time_utc", "valid_time_utc", "nws_temp_c"]].copy()
         res["pred_temp_error_c"] = np.round(err_mean, 2)

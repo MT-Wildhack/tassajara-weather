@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-backfill_and_train.py (v4 — Multi-Year Hydrological & Thermal MOS Backfill)
+backfill_and_train.py (v5.2 — 5-Station Santa Lucia Reference Array & Multi-Year MOS Backfill)
 Backfills up to 730 days of historical observations from the Stone Office Davis
 Vantage Pro2 using the WeatherLink v2 Historic API (Pro Tier, 24-hour chunking),
-commits observations immediately to SQLite, pairs them with chunked Open-Meteo
-archived NWP forecasts and Chews Ridge / Hastings reference series, trains the
-TassajaraMOSCorrector (Thermal Quantile + Two-Stage Hydrological Hurdle) ensemble,
-saves models/tassajara_mos_v1.joblib, and populates mos_corrected_forecasts across
-all historical verification timestamps and the active 7-day NWS forecast.
+merges observations non-destructively into SQLite (never overwriting non-zero rain
+or wind gusts with zeros), pairs with Open-Meteo 5-station reference series,
+trains TassajaraMOSCorrector, and populates mos_corrected_forecasts.
 """
 
 import time
@@ -26,10 +24,12 @@ from ingest_weather import (
     WEATHERLINK_API_KEY,
     WEATHERLINK_API_SECRET,
     WEATHERLINK_BASE_URL,
+    REFERENCE_STATIONS,
+    INDOOR_OR_HEALTH_DST,
     WeatherLinkV2Client,
+    extract_archive_rain_mm,
+    extract_record_wind,
     f_to_c,
-    mph_to_ms,
-    in_to_mm,
     inhg_to_hpa,
 )
 from mos_model import (
@@ -49,10 +49,6 @@ MODEL_PATH = Path("models/tassajara_mos_v1.joblib")
 
 TASS_LAT = 36.2337
 TASS_LON = -121.5501
-CHEWS_LAT = 36.3060
-CHEWS_LON = -121.5650
-HAST_LAT = 36.3886
-HAST_LON = -121.5514
 
 
 def first_not_none(*vals):
@@ -76,7 +72,7 @@ def clean_num(val: Any, default: Optional[float] = None) -> Optional[float]:
 def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
     """
     Ensures all tables, hydrological columns, and the leak-free
-    vw_mos_training_dataset view exist in SQLite.
+    5-station vw_mos_training_dataset view exist in SQLite.
     """
     Path("models").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
@@ -155,12 +151,9 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
             """
         )
 
-        # Ensure backward-compatible migration of hydrological columns on existing tables
         mos_cols = {
             r[1]
-            for r in conn.execute(
-                "PRAGMA table_info(mos_corrected_forecasts)"
-            ).fetchall()
+            for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()
         }
         for col_name in (
             "raw_nws_pop_pct",
@@ -214,9 +207,23 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
                 (o.temp_c - f.nws_temp_c) AS temp_error_c,
                 (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
-                COALESCE(r_chews.temp_c, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                -- CHWC1: Chews Ridge (1,536m Interior Crest)
+                COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
                 COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
-                COALESCE(r_hast.temp_c, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
+                -- CAHC1: Hastings Reservation (546m Foothill Valley)
+                COALESCE(r_hast.temp_c, r_arroyo.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
+                -- ASRC1: Arroyo Seco RAWS (268m Gorge Outlet)
+                COALESCE(r_arroyo.temp_c, r_hast.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
+                COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
+                -- PPSC1: Big Sur RAWS (108m Coastal Slope)
+                COALESCE(r_bigsur.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
+                COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
+                COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
+                -- VTCC1: Ventana Cone (1,453m Windward Crest)
+                COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, f.nws_temp_c + 1.5) AS issue_ventana_temp_c,
+                COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
+                -- Local Stone Office Initialization State
                 COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
                 COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c
             FROM nws_forecasts f
@@ -234,6 +241,12 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
             LEFT JOIN reference_observations r_hast
                 ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+            LEFT JOIN reference_observations r_arroyo
+                ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
+            LEFT JOIN reference_observations r_bigsur
+                ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
+            LEFT JOIN reference_observations r_vent
+                ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
             WHERE o.qc_flag = 'OK'
               AND o.temp_c IS NOT NULL
               AND f.nws_temp_c IS NOT NULL
@@ -246,27 +259,27 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
 def fetch_weatherlink_history(
     client: WeatherLinkV2Client,
     station_id: int,
-    days_back: int = 730,
+    days_back: float = 730.0,
 ) -> pd.DataFrame:
     """
     Pulls historical archive records from WeatherLink v2 API (/v2/historic/{station_id}).
-    Accumulates tipping-bucket rainfall across all sensor structures (rainfall_in,
-    rainfall_mm, and rainfall_clicks) and preserves zero wind speeds.
+    Strictly filters out indoor/health sensors and aggregates sub-hourly rain and wind
+    across all outdoor ISS sensors without letting calm or non-wind packets overwrite gusts.
     """
-    end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=days_back)
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=float(days_back))
 
     chunk_seconds = 86400  # 24 hours max per WeatherLink v2 API spec
     current_start = int(start_dt.timestamp())
     final_end = int(end_dt.timestamp())
 
     hourly_buckets: Dict[str, Dict[str, Any]] = {}
-    total_chunks = int(np.ceil((final_end - current_start) / chunk_seconds))
+    total_chunks = max(1, int(np.ceil((final_end - current_start) / chunk_seconds)))
     chunk_idx = 0
 
     logger.info(
-        f"Fetching {days_back} days of WeatherLink Pro archive for Station {station_id} "
-        f"in {total_chunks} daily chunks..."
+        f"Fetching {days_back:.1f} days of WeatherLink Pro archive for Station {station_id} "
+        f"in {total_chunks} chunk(s)..."
     )
 
     while current_start < final_end:
@@ -289,6 +302,10 @@ def fetch_weatherlink_history(
             payload = resp.json()
 
             for sensor in payload.get("sensors", []):
+                dst = int(sensor.get("data_structure_type") or 0)
+                lsid = sensor.get("lsid")
+                seen_sensor_ts = set()
+
                 for rec in sensor.get("data", []):
                     ts = rec.get("ts")
                     if not ts:
@@ -305,6 +322,7 @@ def fetch_weatherlink_history(
                             "dewpoint_c": None,
                             "wetbulb_c": None,
                             "rh_pct": None,
+                            "_wind_speeds_ms": [],
                             "wind_speed_ms": 0.0,
                             "wind_gust_ms": 0.0,
                             "wind_dir_deg": 0.0,
@@ -316,81 +334,85 @@ def fetch_weatherlink_history(
 
                     b = hourly_buckets[hr_iso]
 
-                    # Accumulate tipping-bucket rain regardless of which sensor packet carries it
-                    rain_mm_val = rec.get("rainfall_mm")
-                    if rain_mm_val is None:
-                        rain_in = rec.get("rainfall_in")
-                        if rain_in is None and rec.get("rainfall_clicks") is not None:
-                            rain_in = rec["rainfall_clicks"] * 0.01
-                        if rain_in is not None:
-                            rain_mm_val = in_to_mm(rain_in)
-                    if rain_mm_val:
-                        b["precip_1hr_mm"] = round(
-                            (b["precip_1hr_mm"] or 0.0) + float(rain_mm_val), 3
-                        )
-
+                    # 1. Barometric pressure (from Barometer sensor or ISS/Console packet)
                     bar_sl = first_not_none(
                         rec.get("bar_sea_level"),
                         rec.get("bar_sea_level_last"),
                         rec.get("bar_final"),
-                        rec.get("bar_absolute"),
                         rec.get("bar"),
+                        rec.get("pressure_last"),
+                        rec.get("bar_absolute"),
                     )
                     if bar_sl is not None:
                         b["mslp_hpa"] = inhg_to_hpa(bar_sl)
 
+                    # Skip indoor/health sensors for outdoor temperature, wind, and rain
+                    if dst in INDOOR_OR_HEALTH_DST and "temp_out" not in rec:
+                        continue
+
+                    # 2. Accumulate tipping-bucket rain across sub-hourly archive intervals
+                    ts_key = (lsid, ts)
+                    if ts_key not in seen_sensor_ts:
+                        rain_mm_val = extract_archive_rain_mm(rec)
+                        if rain_mm_val > 0.0:
+                            b["precip_1hr_mm"] = round(
+                                (b["precip_1hr_mm"] or 0.0) + rain_mm_val, 3
+                            )
+                        seen_sensor_ts.add(ts_key)
+
+                    # 3. Outdoor temperature & humidity
                     t_f = first_not_none(
-                        rec.get("temp_last"), rec.get("temp_avg"), rec.get("temp")
+                        rec.get("temp_out"),
+                        rec.get("temp_out_last"),
+                        rec.get("temp_out_avg"),
+                        rec.get("temp_last"),
+                        rec.get("temp_avg"),
+                        rec.get("temp"),
                     )
                     if t_f is not None:
                         b["temp_c"] = f_to_c(t_f)
                         dew_f = first_not_none(
+                            rec.get("dew_point_out"),
                             rec.get("dew_point_last"),
                             rec.get("dew_point_avg"),
                             rec.get("dew_point"),
                         )
                         wet_f = first_not_none(
+                            rec.get("wet_bulb_out"),
                             rec.get("wet_bulb_last"),
                             rec.get("wet_bulb_avg"),
                             rec.get("wet_bulb"),
                         )
                         hum = first_not_none(
-                            rec.get("hum_last"), rec.get("hum_avg"), rec.get("hum")
+                            rec.get("hum_out"),
+                            rec.get("hum_out_last"),
+                            rec.get("hum_last"),
+                            rec.get("hum_avg"),
+                            rec.get("hum"),
                         )
+                        if dew_f is not None:
+                            b["dewpoint_c"] = f_to_c(dew_f)
+                        if wet_f is not None:
+                            b["wetbulb_c"] = f_to_c(wet_f)
+                        if hum is not None:
+                            b["rh_pct"] = float(hum)
 
-                        b["dewpoint_c"] = f_to_c(dew_f)
-                        b["wetbulb_c"] = f_to_c(wet_f)
-                        b["rh_pct"] = hum
+                    # 4. Wind speed, gust, and direction (never overwrite non-zero with 0)
+                    spd_ms, gst_ms, dir_deg = extract_record_wind(rec)
+                    if spd_ms is not None and spd_ms > 0.0:
+                        b["_wind_speeds_ms"].append(spd_ms)
+                        b["wind_speed_ms"] = round(float(np.mean(b["_wind_speeds_ms"])), 2)
+                    if gst_ms is not None and gst_ms > 0.0:
+                        b["wind_gust_ms"] = max(b["wind_gust_ms"] or 0.0, gst_ms, b["wind_speed_ms"])
+                    if dir_deg is not None and dir_deg > 0.0:
+                        b["wind_dir_deg"] = dir_deg
 
-                        w_spd = first_not_none(
-                            rec.get("wind_speed_avg"), rec.get("wind_speed_last"), 0.0
-                        )
-                        w_gst = first_not_none(
-                            rec.get("wind_speed_hi"),
-                            rec.get("wind_gust_10_min"),
-                            w_spd,
-                            0.0,
-                        )
-                        w_dir = first_not_none(
-                            rec.get("wind_dir_of_prevail"),
-                            rec.get("wind_dir_scalar_avg"),
-                            rec.get("wind_dir_last"),
-                            0.0,
-                        )
-
-                        b["wind_speed_ms"] = mph_to_ms(w_spd) or 0.0
-                        gst_ms = mph_to_ms(w_gst) or 0.0
-                        b["wind_gust_ms"] = max(b["wind_gust_ms"] or 0.0, gst_ms)
-                        b["wind_dir_deg"] = float(w_dir)
-
-                        sol = first_not_none(
-                            rec.get("solar_rad_avg"), rec.get("solar_rad")
-                        )
-                        uv = first_not_none(rec.get("uv_index_avg"), rec.get("uv_index"))
-                        if sol is not None:
-                            b["solar_rad_wm2"] = sol
-                        if uv is not None:
-                            b["uv_index"] = uv
+                    sol = first_not_none(rec.get("solar_rad_avg"), rec.get("solar_rad"))
+                    uv = first_not_none(rec.get("uv_index_avg"), rec.get("uv_index"), rec.get("uv"))
+                    if sol is not None:
+                        b["solar_rad_wm2"] = float(sol)
+                    if uv is not None:
+                        b["uv_index"] = float(uv)
 
         except Exception as exc:
             logger.warning(f"Chunk {chunk_idx}/{total_chunks} failed ({current_start}): {exc}")
@@ -407,7 +429,11 @@ def fetch_weatherlink_history(
             )
 
         current_start = current_end
-        time.sleep(0.18)
+        if total_chunks > 2:
+            time.sleep(0.18)
+
+    for b in hourly_buckets.values():
+        b.pop("_wind_speeds_ms", None)
 
     df = pd.DataFrame(list(hourly_buckets.values()))
     if df.empty:
@@ -444,9 +470,9 @@ def fetch_weatherlink_history(
 
 def fetch_historical_nwp_and_references(days_back: int = 730) -> Dict[str, pd.DataFrame]:
     """
-    Fetches archived hourly NWP forecasts for Tassajara and reference series
-    for Chews Ridge (1,536m) and Hastings RAWS (546m) in 180-day chunks with
-    rate-limit backoff. Clamps all returned rows to valid_time_utc <= now_utc.
+    Fetches archived hourly NWP forecasts for Tassajara and boundary series for all
+    5 Santa Lucia reference stations (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1) in 180-day
+    chunks with rate-limit backoff. Clamps all returned rows to valid_time_utc <= now_utc.
     """
     now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     end_date = now_utc.date()
@@ -545,19 +571,28 @@ def fetch_historical_nwp_and_references(days_back: int = 730) -> Dict[str, pd.Da
         return df
 
     logger.info("Fetching archived NWP hourly forecasts for Tassajara grid cell...")
-    tass_nwp = _pull_point_chunked(TASS_LAT, TASS_LON, 880.0)
+    out_dict: Dict[str, pd.DataFrame] = {
+        "tass_nwp": _pull_point_chunked(TASS_LAT, TASS_LON, 880.0)
+    }
 
-    logger.info(
-        "Fetching archived reference boundary conditions for Chews Ridge & Hastings..."
-    )
-    chews_df = _pull_point_chunked(CHEWS_LAT, CHEWS_LON, 1536.0)
-    hast_df = _pull_point_chunked(HAST_LAT, HAST_LON, 546.0)
+    for stid, meta in REFERENCE_STATIONS.items():
+        logger.info(
+            f"Fetching archived reference boundary conditions for {stid} "
+            f"({meta['name']}, {meta['elev_m']:.0f}m)..."
+        )
+        out_dict[stid] = _pull_point_chunked(
+            float(meta["lat"]), float(meta["lon"]), float(meta["elev_m"])
+        )
 
-    return {"tass_nwp": tass_nwp, "chews": chews_df, "hastings": hast_df}
+    return out_dict
 
 
 def store_observations_to_sqlite(obs_df: pd.DataFrame, db_path: str = DB_PATH) -> int:
-    """Commits WeatherLink local observations to SQLite immediately."""
+    """
+    Upserts WeatherLink local observations to SQLite non-destructively:
+    if a row already exists in local_observations with non-zero rain or wind gusts,
+    MAX() preserves the higher value rather than overwriting with 0.0.
+    """
     if obs_df is None or obs_df.empty:
         return 0
     obs_rows = [
@@ -584,18 +619,31 @@ def store_observations_to_sqlite(obs_df: pd.DataFrame, db_path: str = DB_PATH) -
     with sqlite3.connect(db_path) as conn:
         conn.executemany(
             """
-            INSERT OR REPLACE INTO local_observations (
+            INSERT INTO local_observations (
                 valid_time_utc, station_id, temp_c, dewpoint_c, wetbulb_c,
                 rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg,
                 mslp_hpa, pressure_trend_3hr_hpa, precip_1hr_mm,
                 solar_rad_wm2, uv_index, qc_flag
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(valid_time_utc) DO UPDATE SET
+                temp_c = COALESCE(excluded.temp_c, local_observations.temp_c),
+                dewpoint_c = COALESCE(excluded.dewpoint_c, local_observations.dewpoint_c),
+                wetbulb_c = COALESCE(excluded.wetbulb_c, local_observations.wetbulb_c),
+                rh_pct = COALESCE(excluded.rh_pct, local_observations.rh_pct),
+                wind_speed_ms = MAX(COALESCE(local_observations.wind_speed_ms, 0.0), COALESCE(excluded.wind_speed_ms, 0.0)),
+                wind_gust_ms = MAX(COALESCE(local_observations.wind_gust_ms, 0.0), COALESCE(excluded.wind_gust_ms, 0.0)),
+                wind_dir_deg = CASE WHEN COALESCE(excluded.wind_dir_deg, 0.0) > 0.0 THEN excluded.wind_dir_deg ELSE local_observations.wind_dir_deg END,
+                mslp_hpa = COALESCE(excluded.mslp_hpa, local_observations.mslp_hpa),
+                pressure_trend_3hr_hpa = COALESCE(excluded.pressure_trend_3hr_hpa, local_observations.pressure_trend_3hr_hpa),
+                precip_1hr_mm = MAX(COALESCE(local_observations.precip_1hr_mm, 0.0), COALESCE(excluded.precip_1hr_mm, 0.0)),
+                solar_rad_wm2 = COALESCE(excluded.solar_rad_wm2, local_observations.solar_rad_wm2),
+                uv_index = COALESCE(excluded.uv_index, local_observations.uv_index)
             """,
             obs_rows,
         )
         conn.commit()
     logger.info(
-        f"Committed {len(obs_rows)} Stone Office hourly observation rows to SQLite."
+        f"Upserted {len(obs_rows)} Stone Office hourly observation rows to SQLite."
     )
     return len(obs_rows)
 
@@ -605,7 +653,7 @@ def store_backfill_to_sqlite(
     nwp_dict: Dict[str, pd.DataFrame],
     db_path: str = DB_PATH,
 ) -> None:
-    """Writes historical observations, reference stations, and NWP forecasts to SQLite."""
+    """Writes historical observations, all 5 reference stations, and NWP forecasts to SQLite."""
     now_iso = (
         datetime.now(timezone.utc)
         .replace(minute=0, second=0, microsecond=0)
@@ -633,8 +681,8 @@ def store_backfill_to_sqlite(
             """
         )
 
-        for stid, key in [("CHWC1", "chews"), ("CAHC1", "hastings")]:
-            rdf = nwp_dict.get(key, pd.DataFrame())
+        for stid in REFERENCE_STATIONS.keys():
+            rdf = nwp_dict.get(stid, pd.DataFrame())
             if rdf is None or rdf.empty:
                 continue
             ref_rows = [
@@ -711,7 +759,7 @@ def store_backfill_to_sqlite(
             )
         conn.commit()
     logger.info(
-        f"NWP & Reference backfill stored: {len(fc_rows)} historical forecast rows."
+        f"NWP & 5-Station Reference backfill stored: {len(fc_rows)} historical forecast rows."
     )
 
 
@@ -737,7 +785,7 @@ def populate_mos_verification_and_active_forecasts(
     """
     Populates all 15 thermal + hydrological columns in mos_corrected_forecasts across:
     1. All paired historical verification timestamps in train_df, and
-    2. The latest complete operational NWS 7-day forecast batch.
+    2. The latest complete operational NWS 7-day forecast batch using the 5-station array.
     """
     hist_preds = _ensure_hydro_pred_cols(corrector.predict(train_df), train_df)
     hist_rows = [
@@ -797,38 +845,82 @@ def populate_mos_verification_and_active_forecasts(
                 "SELECT * FROM local_observations WHERE temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1",
                 conn,
             )
-            chews_latest = pd.read_sql_query(
-                "SELECT * FROM reference_observations WHERE station_id = 'CHWC1' AND temp_c IS NOT NULL ORDER BY valid_time_utc DESC LIMIT 1",
-                conn,
+            anchor_ts = (
+                str(obs_latest.iloc[0]["valid_time_utc"])
+                if not obs_latest.empty
+                else datetime.now(timezone.utc).isoformat()
             )
+            refs_latest_df = pd.read_sql_query(
+                """
+                WITH ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY station_id ORDER BY valid_time_utc DESC) AS rn
+                    FROM reference_observations
+                    WHERE (temp_c IS NOT NULL OR precip_1hr_mm IS NOT NULL)
+                      AND valid_time_utc >= strftime('%Y-%m-%dT%H:%M:%S+00:00', ?, '-6 hours')
+                )
+                SELECT * FROM ranked WHERE rn = 1
+                """,
+                conn,
+                params=(anchor_ts,),
+            )
+            ref_map = (
+                {str(r["station_id"]): r for _, r in refs_latest_df.iterrows()}
+                if not refs_latest_df.empty
+                else {}
+            )
+
+            base_nws_t = float(latest_fc_df["nws_temp_c"].iloc[0])
+            base_nws_rh = clean_num(latest_fc_df["nws_rh_pct"].iloc[0], 50.0) or 50.0
             tass_t = (
                 float(obs_latest.iloc[0]["temp_c"])
                 if not obs_latest.empty
-                else float(latest_fc_df["nws_temp_c"].iloc[0])
+                else base_nws_t
             )
             ptrend = (
                 clean_num(obs_latest.iloc[0].get("pressure_trend_3hr_hpa"), 0.0)
                 if not obs_latest.empty
                 else 0.0
             )
-            chews_t = (
-                float(chews_latest.iloc[0]["temp_c"])
-                if not chews_latest.empty
-                else (tass_t + 2.0)
-            )
-            chews_p = (
-                clean_num(chews_latest.iloc[0].get("precip_1hr_mm"), 0.0)
-                if not chews_latest.empty
-                else 0.0
-            )
+
+            def _ref_val(stid: str, col: str, default_val: float) -> float:
+                row_s = ref_map.get(stid)
+                if row_s is not None and pd.notna(row_s.get(col)):
+                    return float(row_s[col])
+                return default_val
+
+            vent_raw_t = _ref_val("VTCC1", "temp_c", np.nan)
+            chews_default_t = (vent_raw_t - 0.54) if not np.isnan(vent_raw_t) else (tass_t + 2.0)
+            chews_t = _ref_val("CHWC1", "temp_c", chews_default_t)
+            chews_rh = _ref_val("CHWC1", "rh_pct", base_nws_rh)
+            chews_p = _ref_val("CHWC1", "precip_1hr_mm", 0.0)
+
+            arroyo_raw_t = _ref_val("ASRC1", "temp_c", np.nan)
+            hast_default_t = (arroyo_raw_t - 1.80) if not np.isnan(arroyo_raw_t) else (tass_t + 0.5)
+            hast_t = _ref_val("CAHC1", "temp_c", hast_default_t)
+            arroyo_t = _ref_val("ASRC1", "temp_c", hast_t + 1.80)
+            arroyo_rh = _ref_val("ASRC1", "rh_pct", base_nws_rh)
+
+            bigsur_t = _ref_val("PPSC1", "temp_c", tass_t + 0.8)
+            bigsur_rh = _ref_val("PPSC1", "rh_pct", base_nws_rh)
+            bigsur_p = _ref_val("PPSC1", "precip_1hr_mm", 0.0)
+
+            vent_t = _ref_val("VTCC1", "temp_c", chews_t + 0.54)
+            vent_p = _ref_val("VTCC1", "precip_1hr_mm", chews_p)
 
             latest_fc_df["pressure_trend_3hr_hpa"] = ptrend
             latest_fc_df["issue_chews_temp_c"] = chews_t
+            latest_fc_df["issue_chews_rh_pct"] = chews_rh
             latest_fc_df["issue_chews_precip_mm"] = chews_p
+            latest_fc_df["issue_hastings_temp_c"] = hast_t
+            latest_fc_df["issue_arroyo_temp_c"] = arroyo_t
+            latest_fc_df["issue_arroyo_rh_pct"] = arroyo_rh
+            latest_fc_df["issue_bigsur_temp_c"] = bigsur_t
+            latest_fc_df["issue_bigsur_rh_pct"] = bigsur_rh
+            latest_fc_df["issue_bigsur_precip_mm"] = bigsur_p
+            latest_fc_df["issue_ventana_temp_c"] = vent_t
+            latest_fc_df["issue_ventana_precip_mm"] = vent_p
             latest_fc_df["issue_tass_temp_c"] = tass_t
-            latest_fc_df["issue_persistence_bias_c"] = tass_t - float(
-                latest_fc_df["nws_temp_c"].iloc[0]
-            )
+            latest_fc_df["issue_persistence_bias_c"] = tass_t - base_nws_t
 
             fut_preds = _ensure_hydro_pred_cols(
                 corrector.predict(latest_fc_df), latest_fc_df
@@ -878,13 +970,18 @@ def populate_mos_verification_and_active_forecasts(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backfill WeatherLink Pro history and train Thermal + Hydrological MOS model."
+        description="Backfill WeatherLink Pro history and train 5-station Thermal + Hydrological MOS model."
     )
     parser.add_argument(
         "--days",
         type=int,
         default=730,
         help="Number of past days to backfill (default: 730)",
+    )
+    parser.add_argument(
+        "--skip-weatherlink",
+        action="store_true",
+        help="Preserve existing local_observations in SQLite and only backfill the 5-station Open-Meteo series before training.",
     )
     parser.add_argument(
         "--skip-fetch",
@@ -896,25 +993,25 @@ def main():
     ensure_schema_and_view(DB_PATH)
 
     if not args.skip_fetch:
-        obs_df = pd.DataFrame()
-        try:
-            wl_client = WeatherLinkV2Client(
-                WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET
-            )
-            station_id = wl_client.get_station_id()
-            obs_df = fetch_weatherlink_history(
-                wl_client, station_id, days_back=args.days
-            )
-            if not obs_df.empty:
-                store_observations_to_sqlite(obs_df, DB_PATH)
-            else:
-                logger.warning(
-                    "WeatherLink Historic API returned 0 rows; proceeding with existing SQLite observations."
+        if not args.skip_weatherlink:
+            try:
+                wl_client = WeatherLinkV2Client(
+                    WEATHERLINK_API_KEY, WEATHERLINK_API_SECRET
                 )
-        except Exception as exc:
-            logger.warning(
-                f"Live WeatherLink backfill encountered an error ({exc}); preserving existing SQLite observations..."
-            )
+                station_id = wl_client.get_station_id()
+                obs_df = fetch_weatherlink_history(
+                    wl_client, station_id, days_back=float(args.days)
+                )
+                if not obs_df.empty:
+                    store_observations_to_sqlite(obs_df, DB_PATH)
+                else:
+                    logger.warning(
+                        "WeatherLink Historic API returned 0 rows; proceeding with existing SQLite observations."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Live WeatherLink backfill encountered an error ({exc}); preserving existing SQLite observations..."
+                )
 
         try:
             nwp_dict = fetch_historical_nwp_and_references(days_back=args.days)
