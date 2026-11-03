@@ -4,7 +4,8 @@ app.py — Tassajara Zen Mountain Center Meteorological & Hydrological MOS Monit
 Publication-grade scientific monitoring suite for Station 36966 (Stone Office Vantage Pro2),
 the 5-station Santa Lucia boundary network (Chews Ridge CHWC1, Hastings CAHC1, Arroyo Seco ASRC1,
 Big Sur PPSC1, Ventana Cone VTCC1), and Thermal + Hydrological MOS.
-Includes comprehensive scientific tooltips (help="...") and an OLS & Feature Importance suite.
+Includes real-time UTC horizon filtering, automatic live 168-hour NWP top-up,
+comprehensive scientific tooltips (help="..."), and an OLS & Feature Importance suite.
 """
 
 import math
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -31,6 +33,7 @@ from ingest_weather import (
     ELEV_VENTANA_CONE_M as ELEV_VENTANA_M,
 )
 from mos_model import (
+    TassajaraMOSCorrector,
     engineer_mos_features,
     analytical_hydro_hurdle_fallback,
     build_well_conditioned_ols_matrix,
@@ -100,6 +103,10 @@ st.markdown(
 DB_PATH = "tassajara_weather.db"
 MODEL_PATH = Path("models/tassajara_mos_v1.joblib")
 LOCAL_TZ = "America/Los_Angeles"
+
+TASSAJARA_LAT = 36.2337
+TASSAJARA_LON = -121.5501
+NWP_GRID_ELEV_M = 880.0
 
 # ---------------------------------------------------------------------------
 # Scientific Tooltip Dictionary & Feature Metadata (Line-Wrap Safe)
@@ -311,8 +318,8 @@ def compute_wetbulb_stull_c(temp_c: float, rh_pct: float) -> float:
 
 def compute_canyon_solar_state(dt_utc: datetime):
     """Computes solar elevation, azimuth, and Tassajara Canyon horizon shadow regime."""
-    lat_rad = math.radians(36.2337)
-    lon_deg = -121.5501
+    lat_rad = math.radians(TASSAJARA_LAT)
+    lon_deg = TASSAJARA_LON
     doy = dt_utc.timetuple().tm_yday
     hour_utc = dt_utc.hour + dt_utc.minute / 60.0
 
@@ -321,7 +328,7 @@ def compute_canyon_solar_state(dt_utc: datetime):
         0.006918
         - 0.399912 * math.cos(gamma)
         + 0.070257 * math.sin(gamma)
-        - 0.006758 * np.cos(2 * gamma)
+        - 0.006758 * math.cos(2 * gamma)
         + 0.000907 * math.sin(2 * gamma)
     )
     eqtime = 229.18 * (
@@ -359,6 +366,323 @@ def compute_canyon_solar_state(dt_utc: datetime):
     return "Direct Canyon Insolation", el_deg, az_deg, horizon_deg
 
 
+# ---------------------------------------------------------------------------
+# Strict Real-Time Horizon Filtering & Live 7-Day NWP Top-Up Helpers
+# ---------------------------------------------------------------------------
+def filter_future_horizon(df: pd.DataFrame, now_hour_utc: datetime) -> pd.DataFrame:
+    """
+    Strictly filters a forecast DataFrame to `valid_time_utc >= now_hour_utc`,
+    normalizes timestamps to UTC, deduplicates any repeated hours (such as
+    Daylight Saving Time fallback transitions), and sorts chronologically.
+    """
+    if df is None or df.empty or "valid_time_utc" not in df.columns:
+        return pd.DataFrame()
+
+    out = df.copy()
+    valid_dt = pd.to_datetime(out["valid_time_utc"], utc=True, errors="coerce")
+    out = out.loc[valid_dt.notna()].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    out["_valid_dt_utc"] = pd.to_datetime(out["valid_time_utc"], utc=True).dt.floor("h")
+    cutoff_ts = pd.Timestamp(now_hour_utc).floor("h")
+    out = out.loc[out["_valid_dt_utc"] >= cutoff_ts].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    out = (
+        out.sort_values("_valid_dt_utc", ascending=True)
+        .drop_duplicates(subset=["_valid_dt_utc"], keep="first")
+        .reset_index(drop=True)
+    )
+    out["valid_time_utc"] = out["_valid_dt_utc"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    out = out.drop(columns=["_valid_dt_utc"])
+    return out
+
+
+def attach_boundary_telemetry_for_mos(
+    df: pd.DataFrame,
+    obs_df: pd.DataFrame,
+    ref_dict: dict,
+    now_hour_utc: datetime,
+) -> pd.DataFrame:
+    """
+    Attaches the latest Stone Office Vantage Pro2 observation and 5-station
+    Santa Lucia reference boundary conditions (CHWC1, VTCC1, CAHC1, ASRC1, PPSC1)
+    to future forecast rows prior to running TassajaraMOSCorrector inference.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if "nws_temp_c" not in out.columns and "raw_nws_temp_c" in out.columns:
+        out["nws_temp_c"] = out["raw_nws_temp_c"]
+    if "raw_nws_temp_c" not in out.columns and "nws_temp_c" in out.columns:
+        out["raw_nws_temp_c"] = out["nws_temp_c"]
+
+    base_t = get_col(out, "nws_temp_c", 15.0)
+    base_rh = get_col(out, "nws_rh_pct", 50.0)
+
+    valid_dt = pd.to_datetime(out["valid_time_utc"], utc=True, errors="coerce")
+    if "issue_time_utc" not in out.columns or out["issue_time_utc"].isna().all():
+        out["issue_time_utc"] = now_hour_utc.isoformat()
+
+    issue_dt = pd.to_datetime(out["issue_time_utc"], utc=True, errors="coerce").fillna(
+        pd.Timestamp(now_hour_utc)
+    )
+    computed_lead = ((valid_dt - issue_dt).dt.total_seconds() / 3600.0).clip(lower=1.0)
+    if "lead_time_hours" not in out.columns:
+        out["lead_time_hours"] = computed_lead
+    else:
+        out["lead_time_hours"] = pd.to_numeric(
+            out["lead_time_hours"], errors="coerce"
+        ).fillna(computed_lead).clip(lower=1.0)
+
+    latest_tass_t = np.nan
+    latest_ptrend = 0.0
+    if obs_df is not None and not obs_df.empty:
+        latest_tass_t = safe_float(obs_df.iloc[0].get("temp_c"), np.nan)
+        latest_ptrend = safe_float(obs_df.iloc[0].get("pressure_trend_3hr_hpa"), 0.0)
+
+    first_nws_t = float(base_t.iloc[0]) if not base_t.empty else 15.0
+    init_bias_c = (
+        float(latest_tass_t - first_nws_t) if not math.isnan(latest_tass_t) else 0.0
+    )
+
+    def _ref_val(stid: str, key: str, default_val=np.nan):
+        if not isinstance(ref_dict, dict):
+            return default_val
+        node = ref_dict.get(stid, {})
+        if not isinstance(node, dict):
+            return default_val
+        v = node.get(key)
+        if v is None or pd.isna(v):
+            return default_val
+        try:
+            f_v = float(v)
+            return default_val if math.isnan(f_v) else f_v
+        except (ValueError, TypeError):
+            return default_val
+
+    chews_t = _ref_val("CHWC1", "temp_c", np.nan)
+    chews_rh = _ref_val("CHWC1", "rh_pct", np.nan)
+    chews_p = _ref_val("CHWC1", "precip_1hr_mm", 0.0)
+
+    vent_t = _ref_val("VTCC1", "temp_c", np.nan)
+    vent_p = _ref_val("VTCC1", "precip_1hr_mm", np.nan)
+
+    hast_t = _ref_val("CAHC1", "temp_c", np.nan)
+    arroyo_t = _ref_val("ASRC1", "temp_c", np.nan)
+    arroyo_rh = _ref_val("ASRC1", "rh_pct", np.nan)
+
+    bigsur_t = _ref_val("PPSC1", "temp_c", np.nan)
+    bigsur_rh = _ref_val("PPSC1", "rh_pct", np.nan)
+    bigsur_p = _ref_val("PPSC1", "precip_1hr_mm", 0.0)
+
+    if math.isnan(chews_t) and not math.isnan(vent_t):
+        chews_t = vent_t - 0.54
+    if math.isnan(vent_t) and not math.isnan(chews_t):
+        vent_t = chews_t + 0.54
+    if math.isnan(hast_t) and not math.isnan(arroyo_t):
+        hast_t = arroyo_t - 1.80
+    if math.isnan(arroyo_t) and not math.isnan(hast_t):
+        arroyo_t = hast_t + 1.80
+
+    out["pressure_trend_3hr_hpa"] = get_col(out, "pressure_trend_3hr_hpa", latest_ptrend)
+    out["issue_tass_temp_c"] = get_col(
+        out,
+        "issue_tass_temp_c",
+        latest_tass_t if not math.isnan(latest_tass_t) else base_t,
+    )
+    out["issue_persistence_bias_c"] = get_col(out, "issue_persistence_bias_c", init_bias_c)
+
+    out["issue_chews_temp_c"] = get_col(
+        out,
+        "issue_chews_temp_c",
+        chews_t if not math.isnan(chews_t) else base_t + 2.0,
+    )
+    out["issue_chews_rh_pct"] = get_col(
+        out,
+        "issue_chews_rh_pct",
+        chews_rh if not math.isnan(chews_rh) else base_rh,
+    )
+    out["issue_chews_precip_mm"] = get_col(out, "issue_chews_precip_mm", chews_p)
+
+    out["issue_ventana_temp_c"] = get_col(
+        out,
+        "issue_ventana_temp_c",
+        vent_t if not math.isnan(vent_t) else out["issue_chews_temp_c"] + 0.54,
+    )
+    out["issue_ventana_precip_mm"] = get_col(
+        out,
+        "issue_ventana_precip_mm",
+        vent_p if not math.isnan(vent_p) else out["issue_chews_precip_mm"],
+    )
+
+    out["issue_hastings_temp_c"] = get_col(
+        out,
+        "issue_hastings_temp_c",
+        hast_t if not math.isnan(hast_t) else base_t + 0.5,
+    )
+    out["issue_arroyo_temp_c"] = get_col(
+        out,
+        "issue_arroyo_temp_c",
+        arroyo_t if not math.isnan(arroyo_t) else base_t + 1.4,
+    )
+    out["issue_arroyo_rh_pct"] = get_col(
+        out,
+        "issue_arroyo_rh_pct",
+        arroyo_rh if not math.isnan(arroyo_rh) else base_rh,
+    )
+
+    out["issue_bigsur_temp_c"] = get_col(
+        out,
+        "issue_bigsur_temp_c",
+        bigsur_t if not math.isnan(bigsur_t) else base_t + 0.8,
+    )
+    out["issue_bigsur_rh_pct"] = get_col(
+        out,
+        "issue_bigsur_rh_pct",
+        bigsur_rh if not math.isnan(bigsur_rh) else base_rh,
+    )
+    out["issue_bigsur_precip_mm"] = get_col(out, "issue_bigsur_precip_mm", bigsur_p)
+
+    return out
+
+
+def fetch_live_nwp_topup(now_hour_utc: datetime) -> pd.DataFrame:
+    """
+    Fetches a live 168-hour (7-day) hourly NWP forecast for the Tassajara grid cell
+    (36.2337°N, -121.5501°W, 880m MSL) via Open-Meteo GFS/HRRR Seamless API, with
+    an automatic fallback to the operational weather.gov API.
+    """
+    issue_iso = now_hour_utc.isoformat()
+
+    # Primary: Open-Meteo GFS/HRRR seamless hourly forecast at 880m NWP reference elevation
+    om_url = "https://api.open-meteo.com/v1/forecast"
+    om_params = {
+        "latitude": TASSAJARA_LAT,
+        "longitude": TASSAJARA_LON,
+        "elevation": NWP_GRID_ELEV_M,
+        "hourly": (
+            "temperature_2m,relative_humidity_2m,dew_point_2m,"
+            "precipitation_probability,precipitation,cloud_cover,"
+            "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
+        ),
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "ms",
+        "precipitation_unit": "mm",
+        "timezone": "UTC",
+        "forecast_days": 8,
+    }
+    try:
+        resp = requests.get(om_url, params=om_params, timeout=12)
+        resp.raise_for_status()
+        hourly = resp.json().get("hourly", {})
+        times = hourly.get("time", [])
+        if times:
+            dt_series = pd.to_datetime(times, utc=True).floor("h")
+            df_live = pd.DataFrame({
+                "issue_time_utc": issue_iso,
+                "valid_time_utc": dt_series.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                "nws_temp_c": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
+                "nws_dewpoint_c": pd.to_numeric(hourly.get("dew_point_2m"), errors="coerce"),
+                "nws_rh_pct": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
+                "nws_wind_speed_ms": pd.to_numeric(hourly.get("wind_speed_10m"), errors="coerce"),
+                "nws_wind_gust_ms": pd.to_numeric(hourly.get("wind_gusts_10m"), errors="coerce"),
+                "nws_wind_dir_deg": pd.to_numeric(hourly.get("wind_direction_10m"), errors="coerce"),
+                "nws_pop_pct": pd.to_numeric(
+                    hourly.get("precipitation_probability"), errors="coerce"
+                ).fillna(0.0),
+                "nws_qpf_1hr_mm": pd.to_numeric(
+                    hourly.get("precipitation"), errors="coerce"
+                ).fillna(0.0),
+                "nws_sky_cover_pct": pd.to_numeric(
+                    hourly.get("cloud_cover"), errors="coerce"
+                ).fillna(20.0),
+                "short_forecast": "Live NWP Grid",
+            })
+            df_live["raw_nws_temp_c"] = df_live["nws_temp_c"]
+            df_live = filter_future_horizon(df_live, now_hour_utc).head(168).copy()
+            if not df_live.empty:
+                valid_dt = pd.to_datetime(df_live["valid_time_utc"], utc=True)
+                df_live["lead_time_hours"] = (
+                    (valid_dt - pd.Timestamp(now_hour_utc)).dt.total_seconds() / 3600.0
+                ).clip(lower=1.0)
+                return df_live
+    except Exception:
+        pass
+
+    # Secondary Fallback: NWS API (/points/36.2337,-121.5501 -> forecastHourly)
+    try:
+        headers = {
+            "User-Agent": "(TassajaraWeatherMOSMonitor/2.0, tzmc-weather@tassajara.org)",
+            "Accept": "application/geo+json",
+        }
+        pt_resp = requests.get(
+            f"https://api.weather.gov/points/{TASSAJARA_LAT},{TASSAJARA_LON}",
+            headers=headers,
+            timeout=10,
+        )
+        pt_resp.raise_for_status()
+        hr_url = pt_resp.json().get("properties", {}).get("forecastHourly")
+        if hr_url:
+            fc_resp = requests.get(hr_url, headers=headers, timeout=12)
+            fc_resp.raise_for_status()
+            periods = fc_resp.json().get("properties", {}).get("periods", [])
+            rows = []
+            for p in periods:
+                v_dt = pd.to_datetime(p.get("startTime"), utc=True).floor("h")
+                t_val = float(p.get("temperature", 60.0))
+                t_unit = str(p.get("temperatureUnit", "F")).upper()
+                t_c = (t_val - 32.0) * 5.0 / 9.0 if t_unit == "F" else t_val
+                rh_val = safe_float(
+                    (p.get("relativeHumidity") or {}).get("value"), 50.0
+                )
+                dew_raw = (p.get("dewpoint") or {}).get("value")
+                dew_c = (
+                    float(dew_raw)
+                    if dew_raw is not None
+                    else t_c - ((100.0 - rh_val) / 5.0)
+                )
+                pop_val = safe_float(
+                    (p.get("probabilityOfPrecipitation") or {}).get("value"), 0.0
+                )
+                w_str = str(p.get("windSpeed", "3 mph")).split()[0]
+                try:
+                    w_mph = float(w_str)
+                except ValueError:
+                    w_mph = 3.0
+                w_ms = round(w_mph * 0.44704, 2)
+                rows.append({
+                    "issue_time_utc": issue_iso,
+                    "valid_time_utc": v_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    "nws_temp_c": round(t_c, 2),
+                    "raw_nws_temp_c": round(t_c, 2),
+                    "nws_dewpoint_c": round(dew_c, 2),
+                    "nws_rh_pct": round(rh_val, 1),
+                    "nws_wind_speed_ms": w_ms,
+                    "nws_wind_gust_ms": round(w_ms * 1.35, 2),
+                    "nws_wind_dir_deg": 295.0,
+                    "nws_pop_pct": round(pop_val, 1),
+                    "nws_qpf_1hr_mm": 0.0,
+                    "nws_sky_cover_pct": 50.0 if pop_val >= 25.0 else 20.0,
+                    "short_forecast": str(p.get("shortForecast") or "NWS Hourly"),
+                })
+            if rows:
+                df_nws = pd.DataFrame(rows)
+                df_nws = filter_future_horizon(df_nws, now_hour_utc).head(168).copy()
+                valid_dt = pd.to_datetime(df_nws["valid_time_utc"], utc=True)
+                df_nws["lead_time_hours"] = (
+                    (valid_dt - pd.Timestamp(now_hour_utc)).dt.total_seconds() / 3600.0
+                ).clip(lower=1.0)
+                return df_nws
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
 def fallback_physics_mos(df: pd.DataFrame) -> pd.DataFrame:
     """Topographic radiation-drainage + Orographic-Virga physical MOS fallback."""
     out = df.copy()
@@ -392,15 +716,19 @@ def fallback_physics_mos(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+def apply_mos_inference_if_needed(
+    df: pd.DataFrame,
+    force_recompute: bool = False,
+) -> pd.DataFrame:
     """
     Ensures every row in `df` has MOS corrected_temp_c, p10, p90, mos_pop_pct,
     mos_qpf_mm, and mos_qpf_p90_mm across the 5-station Santa Lucia feature set.
     """
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
     out = df.copy()
     for col in [
+        "pred_temp_error_c",
         "corrected_temp_c",
         "corrected_temp_p10_c",
         "corrected_temp_p90_c",
@@ -416,15 +744,18 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     mos_pop_s = get_col(out, "mos_pop_pct", np.nan)
     mos_qpf_s = get_col(out, "mos_qpf_mm", np.nan)
 
-    missing_mask = (
-        out["corrected_temp_c"].isna()
-        | mos_qpf_s.isna()
-        | mos_pop_s.isna()
-        | ((raw_pop_s >= 15.0) & (mos_pop_s <= 0.0))
-        | ((raw_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
-        | ((mos_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
-        | ((raw_qpf_s > 0.0) & (mos_qpf_s <= 0.0))
-    )
+    if force_recompute:
+        missing_mask = pd.Series(True, index=out.index)
+    else:
+        missing_mask = (
+            out["corrected_temp_c"].isna()
+            | mos_qpf_s.isna()
+            | mos_pop_s.isna()
+            | ((raw_pop_s >= 15.0) & (mos_pop_s <= 0.0))
+            | ((raw_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+            | ((mos_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+            | ((raw_qpf_s > 0.0) & (mos_qpf_s <= 0.0))
+        )
     if not missing_mask.any():
         return out
 
@@ -451,8 +782,12 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     sub["issue_bigsur_temp_c"] = get_col(sub, "issue_bigsur_temp_c", sub["nws_temp_c"] + 0.8)
     sub["issue_bigsur_rh_pct"] = get_col(sub, "issue_bigsur_rh_pct", sub["nws_rh_pct"])
     sub["issue_bigsur_precip_mm"] = get_col(sub, "issue_bigsur_precip_mm", 0.0)
-    sub["issue_ventana_temp_c"] = get_col(sub, "issue_ventana_temp_c", sub["issue_chews_temp_c"] + 0.54)
-    sub["issue_ventana_precip_mm"] = get_col(sub, "issue_ventana_precip_mm", sub["issue_chews_precip_mm"])
+    sub["issue_ventana_temp_c"] = get_col(
+        sub, "issue_ventana_temp_c", sub["issue_chews_temp_c"] + 0.54
+    )
+    sub["issue_ventana_precip_mm"] = get_col(
+        sub, "issue_ventana_precip_mm", sub["issue_chews_precip_mm"]
+    )
     sub["issue_tass_temp_c"] = get_col(sub, "issue_tass_temp_c", sub["nws_temp_c"])
     sub["issue_persistence_bias_c"] = get_col(sub, "issue_persistence_bias_c", 0.0)
     if "issue_time_utc" not in sub.columns:
@@ -510,172 +845,255 @@ def apply_mos_inference_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Data Loading & SQL Alignment
+# Data Loading, Real-Time Horizon Filtering & Automatic Live 7-Day Top-Up
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=120)
 def load_all_dashboard_data():
-    if not Path(DB_PATH).exists():
-        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
+    now_hour_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    now_hour_iso = now_hour_utc.isoformat()
 
-    with sqlite3.connect(DB_PATH) as conn:
-        # 1. Recent Local Observations (Stone Office Vantage Pro2)
-        try:
-            obs_df = pd.read_sql_query(
-                """
-                SELECT * FROM local_observations
-                WHERE temp_c IS NOT NULL
-                ORDER BY valid_time_utc DESC
-                LIMIT 240
-                """,
-                conn,
-            )
-        except Exception:
-            obs_df = pd.DataFrame()
+    obs_df = pd.DataFrame()
+    ref_dict = {}
+    future_fc_df = pd.DataFrame()
+    verify_df = pd.DataFrame()
+    archive_stats = {
+        "total_obs_hours": 0,
+        "wet_hours": 0,
+        "total_rain_mm": 0.0,
+        "max_1hr_mm": 0.0,
+    }
 
-        # Archive-wide Precipitation Stats
-        archive_stats = {
-            "total_obs_hours": 0,
-            "wet_hours": 0,
-            "total_rain_mm": 0.0,
-            "max_1hr_mm": 0.0,
-        }
-        try:
-            row_st = conn.execute(
-                """
-                SELECT
-                    COUNT(*),
-                    SUM(CASE WHEN COALESCE(precip_1hr_mm, 0.0) >= 0.254 THEN 1 ELSE 0 END),
-                    COALESCE(SUM(precip_1hr_mm), 0.0),
-                    COALESCE(MAX(precip_1hr_mm), 0.0)
-                FROM local_observations
-                WHERE temp_c IS NOT NULL
-                """
-            ).fetchone()
-            if row_st:
-                archive_stats = {
-                    "total_obs_hours": int(row_st[0] or 0),
-                    "wet_hours": int(row_st[1] or 0),
-                    "total_rain_mm": float(row_st[2] or 0.0),
-                    "max_1hr_mm": float(row_st[3] or 0.0),
-                }
-        except Exception:
-            pass
+    if Path(DB_PATH).exists():
+        with sqlite3.connect(DB_PATH) as conn:
+            # 1. Recent Local Observations (Stone Office Vantage Pro2)
+            try:
+                obs_df = pd.read_sql_query(
+                    """
+                    SELECT * FROM local_observations
+                    WHERE temp_c IS NOT NULL
+                    ORDER BY valid_time_utc DESC
+                    LIMIT 240
+                    """,
+                    conn,
+                )
+            except Exception:
+                obs_df = pd.DataFrame()
 
-        # 2. Latest 5-Station Reference Observations (Partitioned by station_id + Staleness Check)
-        ref_dict = {}
-        try:
-            anchor_ts = (
-                str(obs_df.iloc[0]["valid_time_utc"])
-                if not obs_df.empty
-                else datetime.now(timezone.utc).isoformat()
-            )
-            ref_df = pd.read_sql_query(
-                """
-                WITH ranked_refs AS (
+            # Archive-wide Precipitation Stats
+            try:
+                row_st = conn.execute(
+                    """
                     SELECT
-                        *,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY station_id
-                            ORDER BY valid_time_utc DESC
-                        ) AS rn
-                    FROM reference_observations
-                    WHERE valid_time_utc <= ?
-                )
-                SELECT * FROM ranked_refs WHERE rn = 1
-                """,
-                conn,
-                params=(anchor_ts,),
-            )
-            anchor_dt = pd.to_datetime(anchor_ts, utc=True)
-            for stid, meta in REFERENCE_STATIONS.items():
-                match = (
-                    ref_df[ref_df["station_id"] == stid]
-                    if not ref_df.empty and "station_id" in ref_df.columns
-                    else pd.DataFrame()
-                )
-                if not match.empty:
-                    row_d = match.iloc[0].to_dict()
-                    obs_dt = pd.to_datetime(row_d.get("valid_time_utc"), utc=True)
-                    age_hrs = abs((anchor_dt - obs_dt).total_seconds()) / 3600.0 if pd.notna(obs_dt) else 999.0
-                    is_fresh = age_hrs <= 3.5 and (
-                        pd.notna(row_d.get("temp_c")) or pd.notna(row_d.get("precip_1hr_mm"))
-                    )
-                    row_d["online"] = bool(is_fresh)
-                    row_d["age_hours"] = round(age_hrs, 1)
-                    row_d["name"] = meta["name"]
-                    row_d["elev_m"] = meta["elev_m"]
-                    row_d["role"] = meta["role"]
-                    ref_dict[stid] = row_d
-                else:
-                    ref_dict[stid] = {
-                        "station_id": stid,
-                        "name": meta["name"],
-                        "elev_m": meta["elev_m"],
-                        "role": meta["role"],
-                        "valid_time_utc": None,
-                        "online": False,
-                        "age_hours": None,
-                        "temp_c": np.nan,
-                        "rh_pct": np.nan,
-                        "wind_speed_ms": np.nan,
-                        "wind_gust_ms": np.nan,
-                        "wind_dir_deg": np.nan,
-                        "precip_1hr_mm": 0.0,
+                        COUNT(*),
+                        SUM(CASE WHEN COALESCE(precip_1hr_mm, 0.0) >= 0.254 THEN 1 ELSE 0 END),
+                        COALESCE(SUM(precip_1hr_mm), 0.0),
+                        COALESCE(MAX(precip_1hr_mm), 0.0)
+                    FROM local_observations
+                    WHERE temp_c IS NOT NULL
+                    """
+                ).fetchone()
+                if row_st:
+                    archive_stats = {
+                        "total_obs_hours": int(row_st[0] or 0),
+                        "wet_hours": int(row_st[1] or 0),
+                        "total_rain_mm": float(row_st[2] or 0.0),
+                        "max_1hr_mm": float(row_st[3] or 0.0),
                     }
-        except Exception:
-            ref_dict = {}
+            except Exception:
+                pass
 
-        # Inspect mos_corrected_forecasts columns for backward-compatible SQL queries
-        mos_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()
-        }
-        has_hydro_cols = "mos_qpf_mm" in mos_cols and "mos_pop_pct" in mos_cols
-        hydro_select_sql = (
-            "m.mos_pop_pct, m.mos_qpf_mm, m.mos_qpf_p90_mm"
-            if has_hydro_cols
-            else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
-        )
-        hydro_inner_sql = (
-            "mos_pop_pct, mos_qpf_mm, mos_qpf_p90_mm"
-            if has_hydro_cols
-            else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
-        )
+            # 2. Latest 5-Station Reference Observations (Partitioned by station_id + Staleness Check)
+            try:
+                anchor_ts = (
+                    str(obs_df.iloc[0]["valid_time_utc"])
+                    if not obs_df.empty
+                    else now_hour_iso
+                )
+                ref_df = pd.read_sql_query(
+                    """
+                    WITH ranked_refs AS (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY station_id
+                                ORDER BY valid_time_utc DESC
+                            ) AS rn
+                        FROM reference_observations
+                        WHERE valid_time_utc <= ?
+                    )
+                    SELECT * FROM ranked_refs WHERE rn = 1
+                    """,
+                    conn,
+                    params=(anchor_ts,),
+                )
+                anchor_dt = pd.to_datetime(anchor_ts, utc=True)
+                for stid, meta in REFERENCE_STATIONS.items():
+                    match = (
+                        ref_df[ref_df["station_id"] == stid]
+                        if not ref_df.empty and "station_id" in ref_df.columns
+                        else pd.DataFrame()
+                    )
+                    if not match.empty:
+                        row_d = match.iloc[0].to_dict()
+                        obs_dt = pd.to_datetime(row_d.get("valid_time_utc"), utc=True)
+                        age_hrs = (
+                            abs((anchor_dt - obs_dt).total_seconds()) / 3600.0
+                            if pd.notna(obs_dt)
+                            else 999.0
+                        )
+                        is_fresh = age_hrs <= 3.5 and (
+                            pd.notna(row_d.get("temp_c")) or pd.notna(row_d.get("precip_1hr_mm"))
+                        )
+                        row_d["online"] = bool(is_fresh)
+                        row_d["age_hours"] = round(age_hrs, 1)
+                        row_d["name"] = meta["name"]
+                        row_d["elev_m"] = meta["elev_m"]
+                        row_d["role"] = meta["role"]
+                        ref_dict[stid] = row_d
+                    else:
+                        ref_dict[stid] = {
+                            "station_id": stid,
+                            "name": meta["name"],
+                            "elev_m": meta["elev_m"],
+                            "role": meta["role"],
+                            "valid_time_utc": None,
+                            "online": False,
+                            "age_hours": None,
+                            "temp_c": np.nan,
+                            "rh_pct": np.nan,
+                            "wind_speed_ms": np.nan,
+                            "wind_gust_ms": np.nan,
+                            "wind_dir_deg": np.nan,
+                            "precip_1hr_mm": 0.0,
+                        }
+            except Exception:
+                ref_dict = {}
 
-        # 3. Future 7-Day Forecast Series
-        future_fc_df = pd.DataFrame()
-        try:
-            nws_issue_row = pd.read_sql_query(
-                """
-                SELECT issue_time_utc, COUNT(*) AS cnt
-                FROM nws_forecasts
-                WHERE short_forecast != 'Archived NWP Grid' OR short_forecast IS NULL
-                GROUP BY issue_time_utc
-                HAVING COUNT(*) >= 48
-                ORDER BY issue_time_utc DESC
-                LIMIT 1
-                """,
-                conn,
+            # Inspect mos_corrected_forecasts columns for backward-compatible SQL queries
+            mos_cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()
+            }
+            has_hydro_cols = "mos_qpf_mm" in mos_cols and "mos_pop_pct" in mos_cols
+            hydro_select_sql = (
+                "m.mos_pop_pct, m.mos_qpf_mm, m.mos_qpf_p90_mm"
+                if has_hydro_cols
+                else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
             )
-            if nws_issue_row.empty:
+            hydro_inner_sql = (
+                "mos_pop_pct, mos_qpf_mm, mos_qpf_p90_mm"
+                if has_hydro_cols
+                else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
+            )
+
+            # 3. Future 7-Day Forecast Series (Strictly Filtered to valid_time_utc >= now_hour_utc)
+            try:
                 nws_issue_row = pd.read_sql_query(
                     """
                     SELECT issue_time_utc, COUNT(*) AS cnt
                     FROM nws_forecasts
+                    WHERE (short_forecast != 'Archived NWP Grid' OR short_forecast IS NULL)
+                      AND valid_time_utc >= ?
                     GROUP BY issue_time_utc
                     HAVING COUNT(*) >= 24
                     ORDER BY issue_time_utc DESC
                     LIMIT 1
                     """,
                     conn,
+                    params=(now_hour_iso,),
                 )
+                if nws_issue_row.empty:
+                    nws_issue_row = pd.read_sql_query(
+                        """
+                        SELECT issue_time_utc, COUNT(*) AS cnt
+                        FROM nws_forecasts
+                        WHERE valid_time_utc >= ?
+                        GROUP BY issue_time_utc
+                        HAVING COUNT(*) >= 12
+                        ORDER BY issue_time_utc DESC
+                        LIMIT 1
+                        """,
+                        conn,
+                        params=(now_hour_iso,),
+                    )
 
-            if not nws_issue_row.empty:
-                latest_nws_issue = str(nws_issue_row.iloc[0]["issue_time_utc"])
-                future_fc_df = pd.read_sql_query(
+                if not nws_issue_row.empty:
+                    latest_nws_issue = str(nws_issue_row.iloc[0]["issue_time_utc"])
+                    future_fc_df = pd.read_sql_query(
+                        f"""
+                        SELECT
+                            f.issue_time_utc,
+                            f.valid_time_utc,
+                            f.lead_time_hours,
+                            f.nws_temp_c,
+                            f.nws_temp_c AS raw_nws_temp_c,
+                            f.nws_dewpoint_c,
+                            f.nws_rh_pct,
+                            f.nws_wind_speed_ms,
+                            f.nws_wind_gust_ms,
+                            f.nws_wind_dir_deg,
+                            f.nws_pop_pct,
+                            f.nws_qpf_1hr_mm,
+                            f.nws_sky_cover_pct,
+                            f.short_forecast,
+                            m.model_version,
+                            m.pred_temp_error_c,
+                            m.corrected_temp_c,
+                            m.corrected_temp_p10_c,
+                            m.corrected_temp_p90_c,
+                            m.corrected_rh_pct,
+                            m.corrected_wind_gust_ms,
+                            {hydro_select_sql}
+                        FROM nws_forecasts f
+                        LEFT JOIN (
+                            SELECT
+                                valid_time_utc,
+                                model_version,
+                                pred_temp_error_c,
+                                corrected_temp_c,
+                                corrected_temp_p10_c,
+                                corrected_temp_p90_c,
+                                corrected_rh_pct,
+                                corrected_wind_gust_ms,
+                                {hydro_inner_sql}
+                            FROM mos_corrected_forecasts
+                            WHERE issue_time_utc = (
+                                SELECT issue_time_utc
+                                FROM mos_corrected_forecasts
+                                GROUP BY issue_time_utc
+                                HAVING COUNT(*) >= 24
+                                ORDER BY issue_time_utc DESC
+                                LIMIT 1
+                            )
+                        ) m ON f.valid_time_utc = m.valid_time_utc
+                        WHERE f.issue_time_utc = ?
+                          AND f.valid_time_utc >= ?
+                        ORDER BY f.valid_time_utc ASC
+                        """,
+                        conn,
+                        params=(latest_nws_issue, now_hour_iso),
+                    )
+                    future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
+            except Exception:
+                future_fc_df = pd.DataFrame()
+
+            # 4. Paired Historical Verification Dataset (with 5-Station Reference Joins)
+            try:
+                verify_df = pd.read_sql_query(
                     f"""
                     SELECT
+                        o.valid_time_utc,
+                        o.temp_c AS actual_temp_c,
+                        o.dewpoint_c AS actual_dewpoint_c,
+                        o.wetbulb_c AS actual_wetbulb_c,
+                        o.rh_pct AS actual_rh_pct,
+                        o.wind_speed_ms AS actual_wind_speed_ms,
+                        o.wind_gust_ms AS actual_wind_gust_ms,
+                        o.wind_dir_deg AS actual_wind_dir_deg,
+                        o.mslp_hpa AS actual_mslp_hpa,
+                        COALESCE(o.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
+                        COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
                         f.issue_time_utc,
-                        f.valid_time_utc,
                         f.lead_time_hours,
                         f.nws_temp_c,
                         f.nws_temp_c AS raw_nws_temp_c,
@@ -684,181 +1102,174 @@ def load_all_dashboard_data():
                         f.nws_wind_speed_ms,
                         f.nws_wind_gust_ms,
                         f.nws_wind_dir_deg,
-                        f.nws_pop_pct,
-                        f.nws_qpf_1hr_mm,
-                        f.nws_sky_cover_pct,
+                        COALESCE(f.nws_pop_pct, 0.0) AS nws_pop_pct,
+                        COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
+                        COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
                         f.short_forecast,
-                        m.model_version,
-                        m.pred_temp_error_c,
+                        COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                        COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
+                        COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
+                        COALESCE(r_hast.temp_c, r_arroyo.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
+                        COALESCE(r_arroyo.temp_c, r_hast.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
+                        COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
+                        COALESCE(r_bigsur.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
+                        COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
+                        COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
+                        COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, f.nws_temp_c + 1.5) AS issue_ventana_temp_c,
+                        COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
+                        COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
+                        COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c,
                         m.corrected_temp_c,
                         m.corrected_temp_p10_c,
                         m.corrected_temp_p90_c,
                         m.corrected_rh_pct,
                         m.corrected_wind_gust_ms,
-                        {hydro_select_sql}
-                    FROM nws_forecasts f
+                        {hydro_select_sql},
+                        m.model_version
+                    FROM local_observations o
+                    INNER JOIN (
+                        SELECT
+                            valid_time_utc,
+                            issue_time_utc,
+                            lead_time_hours,
+                            nws_temp_c,
+                            nws_dewpoint_c,
+                            nws_rh_pct,
+                            nws_wind_speed_ms,
+                            nws_wind_gust_ms,
+                            nws_wind_dir_deg,
+                            nws_pop_pct,
+                            nws_qpf_1hr_mm,
+                            nws_sky_cover_pct,
+                            short_forecast,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY valid_time_utc
+                                ORDER BY
+                                    CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                                    CASE WHEN lead_time_hours >= 1 THEN 0 ELSE 1 END ASC,
+                                    ABS(lead_time_hours - 6) ASC,
+                                    issue_time_utc DESC
+                            ) AS rn
+                        FROM nws_forecasts
+                        WHERE nws_temp_c IS NOT NULL
+                    ) f ON o.valid_time_utc = f.valid_time_utc AND f.rn = 1
+                    LEFT JOIN local_observations o_issue
+                        ON f.issue_time_utc = o_issue.valid_time_utc
+                    LEFT JOIN (
+                        SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
+                        FROM nws_forecasts
+                        GROUP BY valid_time_utc
+                    ) f_issue ON f.issue_time_utc = f_issue.valid_time_utc
+                    LEFT JOIN reference_observations r_chews
+                        ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
+                    LEFT JOIN reference_observations r_hast
+                        ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+                    LEFT JOIN reference_observations r_arroyo
+                        ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
+                    LEFT JOIN reference_observations r_bigsur
+                        ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
+                    LEFT JOIN reference_observations r_vent
+                        ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
                     LEFT JOIN (
                         SELECT
                             valid_time_utc,
-                            model_version,
-                            pred_temp_error_c,
                             corrected_temp_c,
                             corrected_temp_p10_c,
                             corrected_temp_p90_c,
                             corrected_rh_pct,
                             corrected_wind_gust_ms,
-                            {hydro_inner_sql}
+                            {hydro_inner_sql},
+                            model_version,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY valid_time_utc
+                                ORDER BY
+                                    CASE WHEN model_version LIKE 'MOS_GBM%' THEN 0 ELSE 1 END ASC,
+                                    issue_time_utc DESC
+                            ) AS rn
                         FROM mos_corrected_forecasts
-                        WHERE issue_time_utc = (
-                            SELECT issue_time_utc
-                            FROM mos_corrected_forecasts
-                            GROUP BY issue_time_utc
-                            HAVING COUNT(*) >= 24
-                            ORDER BY issue_time_utc DESC
-                            LIMIT 1
-                        )
-                    ) m ON f.valid_time_utc = m.valid_time_utc
-                    WHERE f.issue_time_utc = ?
-                    ORDER BY f.valid_time_utc ASC
+                    ) m ON o.valid_time_utc = m.valid_time_utc AND m.rn = 1
+                    WHERE o.temp_c IS NOT NULL AND o.qc_flag = 'OK'
+                    ORDER BY o.valid_time_utc ASC
                     """,
                     conn,
-                    params=(latest_nws_issue,),
                 )
-                future_fc_df = apply_mos_inference_if_needed(future_fc_df)
-                if "corrected_rh_pct" in future_fc_df.columns:
-                    future_fc_df["corrected_rh_pct"] = future_fc_df[
-                        "corrected_rh_pct"
-                    ].combine_first(future_fc_df["nws_rh_pct"])
-                if "corrected_wind_gust_ms" in future_fc_df.columns:
-                    future_fc_df["corrected_wind_gust_ms"] = (
-                        future_fc_df["corrected_wind_gust_ms"]
-                        .combine_first(future_fc_df["nws_wind_gust_ms"])
-                        .combine_first(future_fc_df["nws_wind_speed_ms"] * 1.35)
-                    )
-        except Exception:
-            future_fc_df = pd.DataFrame()
+                if not verify_df.empty:
+                    verify_df = apply_mos_inference_if_needed(verify_df)
+            except Exception:
+                verify_df = pd.DataFrame()
 
-        # 4. Paired Historical Verification Dataset (with 5-Station Reference Joins)
-        verify_df = pd.DataFrame()
-        try:
-            verify_df = pd.read_sql_query(
-                f"""
-                SELECT
-                    o.valid_time_utc,
-                    o.temp_c AS actual_temp_c,
-                    o.dewpoint_c AS actual_dewpoint_c,
-                    o.wetbulb_c AS actual_wetbulb_c,
-                    o.rh_pct AS actual_rh_pct,
-                    o.wind_speed_ms AS actual_wind_speed_ms,
-                    o.wind_gust_ms AS actual_wind_gust_ms,
-                    o.wind_dir_deg AS actual_wind_dir_deg,
-                    o.mslp_hpa AS actual_mslp_hpa,
-                    COALESCE(o.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
-                    COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
-                    f.issue_time_utc,
-                    f.lead_time_hours,
-                    f.nws_temp_c,
-                    f.nws_temp_c AS raw_nws_temp_c,
-                    f.nws_dewpoint_c,
-                    f.nws_rh_pct,
-                    f.nws_wind_speed_ms,
-                    f.nws_wind_gust_ms,
-                    f.nws_wind_dir_deg,
-                    COALESCE(f.nws_pop_pct, 0.0) AS nws_pop_pct,
-                    COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
-                    COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
-                    f.short_forecast,
-                    COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
-                    COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
-                    COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
-                    COALESCE(r_hast.temp_c, r_arroyo.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
-                    COALESCE(r_arroyo.temp_c, r_hast.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
-                    COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
-                    COALESCE(r_bigsur.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
-                    COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
-                    COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
-                    COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, f.nws_temp_c + 1.5) AS issue_ventana_temp_c,
-                    COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
-                    COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
-                    COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c,
-                    m.corrected_temp_c,
-                    m.corrected_temp_p10_c,
-                    m.corrected_temp_p90_c,
-                    m.corrected_rh_pct,
-                    m.corrected_wind_gust_ms,
-                    {hydro_select_sql},
-                    m.model_version
-                FROM local_observations o
-                INNER JOIN (
-                    SELECT
-                        valid_time_utc,
-                        issue_time_utc,
-                        lead_time_hours,
-                        nws_temp_c,
-                        nws_dewpoint_c,
-                        nws_rh_pct,
-                        nws_wind_speed_ms,
-                        nws_wind_gust_ms,
-                        nws_wind_dir_deg,
-                        nws_pop_pct,
-                        nws_qpf_1hr_mm,
-                        nws_sky_cover_pct,
-                        short_forecast,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY valid_time_utc
-                            ORDER BY
-                                CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
-                                CASE WHEN lead_time_hours >= 1 THEN 0 ELSE 1 END ASC,
-                                ABS(lead_time_hours - 6) ASC,
-                                issue_time_utc DESC
-                        ) AS rn
-                    FROM nws_forecasts
-                    WHERE nws_temp_c IS NOT NULL
-                ) f ON o.valid_time_utc = f.valid_time_utc AND f.rn = 1
-                LEFT JOIN local_observations o_issue
-                    ON f.issue_time_utc = o_issue.valid_time_utc
-                LEFT JOIN (
-                    SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
-                    FROM nws_forecasts
-                    GROUP BY valid_time_utc
-                ) f_issue ON f.issue_time_utc = f_issue.valid_time_utc
-                LEFT JOIN reference_observations r_chews
-                    ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
-                LEFT JOIN reference_observations r_hast
-                    ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
-                LEFT JOIN reference_observations r_arroyo
-                    ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
-                LEFT JOIN reference_observations r_bigsur
-                    ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
-                LEFT JOIN reference_observations r_vent
-                    ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
-                LEFT JOIN (
-                    SELECT
-                        valid_time_utc,
-                        corrected_temp_c,
-                        corrected_temp_p10_c,
-                        corrected_temp_p90_c,
-                        corrected_rh_pct,
-                        corrected_wind_gust_ms,
-                        {hydro_inner_sql},
-                        model_version,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY valid_time_utc
-                            ORDER BY
-                                CASE WHEN model_version LIKE 'MOS_GBM%' THEN 0 ELSE 1 END ASC,
-                                issue_time_utc DESC
-                        ) AS rn
-                    FROM mos_corrected_forecasts
-                ) m ON o.valid_time_utc = m.valid_time_utc AND m.rn = 1
-                WHERE o.temp_c IS NOT NULL AND o.qc_flag = 'OK'
-                ORDER BY o.valid_time_utc ASC
-                """,
-                conn,
+    # Ensure ref_dict has entries for all 5 Santa Lucia reference stations
+    for stid, meta in REFERENCE_STATIONS.items():
+        if stid not in ref_dict:
+            ref_dict[stid] = {
+                "station_id": stid,
+                "name": meta["name"],
+                "elev_m": meta["elev_m"],
+                "role": meta["role"],
+                "valid_time_utc": None,
+                "online": False,
+                "age_hours": None,
+                "temp_c": np.nan,
+                "rh_pct": np.nan,
+                "wind_speed_ms": np.nan,
+                "wind_gust_ms": np.nan,
+                "wind_dir_deg": np.nan,
+                "precip_1hr_mm": 0.0,
+            }
+
+    # Check if SQLite forecast batch is stale (> 6 hours old) or has < 144 future hours remaining
+    batch_age_hours = 999.0
+    if not future_fc_df.empty and "issue_time_utc" in future_fc_df.columns:
+        issue_dt = pd.to_datetime(
+            future_fc_df.iloc[0]["issue_time_utc"], utc=True, errors="coerce"
+        )
+        if pd.notna(issue_dt):
+            batch_age_hours = max(
+                0.0, (pd.Timestamp(now_hour_utc) - issue_dt).total_seconds() / 3600.0
             )
-            if not verify_df.empty:
-                verify_df = apply_mos_inference_if_needed(verify_df)
-        except Exception:
-            verify_df = pd.DataFrame()
+
+    needs_live_topup = (
+        future_fc_df.empty
+        or batch_age_hours > 6.0
+        or len(future_fc_df) < 144
+    )
+
+    if needs_live_topup:
+        live_df = fetch_live_nwp_topup(now_hour_utc)
+        if not live_df.empty:
+            if future_fc_df.empty or batch_age_hours > 6.0:
+                future_fc_df = live_df.copy()
+            else:
+                combined_fc = pd.concat([future_fc_df, live_df], ignore_index=True, sort=False)
+                future_fc_df = filter_future_horizon(combined_fc, now_hour_utc).head(168).copy()
+
+    if not future_fc_df.empty:
+        future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc).head(168).copy()
+        future_fc_df = attach_boundary_telemetry_for_mos(
+            future_fc_df, obs_df, ref_dict, now_hour_utc
+        )
+        future_fc_df = apply_mos_inference_if_needed(
+            future_fc_df, force_recompute=needs_live_topup
+        )
+        if "corrected_rh_pct" not in future_fc_df.columns:
+            future_fc_df["corrected_rh_pct"] = future_fc_df["nws_rh_pct"]
+        else:
+            future_fc_df["corrected_rh_pct"] = future_fc_df[
+                "corrected_rh_pct"
+            ].combine_first(future_fc_df["nws_rh_pct"])
+
+        if "corrected_wind_gust_ms" not in future_fc_df.columns:
+            future_fc_df["corrected_wind_gust_ms"] = get_col(
+                future_fc_df,
+                "nws_wind_gust_ms",
+                get_col(future_fc_df, "nws_wind_speed_ms", 1.0) * 1.35,
+            )
+        else:
+            future_fc_df["corrected_wind_gust_ms"] = (
+                future_fc_df["corrected_wind_gust_ms"]
+                .combine_first(future_fc_df["nws_wind_gust_ms"])
+                .combine_first(future_fc_df["nws_wind_speed_ms"] * 1.35)
+            )
 
     return ref_dict, obs_df, future_fc_df, verify_df, archive_stats
 
@@ -962,9 +1373,13 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
             )
             thermal_raw = np.maximum(0.0, perm_t.importances_mean)
         except Exception:
-            thermal_raw = np.abs(X_model.corrwith(pd.Series(y_temp_err, index=X_model.index)).fillna(0.0).values)
+            thermal_raw = np.abs(
+                X_model.corrwith(pd.Series(y_temp_err, index=X_model.index)).fillna(0.0).values
+            )
     else:
-        thermal_raw = np.abs(X_model.corrwith(pd.Series(y_temp_err, index=X_model.index)).fillna(0.0).values)
+        thermal_raw = np.abs(
+            X_model.corrwith(pd.Series(y_temp_err, index=X_model.index)).fillna(0.0).values
+        )
 
     t_sum = float(thermal_raw.sum())
     thermal_pct = (thermal_raw / t_sum * 100.0) if t_sum > 0 else np.zeros_like(thermal_raw)
@@ -1024,7 +1439,11 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
             "Physical Mechanism": desc,
         })
 
-    imp_df = pd.DataFrame(imp_rows).sort_values("Thermal Importance (%)", ascending=False).reset_index(drop=True)
+    imp_df = (
+        pd.DataFrame(imp_rows)
+        .sort_values("Thermal Importance (%)", ascending=False)
+        .reset_index(drop=True)
+    )
     diag_out["imp_df"] = imp_df
     return diag_out
 
@@ -1073,8 +1492,12 @@ def render_layman_forecast_view(
     solar_state: str,
     solar_el: float,
     last_obs_str: str,
+    now_hour_utc: datetime,
 ):
     """Renders the intuitive, jargon-free Everyday Weather Forecast Page for TZMC."""
+    # Guarantee future_fc_df only contains hours >= now_hour_utc and has no DST duplicates
+    future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
+
     if not obs_df.empty:
         latest = obs_df.iloc[0]
         last_24 = obs_df.head(24)
@@ -1562,10 +1985,13 @@ def render_layman_forecast_view(
 # ---------------------------------------------------------------------------
 # Header, Sidebar & Station Metadata Banner
 # ---------------------------------------------------------------------------
+now_utc = datetime.now(timezone.utc)
+now_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0)
+
 ref_dict, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
+future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
 model_diag = compute_model_diagnostics_and_importances(verify_df)
 
-now_utc = datetime.now(timezone.utc)
 solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_utc)
 
 active_model_name = (
@@ -1700,6 +2126,7 @@ if view_mode.startswith("🌤️"):
         solar_state=solar_state,
         solar_el=solar_el,
         last_obs_str=last_obs_str,
+        now_hour_utc=now_hour_utc,
     )
 else:
 
@@ -2174,32 +2601,36 @@ else:
         }
         max_future_hrs, past_hrs = horizon_map.get(horizon_choice, (72, 48))
 
-        if not obs_df.empty and "valid_time_utc" in obs_df.columns and not future_fc_df.empty:
-            latest_obs_utc = str(obs_df.iloc[0]["valid_time_utc"])
-            fut_pool = future_fc_df[future_fc_df["valid_time_utc"] > latest_obs_utc]
-            if fut_pool.empty:
-                fut_pool = future_fc_df
-        else:
-            fut_pool = future_fc_df
-
+        fut_pool = filter_future_horizon(future_fc_df, now_hour_utc)
         fut_sub = fut_pool.head(max_future_hrs).copy() if not fut_pool.empty else pd.DataFrame()
         past_sub = verify_df.tail(past_hrs).copy() if not verify_df.empty else pd.DataFrame()
 
         if not past_sub.empty and not fut_sub.empty:
-            past_sub = past_sub[~past_sub["valid_time_utc"].isin(fut_sub["valid_time_utc"])]
+            past_dt = pd.to_datetime(past_sub["valid_time_utc"], utc=True).dt.floor("h")
+            fut_dt_set = set(pd.to_datetime(fut_sub["valid_time_utc"], utc=True).dt.floor("h"))
+            past_sub = past_sub.loc[~past_dt.isin(fut_dt_set)].copy()
             combined_df = pd.concat([past_sub, fut_sub], ignore_index=True, sort=False)
         elif not fut_sub.empty:
             combined_df = fut_sub.copy()
         else:
             combined_df = past_sub.copy()
 
-        combined_df = combined_df.sort_values("valid_time_utc").reset_index(drop=True)
-        combined_df["valid_local"] = (
-            pd.to_datetime(combined_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+        combined_df["_sort_dt_utc"] = pd.to_datetime(
+            combined_df["valid_time_utc"], utc=True
+        ).dt.floor("h")
+        combined_df = (
+            combined_df.sort_values("_sort_dt_utc")
+            .drop_duplicates(subset=["_sort_dt_utc"], keep="last")
+            .reset_index(drop=True)
         )
+        combined_df["valid_local"] = combined_df["_sort_dt_utc"].dt.tz_convert(LOCAL_TZ)
 
         if not obs_df.empty and "valid_time_utc" in obs_df.columns:
-            obs_dedup = obs_df.drop_duplicates(subset=["valid_time_utc"]).set_index("valid_time_utc")
+            obs_tmp = obs_df.copy()
+            obs_tmp["_obs_dt_utc"] = pd.to_datetime(
+                obs_tmp["valid_time_utc"], utc=True
+            ).dt.floor("h")
+            obs_dedup = obs_tmp.drop_duplicates(subset=["_obs_dt_utc"]).set_index("_obs_dt_utc")
             for col_dest, col_src in [
                 ("actual_temp_c", "temp_c"),
                 ("actual_dewpoint_c", "dewpoint_c"),
@@ -2210,7 +2641,7 @@ else:
                 if col_dest not in combined_df.columns:
                     combined_df[col_dest] = np.nan
                 if col_src in obs_dedup.columns:
-                    mapped = combined_df["valid_time_utc"].map(obs_dedup[col_src])
+                    mapped = combined_df["_sort_dt_utc"].map(obs_dedup[col_src])
                     combined_df[col_dest] = combined_df[col_dest].combine_first(mapped)
 
         fig = make_subplots(
@@ -2438,17 +2869,16 @@ else:
             secondary_y=False,
         )
 
-        if not obs_df.empty:
-            divider_ts = pd.to_datetime(obs_df.iloc[0]["valid_time_utc"], utc=True).tz_convert(LOCAL_TZ)
-            for r_idx in (1, 2, 3):
-                fig.add_vline(
-                    x=divider_ts,
-                    line_width=1.4,
-                    line_dash="dash",
-                    line_color="rgba(226, 232, 240, 0.55)",
-                    row=r_idx,
-                    col=1,
-                )
+        divider_ts = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ)
+        for r_idx in (1, 2, 3):
+            fig.add_vline(
+                x=divider_ts,
+                line_width=1.4,
+                line_dash="dash",
+                line_color="rgba(226, 232, 240, 0.55)",
+                row=r_idx,
+                col=1,
+            )
 
         max_rain_val = float(
             max(
@@ -2505,7 +2935,7 @@ else:
     # ---------------------------------------------------------------------------
     if not future_fc_df.empty:
         st.subheader("7-Day Synoptic, Hydrological & Canyon Road Risk Outlook")
-        daily_df = future_fc_df.copy()
+        daily_df = filter_future_horizon(future_fc_df, now_hour_utc).copy()
         daily_df["valid_local"] = (
             pd.to_datetime(daily_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
         )
@@ -2548,6 +2978,7 @@ else:
                 Peak_Gust_MPH=("_gust", lambda s: round(ms_to_mph(safe_float(s.max(), 0.0)), 1)),
             )
             .sort_values("Sort_Date")
+            .head(7)
         )
 
         def _met_regime(row):
