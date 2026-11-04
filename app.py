@@ -38,6 +38,14 @@ from mos_model import (
     analytical_hydro_hurdle_fallback,
     build_well_conditioned_ols_matrix,
 )
+from hydro_risk_engine import (
+    MM_PER_INCH,
+    YELLOW_API_MM,
+    ORANGE_API_MM,
+    RED_API_EXTREME_MM,
+    TIER_METADATA,
+    compute_dashboard_hydro_state,
+)
 
 st.set_page_config(
     page_title="TZMC Atmospheric & Hydrological MOS Monitor",
@@ -1485,6 +1493,509 @@ def get_weather_icon_and_label(
     return "☀️", "Sunny & Clear"
 
 
+
+# ---------------------------------------------------------------------------
+# Early Flood & Tassajara Road Washout Warning UI Components
+# ---------------------------------------------------------------------------
+def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: bool = False):
+    """
+    Renders a high-visibility 4-Tier Creek Flood & Tassajara Road Passability
+    Warning Banner for both the Everyday Community View and Scientific MOS Suite.
+    """
+    if not isinstance(hydro_summary, dict) or not hydro_summary:
+        return
+
+    code = str(hydro_summary.get("alert_code", "GREEN"))
+    tier_num = int(hydro_summary.get("alert_tier", 0))
+    label = str(hydro_summary.get("alert_label", "Normal — Creek Stable & Road Passable"))
+    icon = str(hydro_summary.get("icon", "🟢"))
+    color_hex = str(hydro_summary.get("color_hex", "#10b981"))
+    bg_rgba = str(hydro_summary.get("bg_rgba", "rgba(16, 185, 129, 0.14)"))
+    border_rgba = str(hydro_summary.get("border_rgba", "rgba(16, 185, 129, 0.45)"))
+
+    api_in = float(hydro_summary.get("api_in", 0.0))
+    api_mm = float(hydro_summary.get("api_mm", 0.0))
+    proj_api_24_in = float(hydro_summary.get("projected_max_api_24h_in", api_in))
+    c_val = float(hydro_summary.get("runoff_coeff_c", 0.08))
+    c_pct = float(hydro_summary.get("runoff_coeff_pct", 8.0))
+    decay_k = float(hydro_summary.get("decay_k", 0.91))
+
+    rain_24_in = float(hydro_summary.get("precip_24hr_in", 0.0))
+    fc_qpf_24_in = float(hydro_summary.get("forecast_qpf_24hr_in", 0.0))
+    fc_qpf_72_in = float(hydro_summary.get("forecast_qpf_72hr_in", 0.0))
+    peak_p90_rate_in = float(hydro_summary.get("peak_p90_1hr_24h_in", 0.0))
+    discharge_cfs = float(hydro_summary.get("discharge_index_cfs", 6.5))
+    peak_discharge_24_cfs = float(hydro_summary.get("peak_discharge_24hr_cfs", discharge_cfs))
+
+    road_status = str(hydro_summary.get("road_status", "Open / Dry to Damp"))
+    creek_status = str(hydro_summary.get("creek_status", "Stable Baseflow"))
+    action_text = str(hydro_summary.get("recommended_action", "Routine canyon operations."))
+    trigger_text = str(hydro_summary.get("trigger_summary", "Catchment stable."))
+
+    tech_line = (
+        f'<div style="font-family: monospace; font-size: 0.78rem; color: #cbd5e1; '
+        f'margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(148, 163, 184, 0.22);">'
+        f'<b>HYDROLOGICAL TELEMETRY:</b> '
+        f'API<sub>t</sub> = {api_in:.2f} in ({api_mm:.1f} mm, k={decay_k:.3f}) &bull; '
+        f'24h Peak API = {proj_api_24_in:.2f} in &bull; '
+        f'Runoff Coeff C = {c_val:.2f} ({c_pct:.0f}%) &bull; '
+        f'24h Rain Obs/Fcst = {rain_24_in:.2f}" / {fc_qpf_24_in:.2f}" &bull; '
+        f'72h MOS QPF = {fc_qpf_72_in:.2f}" &bull; '
+        f'Peak 24h P90 Rate = {peak_p90_rate_in:.2f} in/hr &bull; '
+        f'Routed Creek Q = {discharge_cfs:.1f} CFS (24h Peak: {peak_discharge_24_cfs:.1f} CFS)'
+        f'</div>'
+    )
+
+    st.markdown(
+        f'<div style="background: {bg_rgba}; border: 1.5px solid {border_rgba}; '
+        f'border-left: 6px solid {color_hex}; border-radius: 8px; '
+        f'padding: 14px 18px; margin-bottom: 1.1rem;">'
+        f'<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">'
+        f'<div style="font-size: 1.05rem; font-weight: 700; color: #f8fafc;">'
+        f'{icon} CREEK FLOOD &amp; TASSAJARA ROAD WARNING SYSTEM — '
+        f'<span style="color: {color_hex};">TIER {tier_num} ({code}): {label}</span>'
+        f'</div>'
+        f'<div style="font-size: 0.80rem; font-weight: 600; color: #e2e8f0; '
+        f'background: rgba(15, 23, 42, 0.65); padding: 4px 10px; border-radius: 4px;">'
+        f'Soil Wetness API: {api_in:.2f}" &nbsp;|&nbsp; Runoff C: {c_pct:.0f}% &nbsp;|&nbsp; '
+        f'24h Peak Q: {peak_discharge_24_cfs:.0f} CFS'
+        f'</div>'
+        f'</div>'
+        f'<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); '
+        f'gap: 10px; margin-top: 10px; font-size: 0.86rem; color: #e2e8f0;">'
+        f'<div><b>🛣️ Tassajara Road (14-mi Unpaved):</b> {road_status}</div>'
+        f'<div><b>🌊 Tassajara Creek &amp; Bridges:</b> {creek_status}</div>'
+        f'<div><b>⚡ Operational Action:</b> {action_text}</div>'
+        f'</div>'
+        f'<div style="font-size: 0.81rem; color: #cbd5e1; margin-top: 6px;">'
+        f'<b>Active Diagnostic Triggers:</b> {trigger_text}'
+        f'</div>'
+        f'{tech_line if is_scientific else ""}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_hydro_risk_section(
+    hydro_bundle: dict,
+    now_hour_utc: datetime,
+    is_scientific: bool = True,
+):
+    """
+    Renders the interactive Creek Runoff, Antecedent Soil Saturation (API_t) Gauge,
+    and 72-Hour Routed Hydrograph Projection panel alongside rainfall forecasts.
+    """
+    if not isinstance(hydro_bundle, dict) or "summary" not in hydro_bundle:
+        return
+
+    s = hydro_bundle["summary"]
+    hist_df = hydro_bundle.get("hist_hydro_df", pd.DataFrame())
+    proj_df = hydro_bundle.get("proj_fc_df", pd.DataFrame())
+
+    st.subheader(
+        "🌊 Early Flood & Road Washout Warning System: Soil Saturation (API) & Creek Hydrograph"
+        if is_scientific
+        else "🌊 Tassajara Creek Runoff & Road Passability Outlook (Next 72 Hours)"
+    )
+
+    # 1. 4-Card Hydrological KPI Row
+    hc1, hc2, hc3, hc4 = st.columns(4)
+    hc1.metric(
+        "Antecedent Wetness (API_t)",
+        f"{s['api_in']:.2f} in ({s['api_mm']:.1f} mm)",
+        f"24h Peak: {s['projected_max_api_24h_in']:.2f} in | Decay k={s['decay_k']:.3f}",
+        delta_color="off",
+        help=(
+            "Antecedent Precipitation Index (API_t = API_{t-1} * k + P_t) tracking multi-day "
+            "soil moisture storage across the rocky Santa Lucia chaparral and mixed-oak catchment. "
+            "Values above 1.00 in (25.4 mm) indicate a saturated catchment primed for rapid runoff."
+        ),
+    )
+    hc2.metric(
+        "Effective Runoff Coefficient (C)",
+        f"{s['runoff_coeff_pct']:.1f} % (C = {s['runoff_coeff_c']:.2f})",
+        f"Headwater Spillover: {s['upstream_spillover_in']:.2f} in/hr",
+        delta_color="off",
+        help=(
+            "Nonlinear fraction of incoming rainfall converted directly into surface quickflow "
+            "(R_t = C_t * P_t). Scales from 8% on dry fractured granite/duff up to 86% when "
+            "canyon soils reach saturation."
+        ),
+    )
+   hc3.metric(
+        "Projected Peak Runoff (6h / 24h)",
+        f"{s['peak_runoff_24hr_in_hr']:.2f} in/hr ({s['peak_runoff_24hr_mm_hr']:.1f} mm/hr)",
+        f"Next 6h Peak: {s['peak_runoff_6hr_in_hr']:.2f} in/hr | P90 Rain: {s['peak_p90_1hr_24h_in']:.2f} in/hr",
+        delta_color="off",
+        help=(
+            "Maximum hourly effective surface runoff rate (R_t = C_t * QPF_t) expected over the "
+            "next 6 and 24 hours, paired with the 90th-percentile (P90) downpour intensity."
+        ),
+    )
+    hc4.metric(
+        "Tassajara Creek Discharge Index",
+        f"{s['discharge_index_cfs']:.1f} CFS",
+        f"24h Peak: {s['peak_discharge_24hr_cfs']:.1f} CFS (P90: {s['peak_discharge_p90_24hr_cfs']:.0f} CFS)",
+        delta_color="off",
+        help=(
+            "Estimated discharge (cubic feet per second) routed through the 72 km^2 upper "
+            "Tassajara Creek watershed (Pine Ridge, Black Cone, Chews Ridge) using a 3-hour "
+            "steep-canyon kinematic unit hydrograph."
+        ),
+    )
+
+    # 2. Gauge + 2-Panel Hydrograph Projection Layout
+    col_gauge, col_chart = st.columns([1.05, 2.95])
+
+    with col_gauge:
+        gauge_max_in = max(3.2, round(float(s["projected_max_api_72h_in"]) * 1.25, 1))
+        fig_gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number+delta",
+                value=float(s["api_in"]),
+                number={"suffix": " in", "font": {"size": 28}},
+                delta={
+                    "reference": float(s["projected_max_api_24h_in"]),
+                    "increasing": {"color": "#ef4444"},
+                    "decreasing": {"color": "#10b981"},
+                    "valueformat": ".2f",
+                },
+                title={
+                    "text": (
+                        "<b>Catchment Soil Saturation (API)</b><br>"
+                        f"<span style='font-size:0.80em;color:#94a3b8'>"
+                        f"Runoff Readiness C = {s['runoff_coeff_pct']:.0f}% | "
+                        f"24h Peak: {s['projected_max_api_24h_in']:.2f} in</span>"
+                    ),
+                    "font": {"size": 14},
+                },
+                gauge={
+                    "axis": {"range": [0, gauge_max_in], "tickwidth": 1, "tickcolor": "#94a3b8"},
+                    "bar": {"color": s["color_hex"], "thickness": 0.32},
+                    "bgcolor": "rgba(15, 23, 42, 0.45)",
+                    "borderwidth": 1,
+                    "bordercolor": "rgba(148, 163, 184, 0.25)",
+                    "steps": [
+                        {"range": [0, YELLOW_API_MM / MM_PER_INCH], "color": "rgba(16, 185, 129, 0.22)"},
+                        {
+                            "range": [YELLOW_API_MM / MM_PER_INCH, ORANGE_API_MM / MM_PER_INCH],
+                            "color": "rgba(234, 179, 8, 0.25)",
+                        },
+                        {
+                            "range": [ORANGE_API_MM / MM_PER_INCH, RED_API_EXTREME_MM / MM_PER_INCH],
+                            "color": "rgba(249, 115, 22, 0.28)",
+                        },
+                        {
+                            "range": [RED_API_EXTREME_MM / MM_PER_INCH, gauge_max_in],
+                            "color": "rgba(239, 68, 68, 0.32)",
+                        },
+                    ],
+                    "threshold": {
+                        "line": {"color": "#f8fafc", "width": 3},
+                        "thickness": 0.80,
+                        "value": float(s["projected_max_api_24h_in"]),
+                    },
+                },
+            )
+        )
+        fig_gauge.update_layout(
+            height=300,
+            margin=dict(t=55, b=20, l=22, r=22),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font={"color": "#e2e8f0"},
+        )
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+        st.markdown(
+            f'<div style="background: rgba(15, 23, 42, 0.55); '
+            f'border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 6px; '
+            f'padding: 10px 12px; font-size: 0.79rem; color: #cbd5e1;">'
+            f'<b>Catchment Geometry:</b> 72 km² upper watershed (Pine Ridge, Black Cone, Chews Ridge → '
+            f'Tassajara Creek at 485 m MSL).<br>'
+            f'<b>Stream Gauge Telemetry:</b> {s["gauge_sensor_health"]}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_chart:
+        # Combine past 48h spin-up and next 72h projection for continuous hydrograph plot
+        h_sub = hist_df.tail(48).copy() if not hist_df.empty else pd.DataFrame()
+        p_sub = proj_df.head(72).copy() if not proj_df.empty else pd.DataFrame()
+
+        fig_hydro = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.10,
+            row_heights=[0.48, 0.52],
+            specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
+            subplot_titles=(
+                "Antecedent Soil Wetness Index (API in) & Effective Runoff Coefficient C (%)",
+                "Routed Tassajara Creek Discharge (CFS) & Hourly Effective Surface Runoff (in/hr)",
+            ),
+        )
+
+        if not h_sub.empty:
+            h_sub["valid_local"] = pd.to_datetime(h_sub["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=h_sub["valid_local"],
+                    y=h_sub["api_in"],
+                    mode="lines",
+                    line=dict(color="#10b981", width=2.4),
+                    name="Observed Spin-Up API (in)",
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=h_sub["valid_local"],
+                    y=(h_sub["runoff_coeff_c"] * 100.0).round(1),
+                    mode="lines",
+                    line=dict(color="#a855f7", width=1.6, dash="dot"),
+                    name="Runoff Coeff C (%)",
+                ),
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=h_sub["valid_local"],
+                    y=h_sub["discharge_index_cfs"],
+                    mode="lines",
+                    line=dict(color="#10b981", width=2.3),
+                    name="Estimated Historical Creek Q (CFS)",
+                ),
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Bar(
+                    x=h_sub["valid_local"],
+                    y=(h_sub["runoff_mm_hr"] / MM_PER_INCH).round(3),
+                    name="Observed Effective Runoff (in/hr)",
+                    marker_color="#10b981",
+                    opacity=0.65,
+                ),
+                row=2,
+                col=1,
+                secondary_y=True,
+            )
+
+        if not p_sub.empty:
+            p_sub["valid_local"] = pd.to_datetime(p_sub["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=p_sub["valid_local"],
+                    y=p_sub["projected_api_p90_in"],
+                    mode="lines",
+                    line=dict(color="rgba(239, 68, 68, 0.65)", width=1.5, dash="dash"),
+                    name="Projected P90 Extreme API (in)",
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=p_sub["valid_local"],
+                    y=p_sub["projected_api_in"],
+                    mode="lines",
+                    line=dict(color="#38bdf8", width=2.6),
+                    name="Projected Expected API (in)",
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=p_sub["valid_local"],
+                    y=(p_sub["projected_runoff_coeff"] * 100.0).round(1),
+                    mode="lines",
+                    line=dict(color="#c084fc", width=1.8, dash="dot"),
+                    name="Projected Runoff Coeff C (%)",
+                ),
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
+
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=p_sub["valid_local"],
+                    y=p_sub["projected_discharge_p90_cfs"],
+                    mode="lines",
+                    fill="tozeroy",
+                    fillcolor="rgba(239, 68, 68, 0.10)",
+                    line=dict(color="rgba(239, 68, 68, 0.70)", width=1.6, dash="dash"),
+                    name="Projected P90 Surge Q (CFS)",
+                ),
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Scatter(
+                    x=p_sub["valid_local"],
+                    y=p_sub["projected_discharge_cfs"],
+                    mode="lines",
+                    line=dict(color="#0ea5e9", width=2.6),
+                    name="Projected Expected Creek Q (CFS)",
+                ),
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_trace(
+                go.Bar(
+                    x=p_sub["valid_local"],
+                    y=p_sub["projected_runoff_in_hr"],
+                    name="Projected Effective Runoff (in/hr)",
+                    marker_color="#38bdf8",
+                    opacity=0.65,
+                ),
+                row=2,
+                col=1,
+                secondary_y=True,
+            )
+
+        # Add Advisory / Watch threshold lines on Panel 1
+        fig_hydro.add_hline(
+            y=YELLOW_API_MM / MM_PER_INCH,
+            line_dash="dot",
+            line_color="#eab308",
+            annotation_text="Yellow Advisory (1.00 in)",
+            annotation_position="top left",
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+        fig_hydro.add_hline(
+            y=ORANGE_API_MM / MM_PER_INCH,
+            line_dash="dot",
+            line_color="#f97316",
+            annotation_text="Orange Watch (1.75 in)",
+            annotation_position="top right",
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+
+        divider_local = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ)
+        for r_i in (1, 2):
+            fig_hydro.add_vline(
+                x=divider_local,
+                line_width=1.4,
+                line_dash="dash",
+                line_color="rgba(226, 232, 240, 0.55)",
+                row=r_i,
+                col=1,
+            )
+
+        fig_hydro.update_yaxes(
+            title_text="API Wetness (in)",
+            gridcolor="rgba(148,163,184,0.12)",
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+        fig_hydro.update_yaxes(
+            title_text="Runoff Coeff C (%)",
+            range=[0, 100],
+            showgrid=False,
+            row=1,
+            col=1,
+            secondary_y=True,
+        )
+        fig_hydro.update_yaxes(
+            title_text="Creek Discharge (CFS)",
+            gridcolor="rgba(148,163,184,0.12)",
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+        fig_hydro.update_yaxes(
+            title_text="Runoff Rate (in/hr)",
+            showgrid=False,
+            row=2,
+            col=1,
+            secondary_y=True,
+        )
+        fig_hydro.update_layout(
+            height=430,
+            margin=dict(t=35, b=30, l=50, r=50),
+            hovermode="x unified",
+            plot_bgcolor="rgba(15, 23, 42, 0.35)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0.0),
+        )
+        st.plotly_chart(fig_hydro, use_container_width=True)
+
+    with st.expander(
+        "Inspect 4-Tier Flood & Road Severity Matrix & Hourly Projected Hydrograph Table",
+        expanded=False,
+    ):
+        matrix_rows = [
+            {
+                "Alert Tier": "🟢 Tier 0 — GREEN (Normal)",
+                "Soil Saturation & Rain Triggers": "API < 1.00 in AND 24h Rain < 1.00 in AND 1h Rate < 0.50 in/hr",
+                "Tassajara Creek Response": TIER_METADATA["GREEN"]["creek_status"],
+                "Tassajara Road Passability": TIER_METADATA["GREEN"]["road_status"],
+                "Operational Protocol": TIER_METADATA["GREEN"]["recommended_action"],
+            },
+            {
+                "Alert Tier": "🟡 Tier 1 — YELLOW (Advisory)",
+                "Soil Saturation & Rain Triggers": "API >= 1.00 in (25.4 mm) OR 24h Rain >= 1.00 in OR 72h Rain >= 1.50 in",
+                "Tassajara Creek Response": TIER_METADATA["YELLOW"]["creek_status"],
+                "Tassajara Road Passability": TIER_METADATA["YELLOW"]["road_status"],
+                "Operational Protocol": TIER_METADATA["YELLOW"]["recommended_action"],
+            },
+            {
+                "Alert Tier": "🟠 Tier 2 — ORANGE (Watch / Road Risk)",
+                "Soil Saturation & Rain Triggers": "1h Rain >= 0.50 in/hr (or P90 >= 0.75 in/hr) on primed soil OR 24h Rain >= 2.00 in",
+                "Tassajara Creek Response": TIER_METADATA["ORANGE"]["creek_status"],
+                "Tassajara Road Passability": TIER_METADATA["ORANGE"]["road_status"],
+                "Operational Protocol": TIER_METADATA["ORANGE"]["recommended_action"],
+            },
+            {
+                "Alert Tier": "🔴 Tier 3 — RED (Warning / Road Closure)",
+                "Soil Saturation & Rain Triggers": "1h Rain >= 1.00 in/hr (or P90 >= 1.25 in/hr) OR 72h Rain >= 3.50-4.00 in",
+                "Tassajara Creek Response": TIER_METADATA["RED"]["creek_status"],
+                "Tassajara Road Passability": TIER_METADATA["RED"]["road_status"],
+                "Operational Protocol": TIER_METADATA["RED"]["recommended_action"],
+            },
+        ]
+        st.markdown("#### 1. TZMC Multi-Tier Flood & Road Washout Severity Matrix")
+        st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+
+        if not proj_df.empty:
+            st.markdown("#### 2. Hourly Projected Catchment Saturation & Routed Creek Hydrograph (Next 72 Hours)")
+            p_tbl = proj_df.head(72).copy()
+            p_tbl["Local Time"] = (
+                pd.to_datetime(p_tbl["valid_time_utc"], utc=True)
+                .dt.tz_convert(LOCAL_TZ)
+                .dt.strftime("%Y-%m-%d %H:%M")
+            )
+            display_hydro_tbl = pd.DataFrame({
+                "Valid Time (Local)": p_tbl["Local Time"],
+                "Alert Tier": p_tbl["projected_tier"],
+                "MOS QPF (in/hr)": (p_tbl["mos_qpf_mm"] / MM_PER_INCH).round(3),
+                "MOS P90 Rate (in/hr)": (p_tbl["mos_qpf_p90_mm"] / MM_PER_INCH).round(3),
+                "Projected API (in)": p_tbl["projected_api_in"].round(2),
+                "P90 Extreme API (in)": p_tbl["projected_api_p90_in"].round(2),
+                "Runoff Coeff C (%)": (p_tbl["projected_runoff_coeff"] * 100.0).round(1),
+                "Effective Runoff (in/hr)": p_tbl["projected_runoff_in_hr"].round(3),
+                "Expected Creek Q (CFS)": p_tbl["projected_discharge_cfs"].round(1),
+                "P90 Surge Ceiling Q (CFS)": p_tbl["projected_discharge_p90_cfs"].round(1),
+            })
+            st.dataframe(display_hydro_tbl, use_container_width=True, hide_index=True)
+
+
 def render_layman_forecast_view(
     obs_df: pd.DataFrame,
     future_fc_df: pd.DataFrame,
@@ -1493,10 +2004,14 @@ def render_layman_forecast_view(
     solar_el: float,
     last_obs_str: str,
     now_hour_utc: datetime,
+    hydro_bundle: dict = None,
 ):
     """Renders the intuitive, jargon-free Everyday Weather Forecast Page for TZMC."""
     # Guarantee future_fc_df only contains hours >= now_hour_utc and has no DST duplicates
     future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
+
+    if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle:
+        render_flood_and_road_warning_banner(hydro_bundle["summary"], is_scientific=False)
 
     if not obs_df.empty:
         latest = obs_df.iloc[0]
@@ -1863,6 +2378,10 @@ def render_layman_forecast_view(
         )
         st.plotly_chart(fig_layman, use_container_width=True)
 
+    if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle:
+        st.markdown("---")
+        render_hydro_risk_section(hydro_bundle, now_hour_utc=now_hour_utc, is_scientific=False)
+
     st.markdown("---")
 
     # 5. 7-Day Visual Daily Forecast Cards & Simple Table
@@ -1991,6 +2510,11 @@ now_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0)
 ref_dict, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
 future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
 model_diag = compute_model_diagnostics_and_importances(verify_df)
+hydro_bundle = compute_dashboard_hydro_state(
+    obs_df=obs_df,
+    future_fc_df=future_fc_df,
+    ref_dict=ref_dict,
+)
 
 solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_utc)
 
@@ -2028,6 +2552,13 @@ with st.sidebar:
         f"Total Archive Rain: {mm_to_in(archive_stats['total_rain_mm']):.2f} in",
         delta_color="off",
         help="Total hours with tipping-bucket rainfall >= 0.254 mm in local_observations.",
+    )
+    st.metric(
+        "Flood & Road Alert Tier",
+        f"{hydro_bundle['summary']['icon']} {hydro_bundle['summary']['alert_code']} (Tier {hydro_bundle['summary']['alert_tier']})",
+        f"API: {hydro_bundle['summary']['api_in']:.2f} in | C: {hydro_bundle['summary']['runoff_coeff_pct']:.0f}%",
+        delta_color="off",
+        help="Active 4-tier Flood & Tassajara Road Washout status driven by Antecedent Precipitation Index (API) and MOS QPF/P90.",
     )
     st.markdown("---")
     st.markdown(
@@ -2127,8 +2658,10 @@ if view_mode.startswith("🌤️"):
         solar_el=solar_el,
         last_obs_str=last_obs_str,
         now_hour_utc=now_hour_utc,
+        hydro_bundle=hydro_bundle,
     )
 else:
+    render_flood_and_road_warning_banner(hydro_bundle["summary"], is_scientific=True)
 
     # ---------------------------------------------------------------------------
     # Section 1: Live Meteorological & Boundary-Layer Telemetry (8-Card Grid)
@@ -2414,6 +2947,13 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
+
+    st.markdown("---")
+
+    # ---------------------------------------------------------------------------
+    # Section 1B: Hydrological Soil Saturation (API), Runoff & Creek Hydrograph
+    # ---------------------------------------------------------------------------
+    render_hydro_risk_section(hydro_bundle, now_hour_utc=now_hour_utc, is_scientific=True)
 
     st.markdown("---")
 
