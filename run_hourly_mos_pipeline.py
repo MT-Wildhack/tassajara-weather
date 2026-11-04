@@ -8,10 +8,7 @@ Operational hourly orchestrator for the Tassajara Zen Mountain Center (TZMC) MOS
   2. Ingests the 5-station Santa Lucia boundary array (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1) via Synoptic API.
   3. Pulls operational 7-day hourly NWS / NWP forecasts (via ingest_nws.py).
   4. Runs 25-feature Thermal + Hydrological Hurdle MOS inference using models/tassajara_mos_v1.joblib.
-  5. Computes Antecedent Precipitation Index (API_t), effective runoff coefficient (C_t),
-     6h/24h/72h routed creek discharge projections, and 4-Tier Flood & Tassajara Road Washout
-     warnings via hydro_risk_engine.py.
-  6. Evaluates operational canyon alerts (via alert_engine.py if present).
+  5. Evaluates operational canyon alerts (via alert_engine.py if present).
 """
 
 import sqlite3
@@ -36,10 +33,6 @@ from mos_model import (
     TassajaraMOSCorrector,
     engineer_mos_features,
     analytical_hydro_hurdle_fallback,
-)
-from hydro_risk_engine import (
-    ensure_hydro_schema,
-    evaluate_and_store_hydro_risk,
 )
 from backfill_and_train import (
     ensure_schema_and_view,
@@ -196,6 +189,7 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
 
             shortfall_mm = round(reported_24h_mm - db_24h_sum, 3)
             if shortfall_mm >= 0.20:
+                # Attribute uncredited 24h rain to the wettest MOS QPF / highest RH hour in the 24h window
                 target_row = conn.execute(
                     """
                     SELECT o.valid_time_utc
@@ -448,26 +442,6 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
     return len(fut_rows)
 
 
-def run_hydrological_risk_evaluation(db_path: str = DB_PATH) -> Optional[Dict[str, Any]]:
-    """
-    Computes current Antecedent Precipitation Index (API), effective runoff coefficient (C),
-    6h/24h/72h forward creek runoff & discharge projections, and records the 4-tier
-    Flood & Tassajara Road Washout alert status in SQLite.
-    """
-    try:
-        res = evaluate_and_store_hydro_risk(db_path=db_path)
-        s = res.get("summary", {})
-        logger.info(
-            f"Hydrological Warning Engine Updated: [{s.get('alert_code')}] "
-            f"API={s.get('api_in', 0.0):.2f} in | C={s.get('runoff_coeff_c', 0.08):.2f} | "
-            f"Peak 24h Discharge={s.get('peak_discharge_24hr_cfs', 6.5):.1f} CFS"
-        )
-        return res
-    except Exception as exc:
-        logger.error(f"Hydrological risk engine evaluation failed: {exc}")
-        return None
-
-
 def run_alert_evaluation(db_path: str = DB_PATH) -> None:
     """Invokes alert_engine.py if present."""
     try:
@@ -488,7 +462,6 @@ def run_alert_evaluation(db_path: str = DB_PATH) -> None:
 
 def main():
     ensure_schema_and_view(DB_PATH)
-    ensure_hydro_schema(DB_PATH)
     try:
         ingest_live_observations_and_references(DB_PATH)
     except Exception as exc:
@@ -496,7 +469,6 @@ def main():
 
     run_nws_forecast_ingest(DB_PATH)
     generate_operational_mos_forecasts(DB_PATH)
-    run_hydrological_risk_evaluation(DB_PATH)
     run_alert_evaluation(DB_PATH)
 
 
