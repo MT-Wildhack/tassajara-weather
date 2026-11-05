@@ -214,7 +214,7 @@ The following database fields represent planned physical measurement nodes:
 * **`battery_v` & `sensor_health`:** Battery supply voltage and hardware heartbeat from the remote solar/LoRa telemetry logger. Currently defaults to `"UNINSTALLED (MOS + Tipping Bucket Mode)"`.
 
 ### Proposed Equipment Specifications
-* **Sensor Node:** Non-contact SDI-12 / Modbus Radar Level Sensor (e.g., Campbell Scientific CS475A or Valarm Ultrasonic) installed on the downstream stringer of the main bathhouse footbridge.
+* **Sensor Node:** Non-contact SDI-12 / Modbus Radar Level Sensor (e.g., Campbell Scientific CS475A or Valarm Ultrasonic) installed on the downstream stringer of the old bathhouse footbridge.
 * **Datalogger & Telemetry:** Solar-powered ESP32 / LoRaWAN remote node transmitting stage height at 5-minute intervals to the Stone Office local gateway, persisting directly to `stream_gauge_observations`.
 * **Automatic Failover:** When physical stream gauge telemetry goes live, `evaluate_flood_and_road_tier()` will automatically incorporate physical stage thresholds ($0.75\text{ m}$, $1.15\text{ m}$, $1.60\text{ m}$) and surge rates ($\ge 0.40\text{ m/hr}$) directly into the alert arbitration logic without requiring code changes.
 
