@@ -504,10 +504,11 @@ def attach_boundary_telemetry_for_mos(
     )
     out["issue_persistence_bias_c"] = get_col(out, "issue_persistence_bias_c", init_bias_c)
 
+    ref_anchor_t = out["issue_tass_temp_c"]
     out["issue_chews_temp_c"] = get_col(
         out,
         "issue_chews_temp_c",
-        chews_t if not math.isnan(chews_t) else base_t + 2.0,
+        chews_t if not math.isnan(chews_t) else ref_anchor_t - 6.83,
     )
     out["issue_chews_rh_pct"] = get_col(
         out,
@@ -530,12 +531,12 @@ def attach_boundary_telemetry_for_mos(
     out["issue_hastings_temp_c"] = get_col(
         out,
         "issue_hastings_temp_c",
-        hast_t if not math.isnan(hast_t) else base_t + 0.5,
+        hast_t if not math.isnan(hast_t) else ref_anchor_t - 0.60,
     )
     out["issue_arroyo_temp_c"] = get_col(
         out,
         "issue_arroyo_temp_c",
-        arroyo_t if not math.isnan(arroyo_t) else base_t + 1.4,
+        arroyo_t if not math.isnan(arroyo_t) else ref_anchor_t + 1.41,
     )
     out["issue_arroyo_rh_pct"] = get_col(
         out,
@@ -546,7 +547,7 @@ def attach_boundary_telemetry_for_mos(
     out["issue_bigsur_temp_c"] = get_col(
         out,
         "issue_bigsur_temp_c",
-        bigsur_t if not math.isnan(bigsur_t) else base_t + 0.8,
+        bigsur_t if not math.isnan(bigsur_t) else ref_anchor_t + 2.45,
     )
     out["issue_bigsur_rh_pct"] = get_col(
         out,
@@ -1114,16 +1115,16 @@ def load_all_dashboard_data():
                         COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
                         COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
                         f.short_forecast,
-                        COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                        COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
                         COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
                         COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
-                        COALESCE(r_hast.temp_c, r_arroyo.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
-                        COALESCE(r_arroyo.temp_c, r_hast.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
+                        COALESCE(r_hast.temp_c, r_arroyo.temp_c - 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) - 0.60) AS issue_hastings_temp_c,
+                        COALESCE(r_arroyo.temp_c, r_hast.temp_c + 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) + 1.41) AS issue_arroyo_temp_c,
                         COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
-                        COALESCE(r_bigsur.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
+                        COALESCE(r_bigsur.temp_c, COALESCE(o_issue.temp_c, f.nws_temp_c) + 2.45) AS issue_bigsur_temp_c,
                         COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
                         COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
-                        COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, f.nws_temp_c + 1.5) AS issue_ventana_temp_c,
+                        COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
                         COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
                         COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
                         COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c,

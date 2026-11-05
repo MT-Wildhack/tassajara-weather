@@ -177,19 +177,22 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
 
     raw_chews_t = _num_series(df, "issue_chews_temp_c", np.nan)
     raw_ventana_t = _num_series(df, "issue_ventana_temp_c", np.nan)
-    issue_chews_t = raw_chews_t.fillna(raw_ventana_t - 0.54).fillna(t_c + 2.0)
-    issue_ventana_t = raw_ventana_t.fillna(issue_chews_t + 0.54)
+    issue_chews_t = raw_chews_t.fillna(raw_ventana_t - 0.54).fillna(issue_tass_t - 6.83)
+    issue_ventana_t = raw_ventana_t.fillna(issue_chews_t + 0.54).fillna(issue_tass_t - 6.29)
 
     raw_hast_t = _num_series(df, "issue_hastings_temp_c", np.nan)
     raw_arroyo_t = _num_series(df, "issue_arroyo_temp_c", np.nan)
-    issue_hast_t = raw_hast_t.fillna(raw_arroyo_t - 1.80).fillna(t_c + 0.5)
-    issue_arroyo_t = raw_arroyo_t.fillna(issue_hast_t + 1.80)
+    issue_hast_t = raw_hast_t.fillna(raw_arroyo_t - 2.01).fillna(issue_tass_t - 0.60)
+    issue_arroyo_t = raw_arroyo_t.fillna(issue_hast_t + 2.01).fillna(issue_tass_t + 1.41)
 
-    issue_bigsur_t = _num_series(df, "issue_bigsur_temp_c", np.nan).fillna(t_c + 0.8)
+    issue_bigsur_t = _num_series(df, "issue_bigsur_temp_c", np.nan).fillna(issue_arroyo_t + 1.04)
 
     # 1. Upper-Column Vertical Lapse Rate (CHWC1 1536m & VTCC1 1453m -> TZMC 485m)
-    lapse_chews = (-1.0 * (issue_chews_t - issue_tass_t) / 1.051).fillna(6.5)
-    lapse_ventana = (-1.0 * (issue_ventana_t - issue_tass_t) / 0.968).fillna(6.5)
+    # Decayed toward standard atmosphere (6.5 C/km) over tau=12h for multi-day horizons
+    raw_lapse_chews = (-1.0 * (issue_chews_t - issue_tass_t) / 1.051).fillna(6.5)
+    raw_lapse_ventana = (-1.0 * (issue_ventana_t - issue_tass_t) / 0.968).fillna(6.5)
+    lapse_chews = 6.5 + (raw_lapse_chews - 6.5) * np.exp(-lead_hrs / 12.0)
+    lapse_ventana = 6.5 + (raw_lapse_ventana - 6.5) * np.exp(-lead_hrs / 12.0)
     out["issue_lapse_chews_c_km"] = lapse_chews
 
     # 2. Gorge & Foothill Cold-Pool Confinement (TZMC 485m vs. CAHC1 546m & ASRC1 268m)
