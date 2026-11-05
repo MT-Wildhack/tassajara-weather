@@ -4,7 +4,6 @@ __pycache__/
 */.DS_Store
 logs/
 *.log
-*.db
 *.db-wal
 *.db-shm
 *.bak
