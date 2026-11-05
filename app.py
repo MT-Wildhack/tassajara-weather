@@ -53,7 +53,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Publication-grade scientific CSS styling
+# Publication-grade scientific CSS styling (Theme-Adaptive for Light & Dark Mode)
 st.markdown(
     """
     <style>
@@ -63,8 +63,8 @@ st.markdown(
         max-width: 1440px;
     }
     div[data-testid="stMetric"] {
-        background-color: rgba(15, 23, 42, 0.45);
-        border: 1px solid rgba(148, 163, 184, 0.22);
+        background-color: var(--secondary-background-color);
+        border: 1px solid rgba(148, 163, 184, 0.35);
         border-radius: 6px;
         padding: 10px 14px;
     }
@@ -73,12 +73,14 @@ st.markdown(
         font-weight: 600 !important;
         text-transform: uppercase;
         letter-spacing: 0.04em;
-        color: #94a3b8 !important;
+        color: var(--text-color) !important;
+        opacity: 0.78;
     }
     div[data-testid="stMetricValue"] > div {
         font-size: 1.45rem !important;
         font-weight: 700 !important;
         font-variant-numeric: tabular-nums;
+        color: var(--text-color) !important;
     }
     div[data-testid="stMetricDelta"] > div {
         font-size: 0.76rem !important;
@@ -89,19 +91,44 @@ st.markdown(
         font-weight: 600;
     }
     .met-header-bar {
-        border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.35);
         padding-bottom: 0.6rem;
         margin-bottom: 1.0rem;
     }
     .met-subbanner {
         font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
         font-size: 0.80rem;
-        color: #94a3b8;
-        background: rgba(15, 23, 42, 0.6);
-        border-left: 3px solid #38bdf8;
-        padding: 8px 12px;
-        border-radius: 0 4px 4px 0;
+        color: var(--text-color);
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-left: 4px solid #0284c7;
+        padding: 10px 14px;
+        border-radius: 0 6px 6px 0;
         margin-bottom: 1.2rem;
+        line-height: 1.5;
+    }
+    .tzmc-card {
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(148, 163, 184, 0.32);
+        border-radius: 10px;
+        color: var(--text-color);
+    }
+    .tzmc-muted {
+        color: var(--text-color);
+        opacity: 0.75;
+    }
+    .tzmc-subtle {
+        color: var(--text-color);
+        opacity: 0.88;
+    }
+    .tzmc-pill {
+        font-size: 0.80rem;
+        font-weight: 600;
+        color: var(--text-color);
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(148, 163, 184, 0.40);
+        padding: 4px 10px;
+        border-radius: 4px;
     }
     </style>
     """,
@@ -115,6 +142,11 @@ LOCAL_TZ = "America/Los_Angeles"
 TASSAJARA_LAT = 36.2337
 TASSAJARA_LON = -121.5501
 NWP_GRID_ELEV_M = 880.0
+
+# Shared theme-safe Plotly styling constants for crisp Light & Dark mode rendering
+PLOT_BG_RGBA = "rgba(148, 163, 184, 0.08)"
+GRID_RGBA = "rgba(148, 163, 184, 0.25)"
+DIVIDER_LINE_RGBA = "rgba(100, 116, 139, 0.75)"
 
 # ---------------------------------------------------------------------------
 # Scientific Tooltip Dictionary & Feature Metadata (Line-Wrap Safe)
@@ -1494,7 +1526,6 @@ def get_weather_icon_and_label(
     return "☀️", "Sunny & Clear"
 
 
-
 # ---------------------------------------------------------------------------
 # Early Flood & Tassajara Road Washout Warning UI Components
 # ---------------------------------------------------------------------------
@@ -1502,6 +1533,8 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     """
     Renders a high-visibility 4-Tier Creek Flood & Tassajara Road Passability
     Warning Banner for both the Everyday Community View and Scientific MOS Suite.
+    Uses theme-adaptive CSS variables (`var(--text-color)`) so text is crisp and
+    legible in both Streamlit Light and Dark modes.
     """
     if not isinstance(hydro_summary, dict) or not hydro_summary:
         return
@@ -1513,6 +1546,15 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     color_hex = str(hydro_summary.get("color_hex", "#10b981"))
     bg_rgba = str(hydro_summary.get("bg_rgba", "rgba(16, 185, 129, 0.14)"))
     border_rgba = str(hydro_summary.get("border_rgba", "rgba(16, 185, 129, 0.45)"))
+
+    # High-contrast tier label colors that read clearly on both light and dark backgrounds
+    tier_accent_map = {
+        "GREEN": "#059669",
+        "YELLOW": "#b45309",
+        "ORANGE": "#c2410c",
+        "RED": "#dc2626",
+    }
+    tier_text_color = tier_accent_map.get(code, color_hex)
 
     api_in = float(hydro_summary.get("api_in", 0.0))
     api_mm = float(hydro_summary.get("api_mm", 0.0))
@@ -1534,8 +1576,8 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     trigger_text = str(hydro_summary.get("trigger_summary", "Catchment stable."))
 
     tech_line = (
-        f'<div style="font-family: monospace; font-size: 0.78rem; color: #cbd5e1; '
-        f'margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(148, 163, 184, 0.22);">'
+        f'<div class="tzmc-muted" style="font-family: monospace; font-size: 0.78rem; '
+        f'margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(148, 163, 184, 0.35);">'
         f'<b>HYDROLOGICAL TELEMETRY:</b> '
         f'API<sub>t</sub> = {api_in:.2f} in ({api_mm:.1f} mm, k={decay_k:.3f}) &bull; '
         f'24h Peak API = {proj_api_24_in:.2f} in &bull; '
@@ -1550,25 +1592,24 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     st.markdown(
         f'<div style="background: {bg_rgba}; border: 1.5px solid {border_rgba}; '
         f'border-left: 6px solid {color_hex}; border-radius: 8px; '
-        f'padding: 14px 18px; margin-bottom: 1.1rem;">'
+        f'padding: 14px 18px; margin-bottom: 1.1rem; color: var(--text-color);">'
         f'<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">'
-        f'<div style="font-size: 1.05rem; font-weight: 700; color: #f8fafc;">'
+        f'<div style="font-size: 1.05rem; font-weight: 700; color: var(--text-color);">'
         f'{icon} CREEK FLOOD &amp; TASSAJARA ROAD WARNING SYSTEM — '
-        f'<span style="color: {color_hex};">TIER {tier_num} ({code}): {label}</span>'
+        f'<span style="color: {tier_text_color};">TIER {tier_num} ({code}): {label}</span>'
         f'</div>'
-        f'<div style="font-size: 0.80rem; font-weight: 600; color: #e2e8f0; '
-        f'background: rgba(15, 23, 42, 0.65); padding: 4px 10px; border-radius: 4px;">'
+        f'<div class="tzmc-pill">'
         f'Soil Wetness API: {api_in:.2f}" &nbsp;|&nbsp; Runoff C: {c_pct:.0f}% &nbsp;|&nbsp; '
         f'24h Peak Q: {peak_discharge_24_cfs:.0f} CFS'
         f'</div>'
         f'</div>'
         f'<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); '
-        f'gap: 10px; margin-top: 10px; font-size: 0.86rem; color: #e2e8f0;">'
+        f'gap: 10px; margin-top: 10px; font-size: 0.86rem; color: var(--text-color);">'
         f'<div><b>🛣️ Tassajara Road (14-mi Unpaved):</b> {road_status}</div>'
         f'<div><b>🌊 Tassajara Creek &amp; Bridges:</b> {creek_status}</div>'
         f'<div><b>⚡ Operational Action:</b> {action_text}</div>'
         f'</div>'
-        f'<div style="font-size: 0.81rem; color: #cbd5e1; margin-top: 6px;">'
+        f'<div class="tzmc-subtle" style="font-size: 0.81rem; margin-top: 6px;">'
         f'<b>Active Diagnostic Triggers:</b> {trigger_text}'
         f'</div>'
         f'{tech_line if is_scientific else ""}'
@@ -1594,9 +1635,9 @@ def render_hydro_risk_section(
     proj_df = hydro_bundle.get("proj_fc_df", pd.DataFrame())
 
     st.subheader(
-        "🌊 Early Flood & Road Washout Warning System: Soil Saturation (API) & Creek Hydrograph"
+        "Early Flood & Road Washout Warning System: Soil Saturation (API) & Creek Hydrograph"
         if is_scientific
-        else "🌊 Tassajara Creek Runoff & Road Passability Outlook (Next 72 Hours)"
+        else "Tassajara Creek Runoff & Road Passability Outlook (Next 72 Hours)"
     )
 
     # 1. 4-Card Hydrological KPI Row
@@ -1664,35 +1705,35 @@ def render_hydro_risk_section(
                 title={
                     "text": (
                         "<b>Catchment Soil Saturation (API)</b><br>"
-                        f"<span style='font-size:0.80em;color:#94a3b8'>"
+                        f"<span style='font-size:0.80em;color:#64748b'>"
                         f"Runoff Readiness C = {s['runoff_coeff_pct']:.0f}% | "
                         f"24h Peak: {s['projected_max_api_24h_in']:.2f} in</span>"
                     ),
                     "font": {"size": 14},
                 },
                 gauge={
-                    "axis": {"range": [0, gauge_max_in], "tickwidth": 1, "tickcolor": "#94a3b8"},
-                    "bar": {"color": s["color_hex"], "thickness": 0.32},
-                    "bgcolor": "rgba(15, 23, 42, 0.45)",
+                    "axis": {"range": [0, gauge_max_in], "tickwidth": 1, "tickcolor": "#64748b"},
+                    "bar": {"color": s["color_hex"], "thickness": 0.34},
+                    "bgcolor": "rgba(148, 163, 184, 0.10)",
                     "borderwidth": 1,
-                    "bordercolor": "rgba(148, 163, 184, 0.25)",
+                    "bordercolor": "rgba(148, 163, 184, 0.38)",
                     "steps": [
-                        {"range": [0, YELLOW_API_MM / MM_PER_INCH], "color": "rgba(16, 185, 129, 0.22)"},
+                        {"range": [0, YELLOW_API_MM / MM_PER_INCH], "color": "rgba(16, 185, 129, 0.25)"},
                         {
                             "range": [YELLOW_API_MM / MM_PER_INCH, ORANGE_API_MM / MM_PER_INCH],
-                            "color": "rgba(234, 179, 8, 0.25)",
+                            "color": "rgba(234, 179, 8, 0.28)",
                         },
                         {
                             "range": [ORANGE_API_MM / MM_PER_INCH, RED_API_EXTREME_MM / MM_PER_INCH],
-                            "color": "rgba(249, 115, 22, 0.28)",
+                            "color": "rgba(249, 115, 22, 0.30)",
                         },
                         {
                             "range": [RED_API_EXTREME_MM / MM_PER_INCH, gauge_max_in],
-                            "color": "rgba(239, 68, 68, 0.32)",
+                            "color": "rgba(239, 68, 68, 0.34)",
                         },
                     ],
                     "threshold": {
-                        "line": {"color": "#f8fafc", "width": 3},
+                        "line": {"color": "#ef4444", "width": 3},
                         "thickness": 0.80,
                         "value": float(s["projected_max_api_24h_in"]),
                     },
@@ -1703,14 +1744,11 @@ def render_hydro_risk_section(
             height=300,
             margin=dict(t=55, b=20, l=22, r=22),
             paper_bgcolor="rgba(0,0,0,0)",
-            font={"color": "#e2e8f0"},
         )
         st.plotly_chart(fig_gauge, use_container_width=True)
 
         st.markdown(
-            f'<div style="background: rgba(15, 23, 42, 0.55); '
-            f'border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 6px; '
-            f'padding: 10px 12px; font-size: 0.79rem; color: #cbd5e1;">'
+            f'<div class="tzmc-card" style="padding: 10px 12px; font-size: 0.79rem;">'
             f'<b>Catchment Geometry:</b> 72 km² upper watershed (Pine Ridge, Black Cone, Chews Ridge → '
             f'Tassajara Creek at 485 m MSL).<br>'
             f'<b>Stream Gauge Telemetry:</b> {s["gauge_sensor_health"]}'
@@ -1727,7 +1765,7 @@ def render_hydro_risk_section(
             rows=2,
             cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.10,
+            vertical_spacing=0.12,
             row_heights=[0.48, 0.52],
             specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
             subplot_titles=(
@@ -1743,7 +1781,7 @@ def render_hydro_risk_section(
                     x=h_sub["valid_local"],
                     y=h_sub["api_in"],
                     mode="lines",
-                    line=dict(color="#10b981", width=2.4),
+                    line=dict(color="#059669", width=2.4),
                     name="Observed Spin-Up API (in)",
                 ),
                 row=1,
@@ -1755,7 +1793,7 @@ def render_hydro_risk_section(
                     x=h_sub["valid_local"],
                     y=(h_sub["runoff_coeff_c"] * 100.0).round(1),
                     mode="lines",
-                    line=dict(color="#a855f7", width=1.6, dash="dot"),
+                    line=dict(color="#9333ea", width=1.8, dash="dot"),
                     name="Runoff Coeff C (%)",
                 ),
                 row=1,
@@ -1767,7 +1805,7 @@ def render_hydro_risk_section(
                     x=h_sub["valid_local"],
                     y=h_sub["discharge_index_cfs"],
                     mode="lines",
-                    line=dict(color="#10b981", width=2.3),
+                    line=dict(color="#059669", width=2.3),
                     name="Estimated Historical Creek Q (CFS)",
                 ),
                 row=2,
@@ -1780,7 +1818,7 @@ def render_hydro_risk_section(
                     y=(h_sub["runoff_mm_hr"] / MM_PER_INCH).round(3),
                     name="Observed Effective Runoff (in/hr)",
                     marker_color="#10b981",
-                    opacity=0.65,
+                    opacity=0.70,
                 ),
                 row=2,
                 col=1,
@@ -1794,7 +1832,7 @@ def render_hydro_risk_section(
                     x=p_sub["valid_local"],
                     y=p_sub["projected_api_p90_in"],
                     mode="lines",
-                    line=dict(color="rgba(239, 68, 68, 0.65)", width=1.5, dash="dash"),
+                    line=dict(color="rgba(220, 38, 38, 0.75)", width=1.6, dash="dash"),
                     name="Projected P90 Extreme API (in)",
                 ),
                 row=1,
@@ -1806,7 +1844,7 @@ def render_hydro_risk_section(
                     x=p_sub["valid_local"],
                     y=p_sub["projected_api_in"],
                     mode="lines",
-                    line=dict(color="#38bdf8", width=2.6),
+                    line=dict(color="#0284c7", width=2.6),
                     name="Projected Expected API (in)",
                 ),
                 row=1,
@@ -1818,7 +1856,7 @@ def render_hydro_risk_section(
                     x=p_sub["valid_local"],
                     y=(p_sub["projected_runoff_coeff"] * 100.0).round(1),
                     mode="lines",
-                    line=dict(color="#c084fc", width=1.8, dash="dot"),
+                    line=dict(color="#9333ea", width=1.8, dash="dot"),
                     name="Projected Runoff Coeff C (%)",
                 ),
                 row=1,
@@ -1832,8 +1870,8 @@ def render_hydro_risk_section(
                     y=p_sub["projected_discharge_p90_cfs"],
                     mode="lines",
                     fill="tozeroy",
-                    fillcolor="rgba(239, 68, 68, 0.10)",
-                    line=dict(color="rgba(239, 68, 68, 0.70)", width=1.6, dash="dash"),
+                    fillcolor="rgba(239, 68, 68, 0.12)",
+                    line=dict(color="rgba(220, 38, 38, 0.75)", width=1.6, dash="dash"),
                     name="Projected P90 Surge Q (CFS)",
                 ),
                 row=2,
@@ -1845,7 +1883,7 @@ def render_hydro_risk_section(
                     x=p_sub["valid_local"],
                     y=p_sub["projected_discharge_cfs"],
                     mode="lines",
-                    line=dict(color="#0ea5e9", width=2.6),
+                    line=dict(color="#0284c7", width=2.6),
                     name="Projected Expected Creek Q (CFS)",
                 ),
                 row=2,
@@ -1857,8 +1895,8 @@ def render_hydro_risk_section(
                     x=p_sub["valid_local"],
                     y=p_sub["projected_runoff_in_hr"],
                     name="Projected Effective Runoff (in/hr)",
-                    marker_color="#38bdf8",
-                    opacity=0.65,
+                    marker_color="#0ea5e9",
+                    opacity=0.70,
                 ),
                 row=2,
                 col=1,
@@ -1869,7 +1907,7 @@ def render_hydro_risk_section(
         fig_hydro.add_hline(
             y=YELLOW_API_MM / MM_PER_INCH,
             line_dash="dot",
-            line_color="#eab308",
+            line_color="#d97706",
             annotation_text="Yellow Advisory (1.00 in)",
             annotation_position="top left",
             row=1,
@@ -1879,7 +1917,7 @@ def render_hydro_risk_section(
         fig_hydro.add_hline(
             y=ORANGE_API_MM / MM_PER_INCH,
             line_dash="dot",
-            line_color="#f97316",
+            line_color="#ea580c",
             annotation_text="Orange Watch (1.75 in)",
             annotation_position="top right",
             row=1,
@@ -1893,14 +1931,14 @@ def render_hydro_risk_section(
                 x=divider_local,
                 line_width=1.4,
                 line_dash="dash",
-                line_color="rgba(226, 232, 240, 0.55)",
+                line_color=DIVIDER_LINE_RGBA,
                 row=r_i,
                 col=1,
             )
 
         fig_hydro.update_yaxes(
             title_text="API Wetness (in)",
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
             row=1,
             col=1,
             secondary_y=False,
@@ -1915,7 +1953,7 @@ def render_hydro_risk_section(
         )
         fig_hydro.update_yaxes(
             title_text="Creek Discharge (CFS)",
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
             row=2,
             col=1,
             secondary_y=False,
@@ -1927,13 +1965,15 @@ def render_hydro_risk_section(
             col=1,
             secondary_y=True,
         )
+        fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
+        fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=2, col=1)
         fig_hydro.update_layout(
-            height=430,
-            margin=dict(t=35, b=30, l=50, r=50),
+            height=440,
+            margin=dict(t=40, b=30, l=50, r=50),
             hovermode="x unified",
-            plot_bgcolor="rgba(15, 23, 42, 0.35)",
+            plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_hydro, use_container_width=True)
 
@@ -2080,23 +2120,22 @@ def render_layman_forecast_view(
     hero_col1, hero_col2 = st.columns([1.35, 1.65])
     with hero_col1:
         st.markdown(
-            f'<div style="background: rgba(15, 23, 42, 0.65); '
-            f'border: 1px solid rgba(56, 189, 248, 0.30); border-radius: 10px; '
+            f'<div class="tzmc-card" style="border: 1.5px solid rgba(2, 132, 199, 0.40); '
             f'padding: 20px 24px; height: 100%;">'
             f'<div style="font-size: 0.82rem; text-transform: uppercase; '
-            f'letter-spacing: 0.06em; color: #38bdf8; font-weight: 600;">'
+            f'letter-spacing: 0.06em; color: #0284c7; font-weight: 700;">'
             f'Right Now at Tassajara Stone Office (1,590 ft)</div>'
             f'<div style="display: flex; align-items: center; gap: 18px; margin: 10px 0;">'
             f'<span style="font-size: 3.6rem; line-height: 1;">{cur_icon}</span>'
             f'<div>'
-            f'<div style="font-size: 2.9rem; font-weight: 800; line-height: 1.05;">'
+            f'<div style="font-size: 2.9rem; font-weight: 800; line-height: 1.05; color: var(--text-color);">'
             f'{temp_f:.0f}°F</div>'
-            f'<div style="font-size: 1.1rem; color: #e2e8f0; font-weight: 500;">'
+            f'<div class="tzmc-subtle" style="font-size: 1.1rem; font-weight: 600;">'
             f'{cur_cond}</div>'
             f'</div></div>'
-            f'<div style="font-size: 0.90rem; color: #cbd5e1; margin-top: 8px;">'
+            f'<div class="tzmc-subtle" style="font-size: 0.90rem; margin-top: 8px;">'
             f'{sun_badge}</div>'
-            f'<div style="font-size: 0.78rem; color: #94a3b8; margin-top: 10px;">'
+            f'<div class="tzmc-muted" style="font-size: 0.78rem; margin-top: 10px;">'
             f'Updated: {last_obs_str}</div>'
             f'</div>',
             unsafe_allow_html=True,
@@ -2269,17 +2308,15 @@ def render_layman_forecast_view(
 
             with cols_24[idx_col]:
                 st.markdown(
-                    f'<div style="background: rgba(15, 23, 42, 0.50); '
-                    f'border: 1px solid rgba(148, 163, 184, 0.20); border-radius: 8px; '
-                    f'padding: 10px 6px; text-align: center;">'
-                    f'<div style="font-size: 0.75rem; color: #94a3b8; font-weight: 600;">'
+                    f'<div class="tzmc-card" style="padding: 10px 6px; text-align: center;">'
+                    f'<div class="tzmc-muted" style="font-size: 0.75rem; font-weight: 600;">'
                     f'{day_tag} {time_lbl}</div>'
                     f'<div style="font-size: 1.9rem; margin: 6px 0;">{ic}</div>'
-                    f'<div style="font-size: 1.25rem; font-weight: 700;">'
+                    f'<div style="font-size: 1.25rem; font-weight: 700; color: var(--text-color);">'
                     f'{r["smooth_temp_f"]:.0f}°F</div>'
-                    f'<div style="font-size: 0.74rem; color: #cbd5e1; margin-top: 2px;">'
+                    f'<div class="tzmc-subtle" style="font-size: 0.74rem; margin-top: 2px;">'
                     f'{lbl}</div>'
-                    f'<div style="font-size: 0.75rem; color: #38bdf8; margin-top: 4px;">'
+                    f'<div style="font-size: 0.75rem; color: #0284c7; font-weight: 600; margin-top: 4px;">'
                     f'{pop_badge}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -2315,8 +2352,8 @@ def render_layman_forecast_view(
                 y=fc_48["mos_pop"],
                 mode="lines",
                 fill="tozeroy",
-                fillcolor="rgba(56, 189, 248, 0.12)",
-                line=dict(color="rgba(56, 189, 248, 0.55)", width=1.5, dash="dot"),
+                fillcolor="rgba(2, 132, 199, 0.12)",
+                line=dict(color="rgba(2, 132, 199, 0.65)", width=1.6, dash="dot"),
                 name="Chance of Rain (%)",
             ),
             secondary_y=True,
@@ -2328,7 +2365,7 @@ def render_layman_forecast_view(
                     x=fc_48["valid_local"],
                     y=fc_48["mos_rain_in"],
                     name="Expected Rain (in/hr)",
-                    marker_color="#38bdf8",
+                    marker_color="#0284c7",
                     opacity=0.65,
                 ),
                 secondary_y=True,
@@ -2339,7 +2376,7 @@ def render_layman_forecast_view(
                 x=fc_48["valid_local"],
                 y=fc_48["smooth_temp_f"],
                 mode="lines",
-                line=dict(color="#f97316", width=3.2, shape="spline"),
+                line=dict(color="#ea580c", width=3.2, shape="spline"),
                 name="Canyon Temperature (°F)",
             ),
             secondary_y=False,
@@ -2348,7 +2385,7 @@ def render_layman_forecast_view(
         fig_layman.add_hline(
             y=32.0,
             line_dash="dot",
-            line_color="#38bdf8",
+            line_color="#0284c7",
             annotation_text="Freezing (32°F)",
             annotation_position="bottom right",
             secondary_y=False,
@@ -2356,7 +2393,7 @@ def render_layman_forecast_view(
 
         fig_layman.update_yaxes(
             title_text="Temperature (°F)",
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
             secondary_y=False,
         )
         fig_layman.update_yaxes(
@@ -2367,13 +2404,13 @@ def render_layman_forecast_view(
         )
         fig_layman.update_xaxes(
             title_text="Local Canyon Time",
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
         )
         fig_layman.update_layout(
             height=390,
             margin=dict(t=25, b=35, l=50, r=50),
             hovermode="x unified",
-            plot_bgcolor="rgba(15, 23, 42, 0.35)",
+            plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
         )
@@ -2448,20 +2485,18 @@ def render_layman_forecast_view(
             )
             with day_cols[idx_d]:
                 st.markdown(
-                    f'<div style="background: rgba(15, 23, 42, 0.55); '
-                    f'border: 1px solid rgba(148, 163, 184, 0.22); border-radius: 10px; '
-                    f'padding: 12px 8px; text-align: center; height: 100%;">'
-                    f'<div style="font-size: 0.92rem; font-weight: 700; color: #f8fafc;">'
+                    f'<div class="tzmc-card" style="padding: 12px 8px; text-align: center; height: 100%;">'
+                    f'<div style="font-size: 0.92rem; font-weight: 700; color: var(--text-color);">'
                     f'{r_d["Day_Short"]}</div>'
-                    f'<div style="font-size: 0.75rem; color: #94a3b8; margin-bottom: 6px;">'
+                    f'<div class="tzmc-muted" style="font-size: 0.75rem; margin-bottom: 6px;">'
                     f'{r_d["Date_Short"]}</div>'
                     f'<div style="font-size: 2.2rem; margin: 6px 0;">{ic_d}</div>'
-                    f'<div style="font-size: 0.78rem; color: #e2e8f0; min-height: 2.1em;">'
+                    f'<div class="tzmc-subtle" style="font-size: 0.78rem; min-height: 2.1em;">'
                     f'{cond_d}</div>'
                     f'<div style="font-size: 1.15rem; font-weight: 700; margin-top: 6px;">'
-                    f'<span style="color: #fb923c;">{r_d["High_F"]:.0f}°</span> / '
-                    f'<span style="color: #38bdf8;">{r_d["Low_F"]:.0f}°</span></div>'
-                    f'<div style="font-size: 0.74rem; color: #94a3b8; margin-top: 6px;">'
+                    f'<span style="color: #ea580c;">{r_d["High_F"]:.0f}°</span> / '
+                    f'<span style="color: #0284c7;">{r_d["Low_F"]:.0f}°</span></div>'
+                    f'<div class="tzmc-muted" style="font-size: 0.74rem; margin-top: 6px;">'
                     f'{rain_Badge}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -3216,7 +3251,7 @@ else:
                 x=pd.concat([combined_df["valid_local"], combined_df["valid_local"][::-1]]),
                 y=pd.concat([p90_f, p10_f[::-1]]),
                 fill="toself",
-                fillcolor="rgba(249, 115, 22, 0.16)",
+                fillcolor="rgba(234, 88, 12, 0.16)",
                 line=dict(color="rgba(255,255,255,0)"),
                 name="MOS P10–P90 Confidence Band",
                 hoverinfo="skip",
@@ -3229,7 +3264,7 @@ else:
                 x=combined_df["valid_local"],
                 y=dew_f_series.round(1),
                 mode="lines",
-                line=dict(color="rgba(56, 189, 248, 0.45)", width=1.2, dash="dot"),
+                line=dict(color="rgba(2, 132, 199, 0.65)", width=1.4, dash="dot"),
                 name="Dewpoint Temperature (°F)",
             ),
             row=1,
@@ -3240,7 +3275,7 @@ else:
                 x=combined_df["valid_local"],
                 y=raw_nws_f.round(1),
                 mode="lines",
-                line=dict(color="#60a5fa", width=2.0, dash="dash"),
+                line=dict(color="#2563eb", width=2.0, dash="dash"),
                 name="Raw NWS Grid Forecast (°F)",
             ),
             row=1,
@@ -3251,7 +3286,7 @@ else:
                 x=combined_df["valid_local"],
                 y=c_to_f(corr_c_series).round(1),
                 mode="lines",
-                line=dict(color="#f97316", width=2.8),
+                line=dict(color="#ea580c", width=2.8),
                 name="Tassajara MOS Corrected (°F)",
             ),
             row=1,
@@ -3267,8 +3302,8 @@ else:
                         x=actual_pts["valid_local"],
                         y=act_y,
                         mode="lines+markers",
-                        line=dict(color="#10b981", width=2.2),
-                        marker=dict(color="#10b981", size=5.5, symbol="circle"),
+                        line=dict(color="#059669", width=2.2),
+                        marker=dict(color="#059669", size=5.5, symbol="circle"),
                         name="Stone Office Observed (°F)",
                     ),
                     row=1,
@@ -3278,7 +3313,7 @@ else:
         fig.add_hline(
             y=32.0,
             line_dash="dot",
-            line_color="#38bdf8",
+            line_color="#0284c7",
             annotation_text="Freeze Threshold (32.0 °F)",
             annotation_position="bottom right",
             row=1,
@@ -3306,7 +3341,7 @@ else:
                 x=combined_df["valid_local"],
                 y=gust_mph_series.round(1),
                 mode="lines",
-                line=dict(color="#eab308", width=2.0),
+                line=dict(color="#d97706", width=2.0),
                 name="Peak Wind Gust (mph)",
             ),
             row=2,
@@ -3318,7 +3353,7 @@ else:
                 x=combined_df["valid_local"],
                 y=rh_series.round(0),
                 mode="lines",
-                line=dict(color="#a855f7", width=1.8, dash="dot"),
+                line=dict(color="#9333ea", width=1.8, dash="dot"),
                 name="Relative Humidity (%)",
             ),
             row=2,
@@ -3344,8 +3379,8 @@ else:
                 y=mos_pop_pct.round(0),
                 mode="lines",
                 fill="tozeroy",
-                fillcolor="rgba(56, 189, 248, 0.14)",
-                line=dict(color="#38bdf8", width=2.0),
+                fillcolor="rgba(2, 132, 199, 0.14)",
+                line=dict(color="#0284c7", width=2.0),
                 name="MOS Calibrated PoP (%)",
             ),
             row=3,
@@ -3357,7 +3392,7 @@ else:
                 x=combined_df["valid_local"],
                 y=raw_pop_pct.round(0),
                 mode="lines",
-                line=dict(color="rgba(148, 163, 184, 0.55)", width=1.3, dash="dot"),
+                line=dict(color="rgba(100, 116, 139, 0.70)", width=1.4, dash="dot"),
                 name="Raw NWS PoP (%)",
             ),
             row=3,
@@ -3369,7 +3404,7 @@ else:
                 x=combined_df["valid_local"],
                 y=mos_p90_rain_in,
                 mode="lines",
-                line=dict(color="rgba(244, 63, 94, 0.65)", width=1.4, dash="dash"),
+                line=dict(color="rgba(225, 29, 72, 0.75)", width=1.5, dash="dash"),
                 name="MOS P90 Extreme Rate (in/hr)",
             ),
             row=3,
@@ -3381,7 +3416,7 @@ else:
                 x=combined_df["valid_local"],
                 y=raw_rain_in,
                 name="Raw NWS QPF (in/hr)",
-                marker_color="rgba(96, 165, 250, 0.45)",
+                marker_color="rgba(37, 99, 235, 0.50)",
             ),
             row=3,
             col=1,
@@ -3392,7 +3427,7 @@ else:
                 x=combined_df["valid_local"],
                 y=mos_rain_in,
                 name="MOS Calibrated QPF (in/hr)",
-                marker_color="#0ea5e9",
+                marker_color="#0284c7",
             ),
             row=3,
             col=1,
@@ -3403,7 +3438,7 @@ else:
                 x=combined_df["valid_local"],
                 y=actual_rain_in,
                 name="Observed Tipping Bucket (in/hr)",
-                marker_color="#10b981",
+                marker_color="#059669",
             ),
             row=3,
             col=1,
@@ -3416,7 +3451,7 @@ else:
                 x=divider_ts,
                 line_width=1.4,
                 line_dash="dash",
-                line_color="rgba(226, 232, 240, 0.55)",
+                line_color=DIVIDER_LINE_RGBA,
                 row=r_idx,
                 col=1,
             )
@@ -3433,11 +3468,11 @@ else:
         rain_y_top = max(0.20, round(max_rain_val * 1.25, 2))
         max_gust_val = float(max(gust_mph_series.max(), 15.0))
 
-        fig.update_yaxes(title_text="Temperature (°F)", gridcolor="rgba(148,163,184,0.12)", row=1, col=1)
+        fig.update_yaxes(title_text="Temperature (°F)", gridcolor=GRID_RGBA, row=1, col=1)
         fig.update_yaxes(
             title_text="Wind Gust (mph)",
             range=[0, max_gust_val * 1.25],
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
             row=2,
             col=1,
             secondary_y=False,
@@ -3446,7 +3481,7 @@ else:
         fig.update_yaxes(
             title_text="Rain Rate (in/hr)",
             range=[0, rain_y_top],
-            gridcolor="rgba(148,163,184,0.12)",
+            gridcolor=GRID_RGBA,
             row=3,
             col=1,
             secondary_y=False,
@@ -3455,7 +3490,7 @@ else:
         x_min = combined_df["valid_local"].min()
         x_max = combined_df["valid_local"].max()
         for r_idx in (1, 2, 3):
-            fig.update_xaxes(range=[x_min, x_max], gridcolor="rgba(148,163,184,0.12)", row=r_idx, col=1)
+            fig.update_xaxes(range=[x_min, x_max], gridcolor=GRID_RGBA, row=r_idx, col=1)
         fig.update_xaxes(title_text="Local Time (America/Los_Angeles)", row=3, col=1)
 
         fig.update_layout(
@@ -3463,7 +3498,7 @@ else:
             margin=dict(t=60, b=40, l=55, r=55),
             hovermode="x unified",
             barmode="group",
-            plot_bgcolor="rgba(15, 23, 42, 0.35)",
+            plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0.0),
         )
@@ -3616,7 +3651,7 @@ else:
                     x=top_n["Thermal Importance (%)"],
                     y=top_n["Physical Predictor"],
                     orientation="h",
-                    marker_color="#f97316",
+                    marker_color="#ea580c",
                     name="Thermal MOS Share (%)",
                     text=top_n["Thermal Importance (%)"].map(lambda v: f"{v:.1f}%"),
                     textposition="auto",
@@ -3629,7 +3664,7 @@ else:
                     x=top_n["Hydrological Importance (%)"],
                     y=top_n["Physical Predictor"],
                     orientation="h",
-                    marker_color="#38bdf8",
+                    marker_color="#0284c7",
                     name="Hydrological Hurdle Share (%)",
                     text=top_n["Hydrological Importance (%)"].map(lambda v: f"{v:.1f}%"),
                     textposition="auto",
@@ -3637,10 +3672,12 @@ else:
                 row=1,
                 col=2,
             )
+            fig_imp.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
+            fig_imp.update_xaxes(gridcolor=GRID_RGBA, row=1, col=2)
             fig_imp.update_layout(
                 height=520,
                 margin=dict(t=50, b=35, l=20, r=25),
-                plot_bgcolor="rgba(15, 23, 42, 0.35)",
+                plot_bgcolor=PLOT_BG_RGBA,
                 paper_bgcolor="rgba(0,0,0,0)",
                 showlegend=False,
             )
