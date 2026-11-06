@@ -86,7 +86,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
 }
 
 # WeatherLink v2 data_structure_types that belong ONLY to indoor console / health sensors
-INDOOR_OR_HEALTH_DST = {12, 13, 14, 15, 21, 22, 27}
+INDOOR_OR_HEALTH_DST = {12, 13, 14, 15, 16, 17, 18, 21, 22, 27}
 
 
 def first_not_none(*vals):
@@ -294,8 +294,12 @@ class WeatherLinkV2Client:
                         bt_val = bt_val / 1000.0
                     parsed["pressure_trend_hpa"] = inhg_to_hpa(bt_val)
 
-            # Skip strictly indoor/health sensors for outdoor weather metrics
-            if dst in INDOOR_OR_HEALTH_DST and "temp_out" not in latest:
+            # Skip strictly indoor/health/AirLink AQI sensors for outdoor weather metrics
+            stype = int(sensor.get("sensor_type") or 0)
+            if (dst in INDOOR_OR_HEALTH_DST or stype in {323, 326, 504, 506}) and "temp_out" not in latest:
+                continue
+            rec_ts_check = int(latest.get("ts") or 0)
+            if rec_ts_check > 0 and max_iss_ts > 0 and (max_iss_ts - rec_ts_check) > 1800 and "temp_out" not in latest:
                 continue
 
             rec_ts = int(latest.get("ts") or 0)
@@ -499,10 +503,10 @@ def fetch_regional_reference_stations(
         "stid": ",".join(stids),
         "vars": (
             "air_temp,relative_humidity,wind_speed,wind_gust,"
-            "wind_direction,precip_accum_one_hour,precip_intervals,precip_accum"
+            "wind_direction,precip_accum_one_hour,precip_accum"
         ),
         "units": "metric",
-        "within": 120,
+        "within": 360,
         "token": SYNOPTIC_API_TOKEN,
     }
 

@@ -222,46 +222,81 @@ SELECT
     (o.temp_c - f.nws_temp_c) AS temp_error_c,
     (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
     -- CHWC1: Chews Ridge (1,536m Interior Crest)
-    COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
-    COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
-    COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
+    COALESCE(r_chews_v.temp_c, r_chews_i.temp_c, r_vent_v.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+    COALESCE(r_chews_v.rh_pct, r_chews_i.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
+    COALESCE(r_chews_v.precip_1hr_mm, r_chews_i.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
     -- CAHC1: Hastings Reservation (546m Foothill Valley)
-    COALESCE(r_hast.temp_c, r_arroyo.temp_c - 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) - 0.60) AS issue_hastings_temp_c,
+    COALESCE(r_hast_v.temp_c, r_hast_i.temp_c, r_arroyo_v.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
     -- ASRC1: Arroyo Seco RAWS (268m Gorge Outlet)
-    COALESCE(r_arroyo.temp_c, r_hast.temp_c + 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) + 1.41) AS issue_arroyo_temp_c,
-    COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
+    COALESCE(r_arroyo_v.temp_c, r_arroyo_i.temp_c, r_hast_v.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
+    COALESCE(r_arroyo_v.rh_pct, r_arroyo_i.rh_pct, r_hast_v.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
     -- PPSC1: Big Sur RAWS (108m Coastal Slope)
-    COALESCE(r_bigsur.temp_c, COALESCE(o_issue.temp_c, f.nws_temp_c) + 2.45) AS issue_bigsur_temp_c,
-    COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
-    COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
+    COALESCE(r_bigsur_v.temp_c, r_bigsur_i.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
+    COALESCE(r_bigsur_v.rh_pct, r_bigsur_i.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
+    COALESCE(r_bigsur_v.precip_1hr_mm, r_bigsur_i.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
     -- VTCC1: Ventana Cone (1,453m Windward Crest)
-    COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
-    COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
+    COALESCE(r_vent_v.temp_c, r_vent_i.temp_c, r_chews_v.temp_c + 0.54, f.nws_temp_c + 2.54) AS issue_ventana_temp_c,
+    COALESCE(r_vent_v.precip_1hr_mm, r_vent_i.precip_1hr_mm, r_chews_v.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
     -- Local Stone Office Initialization State
     COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
     COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c
-FROM nws_forecasts f
+FROM (
+    SELECT
+        issue_time_utc,
+        valid_time_utc,
+        lead_time_hours,
+        nws_temp_c,
+        nws_dewpoint_c,
+        nws_rh_pct,
+        nws_wind_speed_ms,
+        nws_wind_gust_ms,
+        nws_wind_dir_deg,
+        nws_sky_cover_pct,
+        nws_pop_pct,
+        nws_qpf_1hr_mm,
+        short_forecast,
+        ROW_NUMBER() OVER (
+            PARTITION BY valid_time_utc
+            ORDER BY
+                CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                CASE WHEN lead_time_hours BETWEEN 1 AND 12 THEN 0 ELSE 1 END ASC,
+                ABS(lead_time_hours - 6) ASC,
+                issue_time_utc DESC
+        ) AS rn
+    FROM nws_forecasts
+    WHERE nws_temp_c IS NOT NULL
+      AND lead_time_hours >= 1
+) f
 INNER JOIN local_observations o
     ON f.valid_time_utc = o.valid_time_utc
 LEFT JOIN local_observations o_issue
-    ON f.issue_time_utc = o_issue.valid_time_utc
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = o_issue.valid_time_utc
 LEFT JOIN (
     SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
     FROM nws_forecasts
     GROUP BY valid_time_utc
 ) f_issue
-    ON f.issue_time_utc = f_issue.valid_time_utc
-LEFT JOIN reference_observations r_chews
-    ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
-LEFT JOIN reference_observations r_hast
-    ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
-LEFT JOIN reference_observations r_arroyo
-    ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
-LEFT JOIN reference_observations r_bigsur
-    ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
-LEFT JOIN reference_observations r_vent
-    ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
-WHERE o.qc_flag = 'OK'
-  AND o.temp_c IS NOT NULL
-  AND f.nws_temp_c IS NOT NULL
-  AND f.lead_time_hours >= 1;
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = f_issue.valid_time_utc
+LEFT JOIN reference_observations r_chews_v
+    ON f.valid_time_utc = r_chews_v.valid_time_utc AND r_chews_v.station_id = 'CHWC1'
+LEFT JOIN reference_observations r_chews_i
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = r_chews_i.valid_time_utc AND r_chews_i.station_id = 'CHWC1'
+LEFT JOIN reference_observations r_hast_v
+    ON f.valid_time_utc = r_hast_v.valid_time_utc AND r_hast_v.station_id = 'CAHC1'
+LEFT JOIN reference_observations r_hast_i
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = r_hast_i.valid_time_utc AND r_hast_i.station_id = 'CAHC1'
+LEFT JOIN reference_observations r_arroyo_v
+    ON f.valid_time_utc = r_arroyo_v.valid_time_utc AND r_arroyo_v.station_id = 'ASRC1'
+LEFT JOIN reference_observations r_arroyo_i
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = r_arroyo_i.valid_time_utc AND r_arroyo_i.station_id = 'ASRC1'
+LEFT JOIN reference_observations r_bigsur_v
+    ON f.valid_time_utc = r_bigsur_v.valid_time_utc AND r_bigsur_v.station_id = 'PPSC1'
+LEFT JOIN reference_observations r_bigsur_i
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = r_bigsur_i.valid_time_utc AND r_bigsur_i.station_id = 'PPSC1'
+LEFT JOIN reference_observations r_vent_v
+    ON f.valid_time_utc = r_vent_v.valid_time_utc AND r_vent_v.station_id = 'VTCC1'
+LEFT JOIN reference_observations r_vent_i
+    ON (substr(f.issue_time_utc, 1, 13) || ':00:00+00:00') = r_vent_i.valid_time_utc AND r_vent_i.station_id = 'VTCC1'
+WHERE f.rn = 1
+  AND o.qc_flag = 'OK'
+  AND o.temp_c IS NOT NULL;

@@ -1202,15 +1202,15 @@ def load_all_dashboard_data():
                         GROUP BY valid_time_utc
                     ) f_issue ON f.issue_time_utc = f_issue.valid_time_utc
                     LEFT JOIN reference_observations r_chews
-                        ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
+                        ON o.valid_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
                     LEFT JOIN reference_observations r_hast
-                        ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+                        ON o.valid_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
                     LEFT JOIN reference_observations r_arroyo
-                        ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
+                        ON o.valid_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
                     LEFT JOIN reference_observations r_bigsur
-                        ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
+                        ON o.valid_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
                     LEFT JOIN reference_observations r_vent
-                        ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
+                        ON o.valid_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
                     LEFT JOIN (
                         SELECT
                             valid_time_utc,
