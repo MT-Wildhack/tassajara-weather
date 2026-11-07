@@ -3378,6 +3378,35 @@ else:
                 obs_tmp["valid_time_utc"], utc=True
             ).dt.floor("h")
             obs_dedup = obs_tmp.drop_duplicates(subset=["_obs_dt_utc"]).set_index("_obs_dt_utc")
+            
+            existing_dts = set(combined_df["_sort_dt_utc"])
+            missing_obs = obs_tmp[~obs_tmp["_obs_dt_utc"].isin(existing_dts)].copy()
+            if not missing_obs.empty:
+                missing_rows = []
+                for _, mo in missing_obs.iterrows():
+                    dt_utc = mo["_obs_dt_utc"]
+                    missing_rows.append({
+                        "valid_time_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        "actual_temp_c": mo.get("temp_c"),
+                        "actual_dewpoint_c": mo.get("dewpoint_c"),
+                        "actual_rh_pct": mo.get("rh_pct"),
+                        "actual_precip_mm": mo.get("precip_1hr_mm", 0.0),
+                        "actual_wind_gust_ms": mo.get("wind_gust_ms", 0.0),
+                        "raw_nws_temp_c": mo.get("temp_c"),
+                        "corrected_temp_c": mo.get("temp_c"),
+                        "corrected_temp_p10_c": mo.get("temp_c") - 1.0,
+                        "corrected_temp_p90_c": mo.get("temp_c") + 1.0,
+                        "_sort_dt_utc": dt_utc,
+                        "valid_local": dt_utc.tz_convert(LOCAL_TZ),
+                    })
+                if missing_rows:
+                    combined_df = pd.concat([combined_df, pd.DataFrame(missing_rows)], ignore_index=True, sort=False)
+                    combined_df = (
+                        combined_df.sort_values("_sort_dt_utc")
+                        .drop_duplicates(subset=["_sort_dt_utc"], keep="last")
+                        .reset_index(drop=True)
+                    )
+
             for col_dest, col_src in [
                 ("actual_temp_c", "temp_c"),
                 ("actual_dewpoint_c", "dewpoint_c"),
