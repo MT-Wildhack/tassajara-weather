@@ -1359,8 +1359,19 @@ def load_all_dashboard_data():
     try:
         live_refs = fetch_regional_reference_stations()
         if isinstance(live_refs, dict):
+            ref_db_rows = []
             for stid, rdata in live_refs.items():
                 if isinstance(rdata, dict) and rdata.get("online") and rdata.get("temp_c") is not None:
+                    ref_db_rows.append((
+                        now_hour_iso,
+                        stid,
+                        float(rdata["temp_c"]),
+                        safe_float(rdata.get("rh_pct"), None),
+                        safe_float(rdata.get("wind_speed_ms"), 0.0),
+                        safe_float(rdata.get("wind_gust_ms"), 0.0),
+                        safe_float(rdata.get("wind_dir_deg"), 0.0),
+                        safe_float(rdata.get("precip_1hr_mm"), 0.0),
+                    ))
                     meta = REFERENCE_STATIONS.get(stid, {})
                     ref_dict[stid] = {
                         "station_id": stid,

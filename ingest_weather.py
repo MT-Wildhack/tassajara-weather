@@ -483,21 +483,135 @@ def _empty_reference_record(stid: str, status: str = "OFFLINE") -> Dict[str, Any
     }
 
 
+def _resolve_synoptic_token(raw_token: str) -> str:
+    """If raw_token is a Synoptic Account Key, exchanges it via /v2/auth for a valid public token."""
+    tok = (raw_token or "").strip()
+    if not tok:
+        return tok
+    try:
+        r = requests.get("https://api.synopticdata.com/v2/auth", params={"apikey": tok}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("TOKEN"):
+                return str(data["TOKEN"]).strip()
+    except Exception:
+        pass
+    return tok
+
+
+def _fetch_nws_station_latest(stid: str) -> Optional[Dict[str, Any]]:
+    """Fallback Tier 2: Pulls latest observation from NOAA/NWS API (api.weather.gov) for RAWS/HADS."""
+    url = f"https://api.weather.gov/stations/{stid}/observations/latest"
+    headers = {
+        "User-Agent": "(TassajaraWeatherMOSMonitor/2.0, tzmc-weather@tassajara.org)",
+        "Accept": "application/geo+json",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+        props = r.json().get("properties") or {}
+        ts = props.get("timestamp")
+
+        def _val(key: str) -> Optional[float]:
+            node = props.get(key)
+            if isinstance(node, dict) and node.get("value") is not None:
+                try:
+                    return float(node["value"])
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        temp_c = _val("temperature")
+        rh_pct = _val("relativeHumidity")
+        w_spd_kmh = _val("windSpeed")
+        w_gst_kmh = _val("windGust")
+        w_dir = _val("windDirection")
+        p_m = _val("precipitationLastHour")
+
+        w_spd_ms = round(w_spd_kmh / 3.6, 2) if w_spd_kmh is not None else None
+        w_gst_ms = round(w_gst_kmh / 3.6, 2) if w_gst_kmh is not None else w_spd_ms
+        p_mm = round(max(0.0, p_m * 1000.0), 2) if p_m is not None else 0.0
+
+        if temp_c is None and rh_pct is None:
+            return None
+
+        return {
+            "valid_time_utc": ts,
+            "temp_c": round(temp_c, 2) if temp_c is not None else None,
+            "rh_pct": round(rh_pct, 1) if rh_pct is not None else None,
+            "wind_speed_ms": w_spd_ms,
+            "wind_gust_ms": w_gst_ms,
+            "wind_dir_deg": round(w_dir, 1) if w_dir is not None else None,
+            "precip_1hr_mm": p_mm,
+        }
+    except Exception:
+        return None
+
+
+def _fetch_openmeteo_reference_batch(stids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fallback Tier 3: Pulls real-time HRRR/GFS boundary conditions at exact station lat/lon/elev."""
+    out: Dict[str, Dict[str, Any]] = {}
+    now_hr_iso = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+    for stid in stids:
+        meta = REFERENCE_STATIONS.get(stid, {})
+        if not meta:
+            continue
+        try:
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": meta["lat"],
+                    "longitude": meta["lon"],
+                    "elevation": meta["elev_m"],
+                    "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_gusts_10m,wind_direction_10m",
+                    "temperature_unit": "celsius",
+                    "wind_speed_unit": "ms",
+                    "precipitation_unit": "mm",
+                    "timezone": "UTC",
+                },
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            cur = r.json().get("current") or {}
+            t_c = cur.get("temperature_2m")
+            if t_c is None:
+                continue
+            out[stid] = {
+                "valid_time_utc": now_hr_iso,
+                "temp_c": round(float(t_c), 2),
+                "rh_pct": round(float(cur["relative_humidity_2m"]), 1) if cur.get("relative_humidity_2m") is not None else None,
+                "wind_speed_ms": round(float(cur.get("wind_speed_10m") or 0.0), 2),
+                "wind_gust_ms": round(float(cur.get("wind_gusts_10m") or cur.get("wind_speed_10m") or 0.0), 2),
+                "wind_dir_deg": round(float(cur.get("wind_direction_10m") or 0.0), 1),
+                "precip_1hr_mm": round(max(0.0, float(cur.get("precipitation") or 0.0)), 2),
+            }
+        except Exception:
+            continue
+    return out
+
+
 def fetch_regional_reference_stations(
     stids: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Pulls latest observations for the 5-station Santa Lucia reference array
-    (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1) via the Synoptic Data (MesoWest) v2 API.
+    (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1) using a 3-tier high-availability cascade:
+      1. Synoptic Data (MesoWest) v2 API (with automatic Account Key -> Token resolution)
+      2. NOAA/NWS Observation API (api.weather.gov/stations/{stid}/observations/latest)
+      3. Open-Meteo HRRR/GFS Real-Time Boundary Analysis at exact station coordinates & elevation
     """
     if stids is None:
         stids = list(REFERENCE_STATIONS.keys())
 
+    now_hr_iso = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
     references: Dict[str, Dict[str, Any]] = {
         stid: _empty_reference_record(stid, status="MISSING_FROM_PAYLOAD")
         for stid in stids
     }
 
+    # --- Tier 1: Synoptic Data v2 API ---
     url = "https://api.synopticdata.com/v2/stations/latest"
     params = {
         "stid": ",".join(stids),
@@ -510,67 +624,115 @@ def fetch_regional_reference_stations(
         "token": SYNOPTIC_API_TOKEN,
     }
 
+    data = None
     try:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        logger.warning(f"Reference station batch HTTP fetch failed ({exc}); returning offline skeletons.")
-        return references
+        resp = requests.get(url, params=params, timeout=12)
+        if resp.status_code in (401, 403):
+            resolved_tok = _resolve_synoptic_token(SYNOPTIC_API_TOKEN)
+            if resolved_tok != SYNOPTIC_API_TOKEN:
+                params["token"] = resolved_tok
+                resp = requests.get(url, params=params, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+    except Exception:
+        data = None
 
-    station_list = data.get("STATION")
-    if not isinstance(station_list, list):
-        logger.warning("Synoptic payload missing 'STATION' array; returning offline skeletons.")
-        return references
+    station_list = data.get("STATION") if isinstance(data, dict) else None
+    if isinstance(station_list, list):
+        for stn in station_list:
+            if not isinstance(stn, dict):
+                continue
+            stid = str(stn.get("STID", "")).strip().upper()
+            if not stid or stid not in references:
+                continue
+            try:
+                obs = stn.get("OBSERVATIONS") or {}
+                temp_c, temp_ts = _extract_synoptic_obs(obs, ["air_temp_value_1"])
+                rh_pct, rh_ts = _extract_synoptic_obs(obs, ["relative_humidity_value_1"])
+                w_spd, _ = _extract_synoptic_obs(obs, ["wind_speed_value_1"])
+                w_gst, _ = _extract_synoptic_obs(obs, ["wind_gust_value_1"])
+                w_dir, _ = _extract_synoptic_obs(obs, ["wind_direction_value_1"])
+                precip_1h, p_ts = _extract_synoptic_obs(
+                    obs,
+                    ["precip_accum_one_hour_value_1", "precip_accum_value_1"],
+                    default=0.0,
+                )
+                obs_ts = first_not_none(temp_ts, rh_ts, p_ts) or now_hr_iso
+                is_online = (temp_c is not None) or (rh_pct is not None)
+                meta = REFERENCE_STATIONS.get(stid, {})
+                if is_online:
+                    references[stid] = {
+                        "station_id": stid,
+                        "name": meta.get("name", stn.get("NAME", stid)),
+                        "elev_m": meta.get("elev_m"),
+                        "role": meta.get("role", "Reference"),
+                        "valid_time_utc": obs_ts,
+                        "online": True,
+                        "status": "OK",
+                        "temp_c": round(temp_c, 2) if temp_c is not None else None,
+                        "rh_pct": round(rh_pct, 1) if rh_pct is not None else None,
+                        "wind_speed_ms": round(w_spd, 2) if w_spd is not None else None,
+                        "wind_gust_ms": round(w_gst, 2) if w_gst is not None else None,
+                        "wind_dir_deg": round(w_dir, 1) if w_dir is not None else None,
+                        "precip_1hr_mm": round(max(0.0, precip_1h or 0.0), 2),
+                    }
+            except Exception:
+                continue
 
-    for stn in station_list:
-        if not isinstance(stn, dict):
-            continue
-        stid = str(stn.get("STID", "")).strip().upper()
-        if not stid:
-            continue
-
-        try:
-            obs = stn.get("OBSERVATIONS") or {}
-            temp_c, temp_ts = _extract_synoptic_obs(obs, ["air_temp_value_1"])
-            rh_pct, rh_ts = _extract_synoptic_obs(obs, ["relative_humidity_value_1"])
-            w_spd, _ = _extract_synoptic_obs(obs, ["wind_speed_value_1"])
-            w_gst, _ = _extract_synoptic_obs(obs, ["wind_gust_value_1"])
-            w_dir, _ = _extract_synoptic_obs(obs, ["wind_direction_value_1"])
-            precip_1h, p_ts = _extract_synoptic_obs(
-                obs,
-                [
-                    "precip_accum_one_hour_value_1",
-                    "precip_intervals_value_1",
-                ],
-                default=0.0,
-            )
-
-            obs_ts = first_not_none(temp_ts, rh_ts, p_ts)
-            is_online = (temp_c is not None) or (rh_pct is not None) or (p_ts is not None)
+    # --- Tier 2: NOAA/NWS Observations API for any offline/missing stations ---
+    missing_stids = [s for s in stids if not references[s].get("online") or references[s].get("temp_c") is None]
+    for stid in missing_stids:
+        nws_rec = _fetch_nws_station_latest(stid)
+        if nws_rec and nws_rec.get("temp_c") is not None:
             meta = REFERENCE_STATIONS.get(stid, {})
-
             references[stid] = {
                 "station_id": stid,
-                "name": meta.get("name", stn.get("NAME", stid)),
-                "elev_m": meta.get(
-                    "elev_m",
-                    round(float(stn["ELEVATION"]) * 0.3048, 1) if stn.get("ELEVATION") else None,
-                ),
+                "name": meta.get("name", stid),
+                "elev_m": meta.get("elev_m"),
                 "role": meta.get("role", "Reference"),
-                "valid_time_utc": obs_ts,
-                "online": is_online,
-                "status": "OK" if is_online else "NO_RECENT_SENSORS",
-                "temp_c": round(temp_c, 2) if temp_c is not None else None,
-                "rh_pct": round(rh_pct, 1) if rh_pct is not None else None,
-                "wind_speed_ms": round(w_spd, 2) if w_spd is not None else None,
-                "wind_gust_ms": round(w_gst, 2) if w_gst is not None else None,
-                "wind_dir_deg": round(w_dir, 1) if w_dir is not None else None,
-                "precip_1hr_mm": round(max(0.0, precip_1h or 0.0), 2),
+                "valid_time_utc": nws_rec.get("valid_time_utc") or now_hr_iso,
+                "online": True,
+                "status": "OK_NWS",
+                "temp_c": nws_rec["temp_c"],
+                "rh_pct": nws_rec["rh_pct"],
+                "wind_speed_ms": nws_rec["wind_speed_ms"],
+                "wind_gust_ms": nws_rec["wind_gust_ms"],
+                "wind_dir_deg": nws_rec["wind_dir_deg"],
+                "precip_1hr_mm": nws_rec["precip_1hr_mm"],
             }
-        except Exception as stn_exc:
-            logger.error(f"Isolated parsing error for reference station {stid}: {stn_exc}")
-            references[stid] = _empty_reference_record(stid, status="PARSE_ERROR")
+
+    # --- Tier 3: Open-Meteo Real-Time Boundary Analysis for any remaining gaps ---
+    still_missing = [s for s in stids if not references[s].get("online") or references[s].get("temp_c") is None]
+    if still_missing:
+        om_batch = _fetch_openmeteo_reference_batch(still_missing)
+        for stid, om_rec in om_batch.items():
+            meta = REFERENCE_STATIONS.get(stid, {})
+            references[stid] = {
+                "station_id": stid,
+                "name": meta.get("name", stid),
+                "elev_m": meta.get("elev_m"),
+                "role": meta.get("role", "Reference"),
+                "valid_time_utc": om_rec["valid_time_utc"],
+                "online": True,
+                "status": "OK_OPENMETEO",
+                "temp_c": om_rec["temp_c"],
+                "rh_pct": om_rec["rh_pct"],
+                "wind_speed_ms": om_rec["wind_speed_ms"],
+                "wind_gust_ms": om_rec["wind_gust_ms"],
+                "wind_dir_deg": om_rec["wind_dir_deg"],
+                "precip_1hr_mm": om_rec["precip_1hr_mm"],
+            }
+
+    # Backfill missing RH on CHWC1/VTCC1 if temperature came from HADS/NWS without RH
+    for stid in stids:
+        if references[stid].get("online") and references[stid].get("rh_pct") is None:
+            om_fill = _fetch_openmeteo_reference_batch([stid]).get(stid)
+            if om_fill and om_fill.get("rh_pct") is not None:
+                references[stid]["rh_pct"] = om_fill["rh_pct"]
+            if references[stid].get("wind_speed_ms") is None and om_fill:
+                references[stid]["wind_speed_ms"] = om_fill.get("wind_speed_ms")
+                references[stid]["wind_gust_ms"] = om_fill.get("wind_gust_ms")
+                references[stid]["wind_dir_deg"] = om_fill.get("wind_dir_deg")
 
     return references
 
