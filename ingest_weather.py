@@ -28,7 +28,7 @@ WEATHERLINK_API_SECRET = (os.getenv("WL_API_SECRET") or "").strip() or "ffnphp69
 WEATHERLINK_BASE_URL = "https://api.weatherlink.com/v2"
 
 # Synoptic Data (MesoWest) public token for RAWS/CNRFC/HADS stations
-SYNOPTIC_API_TOKEN = (os.getenv("SYNOPTIC_TOKEN") or "").strip() or "959822b9da094eabb0e41b8a5a7dcaa5"
+SYNOPTIC_API_TOKEN = (os.getenv("SYNOPTIC_TOKEN") or "").strip() or "ee99ea4962204176a8fccdd037b046d7"
 
 # Primary Tassajara Station ID (Stone Office Vantage Pro2)
 DEFAULT_TASSAJARA_STATION_ID = 36966
