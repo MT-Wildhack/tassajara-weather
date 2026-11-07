@@ -2555,6 +2555,34 @@ def render_layman_forecast_view(
     if not future_fc_df.empty:
         st.subheader("7-Day Tassajara Canyon Forecast")
         d_df = future_fc_df.copy()
+        if obs_df is not None and not obs_df.empty and "valid_time_utc" in obs_df.columns:
+            today_local_date = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ).date()
+            obs_today = obs_df.copy()
+            obs_today["valid_local"] = (
+                pd.to_datetime(obs_today["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+            )
+            obs_today = obs_today[obs_today["valid_local"].dt.date == today_local_date].copy()
+            if not obs_today.empty:
+                obs_today["corrected_temp_c"] = obs_today["temp_c"]
+                obs_today["corrected_temp_p10_c"] = obs_today["temp_c"]
+                obs_today["mos_pop_pct"] = 0.0
+                obs_today["nws_pop_pct"] = 0.0
+                obs_today["mos_qpf_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
+                obs_today["nws_qpf_1hr_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
+                obs_today["nws_sky_cover_pct"] = 20.0
+                obs_today["corrected_wind_gust_ms"] = get_col(
+                    obs_today, "wind_gust_ms", get_col(obs_today, "wind_speed_ms", 0.0)
+                )
+                obs_today["nws_wind_speed_ms"] = get_col(obs_today, "wind_speed_ms", 0.0)
+                d_df = pd.concat([obs_today, d_df], ignore_index=True, sort=False)
+                d_df["_hr_utc"] = pd.to_datetime(d_df["valid_time_utc"], utc=True).dt.floor("h")
+                d_df = (
+                    d_df.sort_values("_hr_utc")
+                    .drop_duplicates(subset=["_hr_utc"], keep="first")
+                    .drop(columns=["_hr_utc"])
+                    .reset_index(drop=True)
+                )
+
         d_df["valid_local"] = (
             pd.to_datetime(d_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
         )
@@ -2563,11 +2591,7 @@ def render_layman_forecast_view(
         d_df["Date_Short"] = d_df["valid_local"].dt.strftime("%b %d")
         d_df["Sort_Date"] = d_df["valid_local"].dt.date
 
-        d_df["_t_f"] = (
-            c_to_f(get_col(d_df, "corrected_temp_c", 15.0))
-            .rolling(window=3, center=True, min_periods=1)
-            .mean()
-        )
+        d_df["_t_f"] = c_to_f(get_col(d_df, "corrected_temp_c", 15.0))
         d_df["_p10_f"] = c_to_f(
             get_col(d_df, "corrected_temp_p10_c", get_col(d_df, "corrected_temp_c", 15.0) - 2.1)
         )
@@ -3655,6 +3679,49 @@ else:
     if not future_fc_df.empty:
         st.subheader("7-Day Synoptic, Hydrological & Canyon Road Risk Outlook")
         daily_df = filter_future_horizon(future_fc_df, now_hour_utc).copy()
+        if not obs_df.empty and "valid_time_utc" in obs_df.columns:
+            today_local_date = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ).date()
+            obs_today_sci = obs_df.copy()
+            obs_today_sci["valid_local"] = (
+                pd.to_datetime(obs_today_sci["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+            )
+            obs_today_sci = obs_today_sci[obs_today_sci["valid_local"].dt.date == today_local_date].copy()
+            if not obs_today_sci.empty:
+                obs_today_sci["corrected_temp_c"] = obs_today_sci["temp_c"]
+                obs_today_sci["corrected_temp_p10_c"] = obs_today_sci["temp_c"]
+                obs_today_sci["corrected_temp_p90_c"] = obs_today_sci["temp_c"]
+                obs_today_sci["raw_nws_temp_c"] = obs_today_sci["temp_c"]
+                if not verify_df.empty and "valid_time_utc" in verify_df.columns:
+                    v_map = (
+                        verify_df.drop_duplicates(subset=["valid_time_utc"])
+                        .set_index("valid_time_utc")
+                    )
+                    if "raw_nws_temp_c" in v_map.columns:
+                        obs_today_sci["raw_nws_temp_c"] = (
+                            obs_today_sci["valid_time_utc"]
+                            .map(v_map["raw_nws_temp_c"])
+                            .combine_first(obs_today_sci["temp_c"])
+                        )
+                obs_today_sci["nws_pop_pct"] = 0.0
+                obs_today_sci["mos_pop_pct"] = 0.0
+                obs_today_sci["nws_qpf_1hr_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
+                obs_today_sci["mos_qpf_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
+                obs_today_sci["mos_qpf_p90_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
+                obs_today_sci["corrected_rh_pct"] = get_col(obs_today_sci, "rh_pct", 45.0)
+                obs_today_sci["nws_rh_pct"] = get_col(obs_today_sci, "rh_pct", 45.0)
+                obs_today_sci["corrected_wind_gust_ms"] = get_col(
+                    obs_today_sci, "wind_gust_ms", get_col(obs_today_sci, "wind_speed_ms", 0.0)
+                )
+                obs_today_sci["nws_wind_gust_ms"] = obs_today_sci["corrected_wind_gust_ms"]
+                obs_today_sci["nws_wind_speed_ms"] = get_col(obs_today_sci, "wind_speed_ms", 0.0)
+                daily_df = pd.concat([obs_today_sci, daily_df], ignore_index=True, sort=False)
+                daily_df["_hr_utc"] = pd.to_datetime(daily_df["valid_time_utc"], utc=True).dt.floor("h")
+                daily_df = (
+                    daily_df.sort_values("_hr_utc")
+                    .drop_duplicates(subset=["_hr_utc"], keep="first")
+                    .drop(columns=["_hr_utc"])
+                    .reset_index(drop=True)
+                )
         daily_df["valid_local"] = (
             pd.to_datetime(daily_df["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
         )
