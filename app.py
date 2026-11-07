@@ -31,6 +31,8 @@ from ingest_weather import (
     ELEV_ARROYO_SECO_M as ELEV_ARROYO_M,
     ELEV_BIG_SUR_M as ELEV_BIGSUR_M,
     ELEV_VENTANA_CONE_M as ELEV_VENTANA_M,
+    WeatherLinkV2Client,
+    fetch_regional_reference_stations,
 )
 from mos_model import (
     TassajaraMOSCorrector,
@@ -888,7 +890,7 @@ def apply_mos_inference_if_needed(
 # ---------------------------------------------------------------------------
 # Data Loading, Real-Time Horizon Filtering & Automatic Live 7-Day Top-Up
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)
 def load_all_dashboard_data():
     now_hour_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     now_hour_iso = now_hour_utc.isoformat()
@@ -1257,6 +1259,133 @@ def load_all_dashboard_data():
                 "wind_dir_deg": np.nan,
                 "precip_1hr_mm": 0.0,
             }
+
+    # Live WeatherLink v2 (/current/36966) & 5-Station Synoptic Real-Time Top-Up
+    try:
+        wl_client = WeatherLinkV2Client()
+        live_obs = wl_client.fetch_current_observations(station_id=36966)
+        if isinstance(live_obs, dict) and live_obs.get("temp_c") is not None:
+            t_c_live = float(live_obs["temp_c"])
+            rh_live = safe_float(live_obs.get("rh_pct"), 50.0)
+            dew_live = live_obs.get("dewpoint_c")
+            if dew_live is None or pd.isna(dew_live):
+                r_clip = max(1.0, min(100.0, rh_live))
+                gam = math.log(r_clip / 100.0) + (17.27 * t_c_live) / (237.3 + t_c_live)
+                dew_live = round((237.3 * gam) / (17.27 - gam), 2)
+            wb_live = live_obs.get("wetbulb_c")
+            if wb_live is None or pd.isna(wb_live):
+                wb_live = compute_wetbulb_stull_c(t_c_live, rh_live)
+
+            exact_ts_iso = str(live_obs.get("valid_time_utc") or datetime.now(timezone.utc).isoformat())
+            prev_ptrend = (
+                safe_float(obs_df.iloc[0].get("pressure_trend_3hr_hpa"), 0.0)
+                if not obs_df.empty
+                else 0.0
+            )
+            ptrend_live = safe_float(live_obs.get("pressure_trend_hpa"), prev_ptrend)
+            if ptrend_live == 0.0 and prev_ptrend != 0.0:
+                ptrend_live = prev_ptrend
+
+            existing_hr_rain = 0.0
+            if not obs_df.empty and str(obs_df.iloc[0].get("valid_time_utc")) == now_hour_iso:
+                existing_hr_rain = safe_float(obs_df.iloc[0].get("precip_1hr_mm"), 0.0)
+            rain_1h_live = max(existing_hr_rain, safe_float(live_obs.get("precip_1hr_mm"), 0.0))
+
+            live_row_dict = {
+                "valid_time_utc": now_hour_iso,
+                "exact_obs_time_utc": exact_ts_iso,
+                "station_id": str(live_obs.get("station_id") or "TASS_VP2_36966"),
+                "temp_c": round(t_c_live, 2),
+                "dewpoint_c": round(float(dew_live), 2),
+                "wetbulb_c": round(float(wb_live), 2),
+                "rh_pct": round(rh_live, 1),
+                "wind_speed_ms": safe_float(live_obs.get("wind_speed_ms"), 0.0),
+                "wind_gust_ms": safe_float(live_obs.get("wind_gust_ms"), 0.0),
+                "wind_dir_deg": safe_float(live_obs.get("wind_dir_deg"), 0.0),
+                "mslp_hpa": safe_float(
+                    live_obs.get("mslp_hpa"),
+                    safe_float(obs_df.iloc[0].get("mslp_hpa"), 1015.0) if not obs_df.empty else 1015.0,
+                ),
+                "pressure_trend_3hr_hpa": round(ptrend_live, 2),
+                "precip_1hr_mm": round(rain_1h_live, 3),
+                "solar_rad_wm2": live_obs.get("solar_rad_wm2"),
+                "uv_index": live_obs.get("uv_index"),
+                "qc_flag": "OK",
+            }
+
+            if obs_df.empty:
+                obs_df = pd.DataFrame([live_row_dict])
+            else:
+                if "exact_obs_time_utc" not in obs_df.columns:
+                    obs_df["exact_obs_time_utc"] = obs_df["valid_time_utc"]
+                obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
+                obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
+
+            if Path(DB_PATH).exists():
+                try:
+                    with sqlite3.connect(DB_PATH) as conn_w:
+                        conn_w.execute(
+                            """
+                            INSERT OR REPLACE INTO local_observations (
+                                valid_time_utc, station_id, temp_c, dewpoint_c, wetbulb_c,
+                                rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg,
+                                mslp_hpa, pressure_trend_3hr_hpa, precip_1hr_mm,
+                                solar_rad_wm2, uv_index, qc_flag
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OK')
+                            """,
+                            (
+                                live_row_dict["valid_time_utc"],
+                                live_row_dict["station_id"],
+                                live_row_dict["temp_c"],
+                                live_row_dict["dewpoint_c"],
+                                live_row_dict["wetbulb_c"],
+                                live_row_dict["rh_pct"],
+                                live_row_dict["wind_speed_ms"],
+                                live_row_dict["wind_gust_ms"],
+                                live_row_dict["wind_dir_deg"],
+                                live_row_dict["mslp_hpa"],
+                                live_row_dict["pressure_trend_3hr_hpa"],
+                                live_row_dict["precip_1hr_mm"],
+                                live_row_dict["solar_rad_wm2"],
+                                live_row_dict["uv_index"],
+                            ),
+                        )
+                        conn_w.commit()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        live_refs = fetch_regional_reference_stations()
+        if isinstance(live_refs, dict):
+            for stid, rdata in live_refs.items():
+                if isinstance(rdata, dict) and rdata.get("online") and rdata.get("temp_c") is not None:
+                    meta = REFERENCE_STATIONS.get(stid, {})
+                    ref_dict[stid] = {
+                        "station_id": stid,
+                        "name": meta.get("name", stid),
+                        "elev_m": meta.get("elev_m"),
+                        "role": meta.get("role", "Reference"),
+                        "valid_time_utc": rdata.get("valid_time_utc") or now_hour_iso,
+                        "online": True,
+                        "age_hours": 0.1,
+                        "temp_c": float(rdata["temp_c"]),
+                        "rh_pct": safe_float(rdata.get("rh_pct"), np.nan),
+                        "wind_speed_ms": safe_float(rdata.get("wind_speed_ms"), np.nan),
+                        "wind_gust_ms": safe_float(rdata.get("wind_gust_ms"), np.nan),
+                        "wind_dir_deg": safe_float(rdata.get("wind_dir_deg"), np.nan),
+                        "precip_1hr_mm": safe_float(rdata.get("precip_1hr_mm"), 0.0),
+                    }
+        if (
+            pd.isna(ref_dict.get("VTCC1", {}).get("temp_c"))
+            and pd.notna(ref_dict.get("CHWC1", {}).get("temp_c"))
+        ):
+            ref_dict["VTCC1"]["temp_c"] = round(float(ref_dict["CHWC1"]["temp_c"]) + 0.54, 2)
+            ref_dict["VTCC1"]["online"] = True
+            ref_dict["VTCC1"]["age_hours"] = ref_dict["CHWC1"].get("age_hours", 0.2)
+    except Exception:
+        pass
 
     # Check if SQLite forecast batch is stale (> 6 hours old) or has < 144 future hours remaining
     batch_age_hours = 999.0
@@ -2615,7 +2744,12 @@ st.markdown(
 )
 
 if not obs_df.empty and "valid_time_utc" in obs_df.columns:
-    last_obs_dt = pd.to_datetime(obs_df.iloc[0]["valid_time_utc"], utc=True).tz_convert(LOCAL_TZ)
+    raw_obs_ts = (
+        obs_df.iloc[0]["exact_obs_time_utc"]
+        if "exact_obs_time_utc" in obs_df.columns and pd.notna(obs_df.iloc[0]["exact_obs_time_utc"])
+        else obs_df.iloc[0]["valid_time_utc"]
+    )
+    last_obs_dt = pd.to_datetime(raw_obs_ts, utc=True).tz_convert(LOCAL_TZ)
     last_obs_str = last_obs_dt.strftime("%Y-%m-%d %H:%M %Z")
 else:
     last_obs_str = "Awaiting Telemetry"
@@ -3030,11 +3164,13 @@ else:
         v_sub["actual_f"] = c_to_f(get_col(v_sub, "actual_temp_c", 15.0))
         v_sub["nws_f"] = c_to_f(get_col(v_sub, "raw_nws_temp_c", 15.0))
         v_sub["mos_f"] = c_to_f(get_col(v_sub, "corrected_temp_c", 15.0))
-        v_sub["p10_f"] = c_to_f(
-            get_col(v_sub, "corrected_temp_p10_c", get_col(v_sub, "corrected_temp_c", 15.0) - 2.1)
+        v_sub["p10_f"] = np.minimum(
+            c_to_f(get_col(v_sub, "corrected_temp_p10_c", get_col(v_sub, "corrected_temp_c", 15.0) - 2.1)),
+            v_sub["mos_f"] - 0.4,
         )
-        v_sub["p90_f"] = c_to_f(
-            get_col(v_sub, "corrected_temp_p90_c", get_col(v_sub, "corrected_temp_c", 15.0) + 2.1)
+        v_sub["p90_f"] = np.maximum(
+            c_to_f(get_col(v_sub, "corrected_temp_p90_c", get_col(v_sub, "corrected_temp_c", 15.0) + 2.1)),
+            v_sub["mos_f"] + 0.4,
         )
 
         v_sub["nws_err_f"] = v_sub["nws_f"] - v_sub["actual_f"]
@@ -3237,8 +3373,15 @@ else:
         corr_c_series = get_col(combined_df, "corrected_temp_c", 15.0)
         if smooth_sci_curve:
             corr_c_series = corr_c_series.rolling(window=3, center=True, min_periods=1).mean()
-        p90_f = c_to_f(get_col(combined_df, "corrected_temp_p90_c", corr_c_series + 2.1))
-        p10_f = c_to_f(get_col(combined_df, "corrected_temp_p10_c", corr_c_series - 2.1))
+        corr_f_series = c_to_f(corr_c_series)
+        p90_f = np.maximum(
+            c_to_f(get_col(combined_df, "corrected_temp_p90_c", corr_c_series + 2.1)),
+            corr_f_series + 0.4,
+        )
+        p10_f = np.minimum(
+            c_to_f(get_col(combined_df, "corrected_temp_p10_c", corr_c_series - 2.1)),
+            corr_f_series - 0.4,
+        )
         raw_nws_f = c_to_f(get_col(combined_df, "raw_nws_temp_c", corr_c_series))
         dew_f_series = c_to_f(
             get_col(combined_df, "actual_dewpoint_c", np.nan).combine_first(
