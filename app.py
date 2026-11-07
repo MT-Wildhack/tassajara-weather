@@ -3350,7 +3350,14 @@ else:
 
         fut_pool = filter_future_horizon(future_fc_df, now_hour_utc)
         fut_sub = fut_pool.head(max_future_hrs).copy() if not fut_pool.empty else pd.DataFrame()
-        past_sub = verify_df.tail(past_hrs).copy() if not verify_df.empty else pd.DataFrame()
+        
+        cutoff_past_dt = pd.Timestamp(now_hour_utc) - pd.Timedelta(hours=past_hrs)
+        if not verify_df.empty and "valid_time_utc" in verify_df.columns:
+            v_tmp = verify_df.copy()
+            v_tmp["_dt_utc"] = pd.to_datetime(v_tmp["valid_time_utc"], utc=True).dt.floor("h")
+            past_sub = v_tmp[(v_tmp["_dt_utc"] >= cutoff_past_dt) & (v_tmp["_dt_utc"] < pd.Timestamp(now_hour_utc))].copy()
+        else:
+            past_sub = pd.DataFrame()
 
         if not past_sub.empty and not fut_sub.empty:
             past_dt = pd.to_datetime(past_sub["valid_time_utc"], utc=True).dt.floor("h")
