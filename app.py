@@ -3347,15 +3347,23 @@ else:
             "7-Day Forecast + Past 7-Day Hindcast": (168, 168),
         }
         max_future_hrs, past_hrs = horizon_map.get(horizon_choice, (72, 48))
+        cutoff_past_dt = pd.Timestamp(now_hour_utc) - pd.Timedelta(hours=past_hrs)
+        cutoff_future_dt = pd.Timestamp(now_hour_utc) + pd.Timedelta(hours=max_future_hrs)
 
         fut_pool = filter_future_horizon(future_fc_df, now_hour_utc)
         fut_sub = fut_pool.head(max_future_hrs).copy() if not fut_pool.empty else pd.DataFrame()
-        
-        cutoff_past_dt = pd.Timestamp(now_hour_utc) - pd.Timedelta(hours=past_hrs)
+
         if not verify_df.empty and "valid_time_utc" in verify_df.columns:
             v_tmp = verify_df.copy()
             v_tmp["_dt_utc"] = pd.to_datetime(v_tmp["valid_time_utc"], utc=True).dt.floor("h")
-            past_sub = v_tmp[(v_tmp["_dt_utc"] >= cutoff_past_dt) & (v_tmp["_dt_utc"] < pd.Timestamp(now_hour_utc))].copy()
+            past_sub = (
+                v_tmp[
+                    (v_tmp["_dt_utc"] >= cutoff_past_dt)
+                    & (v_tmp["_dt_utc"] < pd.Timestamp(now_hour_utc))
+                ]
+                .drop(columns=["_dt_utc"])
+                .copy()
+            )
         else:
             past_sub = pd.DataFrame()
 
@@ -3384,8 +3392,13 @@ else:
             obs_tmp["_obs_dt_utc"] = pd.to_datetime(
                 obs_tmp["valid_time_utc"], utc=True
             ).dt.floor("h")
+            # Restrict obs_tmp to the selected [cutoff_past_dt, cutoff_future_dt] horizon
+            obs_tmp = obs_tmp[
+                (obs_tmp["_obs_dt_utc"] >= cutoff_past_dt)
+                & (obs_tmp["_obs_dt_utc"] <= cutoff_future_dt)
+            ].copy()
             obs_dedup = obs_tmp.drop_duplicates(subset=["_obs_dt_utc"]).set_index("_obs_dt_utc")
-            
+
             existing_dts = set(combined_df["_sort_dt_utc"])
             missing_obs = obs_tmp[~obs_tmp["_obs_dt_utc"].isin(existing_dts)].copy()
             if not missing_obs.empty:
@@ -3399,20 +3412,31 @@ else:
                         "actual_rh_pct": mo.get("rh_pct"),
                         "actual_precip_mm": mo.get("precip_1hr_mm", 0.0),
                         "actual_wind_gust_ms": mo.get("wind_gust_ms", 0.0),
-                        "raw_nws_temp_c": mo.get("temp_c"),
-                        "corrected_temp_c": mo.get("temp_c"),
-                        "corrected_temp_p10_c": mo.get("temp_c") - 1.0,
-                        "corrected_temp_p90_c": mo.get("temp_c") + 1.0,
                         "_sort_dt_utc": dt_utc,
                         "valid_local": dt_utc.tz_convert(LOCAL_TZ),
                     })
                 if missing_rows:
-                    combined_df = pd.concat([combined_df, pd.DataFrame(missing_rows)], ignore_index=True, sort=False)
+                    combined_df = pd.concat(
+                        [combined_df, pd.DataFrame(missing_rows)],
+                        ignore_index=True,
+                        sort=False,
+                    )
                     combined_df = (
                         combined_df.sort_values("_sort_dt_utc")
                         .drop_duplicates(subset=["_sort_dt_utc"], keep="last")
                         .reset_index(drop=True)
                     )
+                    for fc_col in [
+                        "raw_nws_temp_c",
+                        "corrected_temp_c",
+                        "corrected_temp_p10_c",
+                        "corrected_temp_p90_c",
+                    ]:
+                        if fc_col in combined_df.columns:
+                            combined_df[fc_col] = (
+                                pd.to_numeric(combined_df[fc_col], errors="coerce")
+                                .interpolate(method="linear", limit_direction="both")
+                            )
 
             for col_dest, col_src in [
                 ("actual_temp_c", "temp_c"),
@@ -3426,6 +3450,17 @@ else:
                 if col_src in obs_dedup.columns:
                     mapped = combined_df["_sort_dt_utc"].map(obs_dedup[col_src])
                     combined_df[col_dest] = combined_df[col_dest].combine_first(mapped)
+
+        # Final strict window clip so combined_df never exceeds [cutoff_past_dt, cutoff_future_dt]
+        combined_df = (
+            combined_df[
+                (combined_df["_sort_dt_utc"] >= cutoff_past_dt)
+                & (combined_df["_sort_dt_utc"] <= cutoff_future_dt)
+            ]
+            .sort_values("_sort_dt_utc")
+            .reset_index(drop=True)
+        )
+        combined_df["valid_local"] = combined_df["_sort_dt_utc"].dt.tz_convert(LOCAL_TZ)
 
         fig = make_subplots(
             rows=3,
