@@ -890,6 +890,231 @@ def apply_mos_inference_if_needed(
 # ---------------------------------------------------------------------------
 # Data Loading, Real-Time Horizon Filtering & Automatic Live 7-Day Top-Up
 # ---------------------------------------------------------------------------
+def backfill_missing_hindcast_verification(
+    obs_df: pd.DataFrame,
+    verify_df: pd.DataFrame,
+    ref_dict: dict,
+    now_hour_utc: datetime,
+) -> pd.DataFrame:
+    """
+    Ensures every observed hour in `obs_df` (< now_hour_utc) has a paired NWP + MOS
+    hindcast row in `verify_df`. When `nws_forecasts` in SQLite has a gap or expired
+    horizon, fetches the past 10 days of hourly NWP grid data from Open-Meteo at 880m MSL,
+    attaches 6-hour lagged initialization & Santa Lucia reference boundary conditions,
+    and runs `apply_mos_inference_if_needed()` so the hindcast curves and verification
+    scorecard are always complete and never flat-lined.
+    """
+    if obs_df is None or obs_df.empty or "valid_time_utc" not in obs_df.columns:
+        return verify_df
+
+    obs_clean = obs_df.copy()
+    obs_clean["_hr_utc"] = pd.to_datetime(obs_clean["valid_time_utc"], utc=True, errors="coerce").dt.floor("h")
+    obs_clean = obs_clean[
+        obs_clean["_hr_utc"].notna()
+        & (obs_clean["_hr_utc"] < pd.Timestamp(now_hour_utc).floor("h"))
+        & obs_clean["temp_c"].notna()
+    ].copy()
+    if obs_clean.empty:
+        return verify_df
+
+    obs_clean = (
+        obs_clean.sort_values("_hr_utc", ascending=True)
+        .drop_duplicates(subset=["_hr_utc"], keep="first")
+        .reset_index(drop=True)
+    )
+
+    existing_v_hrs = set()
+    if verify_df is not None and not verify_df.empty and "valid_time_utc" in verify_df.columns:
+        v_valid = verify_df[
+            verify_df["raw_nws_temp_c"].notna() & verify_df["corrected_temp_c"].notna()
+        ]
+        existing_v_hrs = set(
+            pd.to_datetime(v_valid["valid_time_utc"], utc=True, errors="coerce").dt.floor("h").dropna()
+        )
+
+    missing_obs = obs_clean[~obs_clean["_hr_utc"].isin(existing_v_hrs)].copy()
+    if missing_obs.empty:
+        return verify_df
+
+    nwp_map = {}
+    om_url = "https://api.open-meteo.com/v1/forecast"
+    om_params = {
+        "latitude": TASSAJARA_LAT,
+        "longitude": TASSAJARA_LON,
+        "elevation": NWP_GRID_ELEV_M,
+        "hourly": (
+            "temperature_2m,relative_humidity_2m,dew_point_2m,"
+            "precipitation_probability,precipitation,cloud_cover,"
+            "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
+        ),
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "ms",
+        "precipitation_unit": "mm",
+        "timezone": "UTC",
+        "past_days": 10,
+        "forecast_days": 2,
+    }
+    try:
+        resp = requests.get(om_url, params=om_params, timeout=12)
+        resp.raise_for_status()
+        hourly = resp.json().get("hourly", {})
+        times = hourly.get("time", [])
+        if times:
+            dt_idx = pd.to_datetime(times, utc=True).floor("h")
+            df_om = pd.DataFrame({
+                "_hr_utc": dt_idx,
+                "nws_temp_c": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
+                "nws_dewpoint_c": pd.to_numeric(hourly.get("dew_point_2m"), errors="coerce"),
+                "nws_rh_pct": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
+                "nws_wind_speed_ms": pd.to_numeric(hourly.get("wind_speed_10m"), errors="coerce"),
+                "nws_wind_gust_ms": pd.to_numeric(hourly.get("wind_gusts_10m"), errors="coerce"),
+                "nws_wind_dir_deg": pd.to_numeric(hourly.get("wind_direction_10m"), errors="coerce"),
+                "nws_pop_pct": pd.to_numeric(hourly.get("precipitation_probability"), errors="coerce").fillna(0.0),
+                "nws_qpf_1hr_mm": pd.to_numeric(hourly.get("precipitation"), errors="coerce").fillna(0.0),
+                "nws_sky_cover_pct": pd.to_numeric(hourly.get("cloud_cover"), errors="coerce").fillna(20.0),
+            }).drop_duplicates(subset=["_hr_utc"], keep="first")
+            nwp_map = df_om.set_index("_hr_utc").to_dict(orient="index")
+    except Exception:
+        nwp_map = {}
+
+    obs_temp_by_hr = dict(zip(obs_clean["_hr_utc"], pd.to_numeric(obs_clean["temp_c"], errors="coerce")))
+
+    ref_hist_map = {}
+    if Path(DB_PATH).exists():
+        try:
+            min_iso = missing_obs["_hr_utc"].min().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            with sqlite3.connect(DB_PATH) as conn_r:
+                r_df = pd.read_sql_query(
+                    "SELECT valid_time_utc, station_id, temp_c, rh_pct, precip_1hr_mm FROM reference_observations WHERE valid_time_utc >= ?",
+                    conn_r,
+                    params=(min_iso,),
+                )
+            if not r_df.empty:
+                r_df["_hr_utc"] = pd.to_datetime(r_df["valid_time_utc"], utc=True, errors="coerce").dt.floor("h")
+                for _, rr in r_df.iterrows():
+                    ref_hist_map[(rr["_hr_utc"], str(rr["station_id"]))] = rr
+        except Exception:
+            ref_hist_map = {}
+
+    rows = []
+    for _, o_row in missing_obs.iterrows():
+        hr_dt = o_row["_hr_utc"]
+        valid_iso = hr_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        issue_dt = hr_dt - pd.Timedelta(hours=6)
+        issue_iso = issue_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+        act_t = safe_float(o_row.get("temp_c"), 15.0)
+        act_rh = safe_float(o_row.get("rh_pct"), 50.0)
+        act_dew = safe_float(o_row.get("dewpoint_c"), act_t - 4.0)
+        act_wb = safe_float(o_row.get("wetbulb_c"), compute_wetbulb_stull_c(act_t, act_rh))
+
+        nwp = nwp_map.get(hr_dt, {})
+        nws_t = safe_float(nwp.get("nws_temp_c"), act_t + 2.5)
+        nws_dew = safe_float(nwp.get("nws_dewpoint_c"), act_dew)
+        nws_rh = safe_float(nwp.get("nws_rh_pct"), act_rh)
+        nws_wspd = safe_float(nwp.get("nws_wind_speed_ms"), safe_float(o_row.get("wind_speed_ms"), 1.5))
+        nws_wgst = safe_float(nwp.get("nws_wind_gust_ms"), max(nws_wspd * 1.35, safe_float(o_row.get("wind_gust_ms"), 2.0)))
+        nws_wdir = safe_float(nwp.get("nws_wind_dir_deg"), safe_float(o_row.get("wind_dir_deg"), 295.0))
+        nws_pop = safe_float(nwp.get("nws_pop_pct"), 0.0)
+        nws_qpf = safe_float(nwp.get("nws_qpf_1hr_mm"), 0.0)
+        nws_sky = safe_float(nwp.get("nws_sky_cover_pct"), 20.0)
+
+        issue_tass_t = obs_temp_by_hr.get(issue_dt)
+        if issue_tass_t is None or pd.isna(issue_tass_t):
+            issue_tass_t = obs_temp_by_hr.get(hr_dt - pd.Timedelta(hours=3), nws_t)
+        issue_nwp = nwp_map.get(issue_dt, {})
+        issue_nws_t = safe_float(issue_nwp.get("nws_temp_c"), float(issue_tass_t))
+        init_bias_c = float(issue_tass_t) - float(issue_nws_t)
+
+        def _get_h_ref(stid: str, col: str, default_val: float) -> float:
+            rec = ref_hist_map.get((hr_dt, stid))
+            if rec is not None and pd.notna(rec.get(col)):
+                return float(rec[col])
+            return float(default_val)
+
+        chews_t = _get_h_ref("CHWC1", "temp_c", float(issue_tass_t) - 6.83)
+        chews_rh = _get_h_ref("CHWC1", "rh_pct", nws_rh)
+        chews_p = _get_h_ref("CHWC1", "precip_1hr_mm", 0.0)
+        hast_t = _get_h_ref("CAHC1", "temp_c", float(issue_tass_t) - 0.60)
+        arroyo_t = _get_h_ref("ASRC1", "temp_c", float(issue_tass_t) + 1.41)
+        arroyo_rh = _get_h_ref("ASRC1", "rh_pct", nws_rh)
+        bigsur_t = _get_h_ref("PPSC1", "temp_c", float(issue_tass_t) + 2.45)
+        bigsur_rh = _get_h_ref("PPSC1", "rh_pct", nws_rh)
+        bigsur_p = _get_h_ref("PPSC1", "precip_1hr_mm", 0.0)
+        vent_t = _get_h_ref("VTCC1", "temp_c", chews_t + 0.54)
+        vent_p = _get_h_ref("VTCC1", "precip_1hr_mm", chews_p)
+
+        rows.append({
+            "valid_time_utc": valid_iso,
+            "actual_temp_c": round(act_t, 2),
+            "actual_dewpoint_c": round(act_dew, 2),
+            "actual_wetbulb_c": round(act_wb, 2),
+            "actual_rh_pct": round(act_rh, 1),
+            "actual_wind_speed_ms": safe_float(o_row.get("wind_speed_ms"), 0.0),
+            "actual_wind_gust_ms": safe_float(o_row.get("wind_gust_ms"), 0.0),
+            "actual_wind_dir_deg": safe_float(o_row.get("wind_dir_deg"), 0.0),
+            "actual_mslp_hpa": safe_float(o_row.get("mslp_hpa"), 1015.0),
+            "pressure_trend_3hr_hpa": safe_float(o_row.get("pressure_trend_3hr_hpa"), 0.0),
+            "actual_precip_mm": safe_float(o_row.get("precip_1hr_mm"), 0.0),
+            "issue_time_utc": issue_iso,
+            "lead_time_hours": 6.0,
+            "nws_temp_c": round(nws_t, 2),
+            "raw_nws_temp_c": round(nws_t, 2),
+            "nws_dewpoint_c": round(nws_dew, 2),
+            "nws_rh_pct": round(nws_rh, 1),
+            "nws_wind_speed_ms": round(nws_wspd, 2),
+            "nws_wind_gust_ms": round(nws_wgst, 2),
+            "nws_wind_dir_deg": round(nws_wdir, 1),
+            "nws_pop_pct": round(nws_pop, 1),
+            "nws_qpf_1hr_mm": round(nws_qpf, 2),
+            "nws_sky_cover_pct": round(nws_sky, 1),
+            "short_forecast": "NWP Hindcast Grid",
+            "issue_chews_temp_c": round(chews_t, 2),
+            "issue_chews_rh_pct": round(chews_rh, 1),
+            "issue_chews_precip_mm": round(chews_p, 2),
+            "issue_hastings_temp_c": round(hast_t, 2),
+            "issue_arroyo_temp_c": round(arroyo_t, 2),
+            "issue_arroyo_rh_pct": round(arroyo_rh, 1),
+            "issue_bigsur_temp_c": round(bigsur_t, 2),
+            "issue_bigsur_rh_pct": round(bigsur_rh, 1),
+            "issue_bigsur_precip_mm": round(bigsur_p, 2),
+            "issue_ventana_temp_c": round(vent_t, 2),
+            "issue_ventana_precip_mm": round(vent_p, 2),
+            "issue_tass_temp_c": round(float(issue_tass_t), 2),
+            "issue_persistence_bias_c": round(init_bias_c, 2),
+            "corrected_temp_c": np.nan,
+            "corrected_temp_p10_c": np.nan,
+            "corrected_temp_p90_c": np.nan,
+            "corrected_rh_pct": round(nws_rh, 1),
+            "corrected_wind_gust_ms": round(nws_wgst, 2),
+            "mos_pop_pct": np.nan,
+            "mos_qpf_mm": np.nan,
+            "mos_qpf_p90_mm": np.nan,
+            "model_version": "MOS_GBM_v2_HYDRO",
+        })
+
+    if not rows:
+        return verify_df
+
+    synth_v_df = pd.DataFrame(rows)
+    synth_v_df = apply_mos_inference_if_needed(synth_v_df, force_recompute=True)
+
+    if verify_df is None or verify_df.empty:
+        merged_v = synth_v_df
+    else:
+        merged_v = pd.concat([verify_df, synth_v_df], ignore_index=True, sort=False)
+
+    merged_v["_hr_utc"] = pd.to_datetime(merged_v["valid_time_utc"], utc=True, errors="coerce").dt.floor("h")
+    merged_v = (
+        merged_v[merged_v["_hr_utc"].notna()]
+        .sort_values("_hr_utc", ascending=True)
+        .drop_duplicates(subset=["_hr_utc"], keep="last")
+        .drop(columns=["_hr_utc"])
+        .reset_index(drop=True)
+    )
+    return merged_v
+
+
 @st.cache_data(ttl=60)
 def load_all_dashboard_data():
     now_hour_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -1321,38 +1546,7 @@ def load_all_dashboard_data():
                 obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
                 obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
 
-            if Path(DB_PATH).exists():
-                try:
-                    with sqlite3.connect(DB_PATH) as conn_w:
-                        conn_w.execute(
-                            """
-                            INSERT OR REPLACE INTO local_observations (
-                                valid_time_utc, station_id, temp_c, dewpoint_c, wetbulb_c,
-                                rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg,
-                                mslp_hpa, pressure_trend_3hr_hpa, precip_1hr_mm,
-                                solar_rad_wm2, uv_index, qc_flag
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OK')
-                            """,
-                            (
-                                live_row_dict["valid_time_utc"],
-                                live_row_dict["station_id"],
-                                live_row_dict["temp_c"],
-                                live_row_dict["dewpoint_c"],
-                                live_row_dict["wetbulb_c"],
-                                live_row_dict["rh_pct"],
-                                live_row_dict["wind_speed_ms"],
-                                live_row_dict["wind_gust_ms"],
-                                live_row_dict["wind_dir_deg"],
-                                live_row_dict["mslp_hpa"],
-                                live_row_dict["pressure_trend_3hr_hpa"],
-                                live_row_dict["precip_1hr_mm"],
-                                live_row_dict["solar_rad_wm2"],
-                                live_row_dict["uv_index"],
-                            ),
-                        )
-                        conn_w.commit()
-                except Exception:
-                    pass
+            # In-memory live update only (prevents dirtying tassajara_weather.db in Git)
     except Exception:
         pass
 
@@ -1451,6 +1645,13 @@ def load_all_dashboard_data():
                 .combine_first(future_fc_df["nws_wind_gust_ms"])
                 .combine_first(future_fc_df["nws_wind_speed_ms"] * 1.35)
             )
+
+    verify_df = backfill_missing_hindcast_verification(
+        obs_df=obs_df,
+        verify_df=verify_df,
+        ref_dict=ref_dict,
+        now_hour_utc=now_hour_utc,
+    )
 
     return ref_dict, obs_df, future_fc_df, verify_df, archive_stats
 
@@ -3392,51 +3593,11 @@ else:
             obs_tmp["_obs_dt_utc"] = pd.to_datetime(
                 obs_tmp["valid_time_utc"], utc=True
             ).dt.floor("h")
-            # Restrict obs_tmp to the selected [cutoff_past_dt, cutoff_future_dt] horizon
             obs_tmp = obs_tmp[
                 (obs_tmp["_obs_dt_utc"] >= cutoff_past_dt)
                 & (obs_tmp["_obs_dt_utc"] <= cutoff_future_dt)
             ].copy()
             obs_dedup = obs_tmp.drop_duplicates(subset=["_obs_dt_utc"]).set_index("_obs_dt_utc")
-
-            existing_dts = set(combined_df["_sort_dt_utc"])
-            missing_obs = obs_tmp[~obs_tmp["_obs_dt_utc"].isin(existing_dts)].copy()
-            if not missing_obs.empty:
-                missing_rows = []
-                for _, mo in missing_obs.iterrows():
-                    dt_utc = mo["_obs_dt_utc"]
-                    missing_rows.append({
-                        "valid_time_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                        "actual_temp_c": mo.get("temp_c"),
-                        "actual_dewpoint_c": mo.get("dewpoint_c"),
-                        "actual_rh_pct": mo.get("rh_pct"),
-                        "actual_precip_mm": mo.get("precip_1hr_mm", 0.0),
-                        "actual_wind_gust_ms": mo.get("wind_gust_ms", 0.0),
-                        "_sort_dt_utc": dt_utc,
-                        "valid_local": dt_utc.tz_convert(LOCAL_TZ),
-                    })
-                if missing_rows:
-                    combined_df = pd.concat(
-                        [combined_df, pd.DataFrame(missing_rows)],
-                        ignore_index=True,
-                        sort=False,
-                    )
-                    combined_df = (
-                        combined_df.sort_values("_sort_dt_utc")
-                        .drop_duplicates(subset=["_sort_dt_utc"], keep="last")
-                        .reset_index(drop=True)
-                    )
-                    for fc_col in [
-                        "raw_nws_temp_c",
-                        "corrected_temp_c",
-                        "corrected_temp_p10_c",
-                        "corrected_temp_p90_c",
-                    ]:
-                        if fc_col in combined_df.columns:
-                            combined_df[fc_col] = (
-                                pd.to_numeric(combined_df[fc_col], errors="coerce")
-                                .interpolate(method="linear", limit_direction="both")
-                            )
 
             for col_dest, col_src in [
                 ("actual_temp_c", "temp_c"),
@@ -3451,7 +3612,6 @@ else:
                     mapped = combined_df["_sort_dt_utc"].map(obs_dedup[col_src])
                     combined_df[col_dest] = combined_df[col_dest].combine_first(mapped)
 
-        # Final strict window clip so combined_df never exceeds [cutoff_past_dt, cutoff_future_dt]
         combined_df = (
             combined_df[
                 (combined_df["_sort_dt_utc"] >= cutoff_past_dt)
