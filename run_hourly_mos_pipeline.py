@@ -268,6 +268,7 @@ def run_nws_forecast_ingest(db_path: str = DB_PATH) -> None:
         import ingest_nws
 
         for fn_name in (
+            "fetch_and_store_nws_hourly",
             "ingest_nws_forecasts",
             "fetch_and_store_nws_forecasts",
             "run_nws_ingest",
@@ -419,7 +420,7 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
                 float(r["corrected_temp_p10_c"]),
                 float(r["corrected_temp_p90_c"]),
                 clean_num(latest_fc_df.loc[idx, "nws_rh_pct"], 50.0),
-                round(clean_num(latest_fc_df.loc[idx, "nws_wind_speed_ms"], 0.0) * 1.35, 2),
+                round(max(clean_num(latest_fc_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0, (clean_num(latest_fc_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35), 2),
                 clean_num(r.get("raw_nws_pop_pct"), 0.0),
                 clean_num(r.get("mos_pop_pct"), 0.0),
                 clean_num(r.get("raw_nws_qpf_mm"), 0.0),

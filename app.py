@@ -23,6 +23,7 @@ from plotly.subplots import make_subplots
 from sklearn.inspection import permutation_importance
 import statsmodels.api as sm
 
+from ingest_nws import fetch_nws_gridpoints_dataframe
 from ingest_weather import (
     REFERENCE_STATIONS,
     ELEV_TASSAJARA_M as ELEV_TASS_M,
@@ -595,134 +596,26 @@ def attach_boundary_telemetry_for_mos(
 
 def fetch_live_nwp_topup(now_hour_utc: datetime) -> pd.DataFrame:
     """
-    Fetches a live 168-hour (7-day) hourly NWP forecast for the Tassajara grid cell
-    (36.2337°N, -121.5501°W, 880m MSL) via Open-Meteo GFS/HRRR Seamless API, with
-    an automatic fallback to the operational weather.gov API.
+    Fetches a live 168-hour (7-day) hourly NWP/NWS forecast for the Tassajara grid cell
+    (36.2337°N, -121.5501°W, 880m MSL) combining NOAA NWS /gridpoints/MTR/...
+    (quantitativePrecipitation, windGust, skyCover, PoP) with Open-Meteo GFS/HRRR.
+    Never hardcodes nws_qpf_1hr_mm to 0.0 when either source reports precipitation.
     """
-    issue_iso = now_hour_utc.isoformat()
-
-    # Primary: Open-Meteo GFS/HRRR seamless hourly forecast at 880m NWP reference elevation
-    om_url = "https://api.open-meteo.com/v1/forecast"
-    om_params = {
-        "latitude": TASSAJARA_LAT,
-        "longitude": TASSAJARA_LON,
-        "elevation": NWP_GRID_ELEV_M,
-        "hourly": (
-            "temperature_2m,relative_humidity_2m,dew_point_2m,"
-            "precipitation_probability,precipitation,cloud_cover,"
-            "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
-        ),
-        "temperature_unit": "celsius",
-        "wind_speed_unit": "ms",
-        "precipitation_unit": "mm",
-        "timezone": "UTC",
-        "forecast_days": 8,
-    }
     try:
-        resp = requests.get(om_url, params=om_params, timeout=12)
-        resp.raise_for_status()
-        hourly = resp.json().get("hourly", {})
-        times = hourly.get("time", [])
-        if times:
-            dt_series = pd.to_datetime(times, utc=True).floor("h")
-            df_live = pd.DataFrame({
-                "issue_time_utc": issue_iso,
-                "valid_time_utc": dt_series.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                "nws_temp_c": pd.to_numeric(hourly.get("temperature_2m"), errors="coerce"),
-                "nws_dewpoint_c": pd.to_numeric(hourly.get("dew_point_2m"), errors="coerce"),
-                "nws_rh_pct": pd.to_numeric(hourly.get("relative_humidity_2m"), errors="coerce"),
-                "nws_wind_speed_ms": pd.to_numeric(hourly.get("wind_speed_10m"), errors="coerce"),
-                "nws_wind_gust_ms": pd.to_numeric(hourly.get("wind_gusts_10m"), errors="coerce"),
-                "nws_wind_dir_deg": pd.to_numeric(hourly.get("wind_direction_10m"), errors="coerce"),
-                "nws_pop_pct": pd.to_numeric(
-                    hourly.get("precipitation_probability"), errors="coerce"
-                ).fillna(0.0),
-                "nws_qpf_1hr_mm": pd.to_numeric(
-                    hourly.get("precipitation"), errors="coerce"
-                ).fillna(0.0),
-                "nws_sky_cover_pct": pd.to_numeric(
-                    hourly.get("cloud_cover"), errors="coerce"
-                ).fillna(20.0),
-                "short_forecast": "Live NWP Grid",
-            })
-            df_live["raw_nws_temp_c"] = df_live["nws_temp_c"]
-            df_live = filter_future_horizon(df_live, now_hour_utc).head(168).copy()
-            if not df_live.empty:
-                valid_dt = pd.to_datetime(df_live["valid_time_utc"], utc=True)
-                df_live["lead_time_hours"] = (
-                    (valid_dt - pd.Timestamp(now_hour_utc)).dt.total_seconds() / 3600.0
-                ).clip(lower=1.0)
-                return df_live
-    except Exception:
-        pass
-
-    # Secondary Fallback: NWS API (/points/36.2337,-121.5501 -> forecastHourly)
-    try:
-        headers = {
-            "User-Agent": "(TassajaraWeatherMOSMonitor/2.0, tzmc-weather@tassajara.org)",
-            "Accept": "application/geo+json",
-        }
-        pt_resp = requests.get(
-            f"https://api.weather.gov/points/{TASSAJARA_LAT},{TASSAJARA_LON}",
-            headers=headers,
-            timeout=10,
+        df_live = fetch_nws_gridpoints_dataframe(
+            now_hour_utc=now_hour_utc,
+            include_past_hours=0,
+            prefer_open_meteo_primary=True,
         )
-        pt_resp.raise_for_status()
-        hr_url = pt_resp.json().get("properties", {}).get("forecastHourly")
-        if hr_url:
-            fc_resp = requests.get(hr_url, headers=headers, timeout=12)
-            fc_resp.raise_for_status()
-            periods = fc_resp.json().get("properties", {}).get("periods", [])
-            rows = []
-            for p in periods:
-                v_dt = pd.to_datetime(p.get("startTime"), utc=True).floor("h")
-                t_val = float(p.get("temperature", 60.0))
-                t_unit = str(p.get("temperatureUnit", "F")).upper()
-                t_c = (t_val - 32.0) * 5.0 / 9.0 if t_unit == "F" else t_val
-                rh_val = safe_float(
-                    (p.get("relativeHumidity") or {}).get("value"), 50.0
-                )
-                dew_raw = (p.get("dewpoint") or {}).get("value")
-                dew_c = (
-                    float(dew_raw)
-                    if dew_raw is not None
-                    else t_c - ((100.0 - rh_val) / 5.0)
-                )
-                pop_val = safe_float(
-                    (p.get("probabilityOfPrecipitation") or {}).get("value"), 0.0
-                )
-                w_str = str(p.get("windSpeed", "3 mph")).split()[0]
-                try:
-                    w_mph = float(w_str)
-                except ValueError:
-                    w_mph = 3.0
-                w_ms = round(w_mph * 0.44704, 2)
-                rows.append({
-                    "issue_time_utc": issue_iso,
-                    "valid_time_utc": v_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                    "nws_temp_c": round(t_c, 2),
-                    "raw_nws_temp_c": round(t_c, 2),
-                    "nws_dewpoint_c": round(dew_c, 2),
-                    "nws_rh_pct": round(rh_val, 1),
-                    "nws_wind_speed_ms": w_ms,
-                    "nws_wind_gust_ms": round(w_ms * 1.35, 2),
-                    "nws_wind_dir_deg": 295.0,
-                    "nws_pop_pct": round(pop_val, 1),
-                    "nws_qpf_1hr_mm": 0.0,
-                    "nws_sky_cover_pct": 50.0 if pop_val >= 25.0 else 20.0,
-                    "short_forecast": str(p.get("shortForecast") or "NWS Hourly"),
-                })
-            if rows:
-                df_nws = pd.DataFrame(rows)
-                df_nws = filter_future_horizon(df_nws, now_hour_utc).head(168).copy()
-                valid_dt = pd.to_datetime(df_nws["valid_time_utc"], utc=True)
-                df_nws["lead_time_hours"] = (
-                    (valid_dt - pd.Timestamp(now_hour_utc)).dt.total_seconds() / 3600.0
-                ).clip(lower=1.0)
-                return df_nws
+        if not df_live.empty:
+            df_live = filter_future_horizon(df_live, now_hour_utc).head(168).copy()
+            valid_dt = pd.to_datetime(df_live["valid_time_utc"], utc=True)
+            df_live["lead_time_hours"] = (
+                (valid_dt - pd.Timestamp(now_hour_utc)).dt.total_seconds() / 3600.0
+            ).clip(lower=1.0)
+            return df_live
     except Exception:
         pass
-
     return pd.DataFrame()
 
 
@@ -925,8 +818,14 @@ def backfill_missing_hindcast_verification(
 
     existing_v_hrs = set()
     if verify_df is not None and not verify_df.empty and "valid_time_utc" in verify_df.columns:
+        v_pop = get_col(verify_df, "nws_pop_pct", 0.0)
+        v_qpf = get_col(verify_df, "nws_qpf_1hr_mm", 0.0)
+        v_act_p = get_col(verify_df, "actual_precip_mm", 0.0)
+        qpf_valid_mask = ~(((v_pop >= 25.0) | (v_act_p > 0.0)) & (v_qpf <= 0.0))
         v_valid = verify_df[
-            verify_df["raw_nws_temp_c"].notna() & verify_df["corrected_temp_c"].notna()
+            verify_df["raw_nws_temp_c"].notna()
+            & verify_df["corrected_temp_c"].notna()
+            & qpf_valid_mask
         ]
         existing_v_hrs = set(
             pd.to_datetime(v_valid["valid_time_utc"], utc=True, errors="coerce").dt.floor("h").dropna()
@@ -976,6 +875,23 @@ def backfill_missing_hindcast_verification(
             nwp_map = df_om.set_index("_hr_utc").to_dict(orient="index")
     except Exception:
         nwp_map = {}
+
+    if not nwp_map:
+        try:
+            df_nws_hc = fetch_nws_gridpoints_dataframe(
+                now_hour_utc=now_hour_utc,
+                include_past_hours=72,
+                prefer_open_meteo_primary=False,
+            )
+            if not df_nws_hc.empty:
+                df_nws_hc["_hr_utc"] = pd.to_datetime(df_nws_hc["valid_time_utc"], utc=True).dt.floor("h")
+                nwp_map = (
+                    df_nws_hc.drop_duplicates(subset=["_hr_utc"], keep="first")
+                    .set_index("_hr_utc")
+                    .to_dict(orient="index")
+                )
+        except Exception:
+            nwp_map = {}
 
     obs_temp_by_hr = dict(zip(obs_clean["_hr_utc"], pd.to_numeric(obs_clean["temp_c"], errors="coerce")))
 
@@ -1407,7 +1323,7 @@ def load_all_dashboard_data():
                             nws_wind_gust_ms,
                             nws_wind_dir_deg,
                             nws_pop_pct,
-                            nws_qpf_1hr_mm,
+                            MAX(COALESCE(nws_qpf_1hr_mm, 0.0)) OVER (PARTITION BY valid_time_utc) AS nws_qpf_1hr_mm,
                             nws_sky_cover_pct,
                             short_forecast,
                             ROW_NUMBER() OVER (
@@ -1603,16 +1519,23 @@ def load_all_dashboard_data():
                 0.0, (pd.Timestamp(now_hour_utc) - issue_dt).total_seconds() / 3600.0
             )
 
+    db_qpf_dropout = (
+        not future_fc_df.empty
+        and float(get_col(future_fc_df, "nws_pop_pct", 0.0).max()) >= 20.0
+        and float(get_col(future_fc_df, "nws_qpf_1hr_mm", 0.0).sum()) <= 0.01
+    )
+
     needs_live_topup = (
         future_fc_df.empty
         or batch_age_hours > 6.0
         or len(future_fc_df) < 144
+        or db_qpf_dropout
     )
 
     if needs_live_topup:
         live_df = fetch_live_nwp_topup(now_hour_utc)
         if not live_df.empty:
-            if future_fc_df.empty or batch_age_hours > 6.0:
+            if future_fc_df.empty or batch_age_hours > 6.0 or db_qpf_dropout:
                 future_fc_df = live_df.copy()
             else:
                 combined_fc = pd.concat([future_fc_df, live_df], ignore_index=True, sort=False)

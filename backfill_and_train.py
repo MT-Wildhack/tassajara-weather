@@ -799,7 +799,7 @@ def populate_mos_verification_and_active_forecasts(
             float(r["corrected_temp_p10_c"]),
             float(r["corrected_temp_p90_c"]),
             clean_num(train_df.loc[idx, "nws_rh_pct"], 50.0),
-            round(clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) * 1.35, 2),
+            round(max(clean_num(train_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0, (clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35), 2),
             clean_num(r.get("raw_nws_pop_pct"), 0.0),
             clean_num(r.get("mos_pop_pct"), 0.0),
             clean_num(r.get("raw_nws_qpf_mm"), 0.0),
@@ -937,8 +937,10 @@ def populate_mos_verification_and_active_forecasts(
                     float(r["corrected_temp_p90_c"]),
                     clean_num(latest_fc_df.loc[idx, "nws_rh_pct"], 50.0),
                     round(
-                        clean_num(latest_fc_df.loc[idx, "nws_wind_speed_ms"], 0.0)
-                        * 1.35,
+                        max(
+                            clean_num(latest_fc_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0,
+                            (clean_num(latest_fc_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35,
+                        ),
                         2,
                     ),
                     clean_num(r.get("raw_nws_pop_pct"), 0.0),
