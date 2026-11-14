@@ -49,7 +49,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -121.5650,
         "elev_m": ELEV_CHEWS_RIDGE_M,
         "role": "Interior Crest (NNW)",
-        "default_temp_offset_c": 2.0,
+        "default_temp_offset_c": -6.83,
     },
     "CAHC1": {
         "name": "Hastings RAWS",
@@ -57,7 +57,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -121.5514,
         "elev_m": ELEV_HASTINGS_M,
         "role": "Foothill Valley (N)",
-        "default_temp_offset_c": 0.5,
+        "default_temp_offset_c": -0.60,
     },
     "ASRC1": {
         "name": "Arroyo Seco RAWS",
@@ -65,7 +65,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -121.4799,
         "elev_m": ELEV_ARROYO_SECO_M,
         "role": "Gorge Outlet (6.3km E)",
-        "default_temp_offset_c": 1.4,
+        "default_temp_offset_c": 1.41,
     },
     "PPSC1": {
         "name": "Big Sur RAWS",
@@ -73,7 +73,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -121.7802,
         "elev_m": ELEV_BIG_SUR_M,
         "role": "Coastal Slope (W)",
-        "default_temp_offset_c": 0.8,
+        "default_temp_offset_c": 2.45,
     },
     "VTCC1": {
         "name": "Ventana Cone",
@@ -81,7 +81,7 @@ REFERENCE_STATIONS: Dict[str, Dict[str, Any]] = {
         "lon": -121.7150,
         "elev_m": ELEV_VENTANA_CONE_M,
         "role": "Ventana Crest (WNW)",
-        "default_temp_offset_c": 1.5,
+        "default_temp_offset_c": -6.29,
     },
 }
 

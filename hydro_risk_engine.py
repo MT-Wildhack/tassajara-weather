@@ -494,6 +494,7 @@ def project_forward_hydro_series(
     initial_api_mm: float,
     recent_runoff_history_mm_hr: Optional[List[float]] = None,
     recent_precip_48h_mm: float = 0.0,
+    recent_precip_history_mm: Optional[List[float]] = None,
     base_k: float = API_DECAY_K_DEFAULT,
 ) -> pd.DataFrame:
     """
@@ -542,7 +543,16 @@ def project_forward_hydro_series(
     proj_tiers: List[str] = []
 
     cum_qpf_series = mos_qpf.rolling(window=24, min_periods=1).sum().values
-    cum_qpf_72_series = (mos_qpf.rolling(window=72, min_periods=1).sum() + float(recent_precip_48h_mm * 0.5)).values
+    if recent_precip_history_mm:
+        hist_tail = [max(0.0, float(x)) for x in recent_precip_history_mm[-71:]]
+        combined_p = pd.Series(hist_tail + mos_qpf.tolist(), dtype="float64")
+        cum_qpf_72_series = (
+            combined_p.rolling(window=72, min_periods=1).sum().iloc[len(hist_tail):].values
+        )
+    else:
+        cum_qpf_72_series = (
+            mos_qpf.rolling(window=72, min_periods=1).sum() + float(recent_precip_48h_mm * 0.5)
+        ).values
 
     for idx in range(len(fc)):
         q_exp = float(mos_qpf.iloc[idx])
@@ -778,12 +788,19 @@ def compute_dashboard_hydro_state(
         discharge_cfs = BASEFLOW_CFS
         recent_runoff_list = [current_runoff_mm_hr]
 
+    recent_precip_list = (
+        pd.to_numeric(hist_hydro_df.tail(71)["precip_1hr_mm"], errors="coerce").fillna(0.0).tolist()
+        if not hist_hydro_df.empty and "precip_1hr_mm" in hist_hydro_df.columns
+        else []
+    )
+
     # Forward Hydrograph & API Projection
     proj_fc_df = project_forward_hydro_series(
         future_fc_df=future_fc_df,
         initial_api_mm=api_mm,
         recent_runoff_history_mm_hr=recent_runoff_list,
         recent_precip_48h_mm=precip_48hr_mm,
+        recent_precip_history_mm=recent_precip_list,
         base_k=decay_k,
     )
 

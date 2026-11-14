@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-mos_model.py (v4 — Multi-Station Santa Lucia Spatial Gradients + Hydrological Hurdle + HAC OLS)
+mos_model.py (v4.2 — Multi-Station Santa Lucia Spatial Gradients + Hydrological Hurdle + Precomputed HAC OLS)
 Trains and evaluates the Tassajara Model Output Statistics (MOS) Gradient Boosted Ensemble:
   1. Thermal Subsystem: Mean error + P10/P90 quantile bounds (HistGradientBoostingRegressor)
-     incorporating 5-station Santa Lucia boundary gradients (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1).
+     with out-of-fold conformal interval scaling and strict non-crossing enforcement.
   2. Hydrological Hurdle Subsystem:
      - Stage 1 PoP Classifier: Calibrated HistGradientBoostingClassifier for P(Rain >= 0.254mm)
-     - Stage 2 QPF Regressor: Poisson deviance & P90 extreme quantile HistGradientBoostingRegressor
-       accounting for Santa Lucia orographic moisture flux, Ventana/Big Sur spillover, and canyon virga,
-       with automatic conditional QPF synthesis when raw NWP QPF is zero during high-PoP regimes.
-  3. Econometric Baseline: Z-score standardized, orthogonalized Ordinary Least Squares (OLS) with
-     Newey-West HAC robust standard errors (12-hour lag), eliminating multicollinearity warnings.
+     - Stage 2 QPF Regressor: Poisson deviance & P90 extreme quantile HistGradientBoostingRegressor.
+  3. Precomputed Diagnostics: Standardized Newey-West HAC OLS (12-hour lag) and Permutation
+     Feature Importances serialized directly into models/tassajara_mos_v1.joblib.
 """
 
 import numpy as np
@@ -18,6 +16,7 @@ import pandas as pd
 import joblib
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     mean_absolute_error,
@@ -97,7 +96,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Builds 25 physical, cyclical, topographic, multi-station spatial gradient,
     and hydrological features for canyon temperature bias and PoP/QPF calibration.
-    Automatically synthesizes a baseline QPF prior when raw NWP QPF is 0.0 but PoP >= 20%.
+    Uses physically consistent standard-atmosphere lapse fallbacks relative to TZMC (485m MSL).
     """
     out = pd.DataFrame(index=df.index)
     dt_valid = pd.to_datetime(df["valid_time_utc"], utc=True)
@@ -171,21 +170,23 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # -----------------------------------------------------------------------
     # 5-Station Santa Lucia Spatial & Vertical Boundary-Layer Gradients
-    # Symmetric cross-station fallback chaining (CHWC1 <-> VTCC1, CAHC1 <-> ASRC1)
+    # Physically consistent standard-atmosphere lapse fallbacks vs TZMC (485m):
+    # CHWC1 (1536m): -6.83 C | VTCC1 (1453m): -6.29 C | CAHC1 (546m): -0.60 C
+    # ASRC1 (268m):  +1.41 C | PPSC1 (108m):  +2.45 C
     # -----------------------------------------------------------------------
     issue_tass_t = _num_series(df, "issue_tass_temp_c", np.nan).fillna(t_c)
 
     raw_chews_t = _num_series(df, "issue_chews_temp_c", np.nan)
     raw_ventana_t = _num_series(df, "issue_ventana_temp_c", np.nan)
-    issue_chews_t = raw_chews_t.fillna(raw_ventana_t - 0.54).fillna(t_c + 2.0)
+    issue_chews_t = raw_chews_t.fillna(raw_ventana_t - 0.54).fillna(issue_tass_t - 6.83)
     issue_ventana_t = raw_ventana_t.fillna(issue_chews_t + 0.54)
 
     raw_hast_t = _num_series(df, "issue_hastings_temp_c", np.nan)
     raw_arroyo_t = _num_series(df, "issue_arroyo_temp_c", np.nan)
-    issue_hast_t = raw_hast_t.fillna(raw_arroyo_t - 1.80).fillna(t_c + 0.5)
-    issue_arroyo_t = raw_arroyo_t.fillna(issue_hast_t + 1.80)
+    issue_hast_t = raw_hast_t.fillna(raw_arroyo_t - 2.01).fillna(issue_tass_t - 0.60)
+    issue_arroyo_t = raw_arroyo_t.fillna(issue_hast_t + 2.01).fillna(issue_tass_t + 1.41)
 
-    issue_bigsur_t = _num_series(df, "issue_bigsur_temp_c", np.nan).fillna(t_c + 0.8)
+    issue_bigsur_t = _num_series(df, "issue_bigsur_temp_c", np.nan).fillna(issue_tass_t + 2.45)
 
     # 1. Upper-Column Vertical Lapse Rate (CHWC1 1536m & VTCC1 1453m -> TZMC 485m)
     raw_lapse_chews = (-1.0 * (issue_chews_t - issue_tass_t) / 1.051).fillna(6.5)
@@ -345,9 +346,11 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
 class TassajaraMOSCorrector:
     """
     Multi-Task Ensemble MOS Forecast Corrector:
-      - Thermal Subsystem: Expected temperature error (mean) + P10/P90 uncertainty intervals.
+      - Thermal Subsystem: Expected temperature error (mean) + P10/P90 uncertainty intervals
+        with out-of-fold conformal calibration and strict non-crossing enforcement.
       - Hydrological Subsystem: Two-Stage Hurdle Model predicting calibrated PoP (%),
         expected QPF (mm/hr), and P90 extreme rainfall rate (mm/hr).
+      - Precomputed OLS & Permutation Importances stored in the serialized joblib artifact.
     """
 
     def __init__(self):
@@ -397,30 +400,60 @@ class TassajaraMOSCorrector:
         self.precip_ml_trained = False
         self.feature_names = []
         self.ols_summary = None
+        self.ols_diagnostics = {}
+        self.precomputed_importances = {}
+        self.q_scale_low = 1.0
+        self.q_scale_high = 1.0
+        self.conformal_pad_c = 0.0
 
     def fit_and_evaluate(self, df: pd.DataFrame) -> dict:
-        X = engineer_mos_features(df)
+        df_sorted = df.sort_values("valid_time_utc").reset_index(drop=True)
+        X = engineer_mos_features(df_sorted)
         self.feature_names = list(X.columns)
-        y_err = df["actual_temp_c"] - df["nws_temp_c"]
+        y_err = df_sorted["actual_temp_c"] - df_sorted["nws_temp_c"]
 
-        # 1. Fit Standardized Newey-West HAC OLS Baseline for Physical Interpretability
+        # 1. Fit Standardized Newey-West HAC OLS Baseline & Serialize Complete Diagnostics
         X_ols = build_well_conditioned_ols_matrix(X)
         ols_fit = sm.OLS(y_err.values, X_ols).fit(cov_type="HAC", cov_kwds={"maxlags": 12})
         self.ols_summary = ols_fit.summary().as_text()
+        ci_df = ols_fit.conf_int()
+        self.ols_diagnostics = {
+            "ols_summary_text": self.ols_summary,
+            "ols_r2": float(ols_fit.rsquared),
+            "ols_adj_r2": float(ols_fit.rsquared_adj),
+            "ols_fstat": float(ols_fit.fvalue) if ols_fit.fvalue is not None else np.nan,
+            "ols_aic": float(ols_fit.aic),
+            "ols_cond_no": float(ols_fit.condition_number),
+            "ols_nobs": int(ols_fit.nobs),
+            "coef_records": [
+                {
+                    "feat": str(feat),
+                    "beta": round(float(ols_fit.params[feat]), 4),
+                    "bse": round(float(ols_fit.bse[feat]), 4),
+                    "tval": round(float(ols_fit.tvalues[feat]), 2),
+                    "pval": round(float(ols_fit.pvalues[feat]), 4),
+                    "ci_low": round(float(ci_df.loc[feat, 0]), 4),
+                    "ci_high": round(float(ci_df.loc[feat, 1]), 4),
+                }
+                for feat in ols_fit.params.index
+            ],
+        }
 
-        # 2. Time-Series Cross-Validation (5 Expanding Folds)
+        # 2. Time-Series Cross-Validation (5 Expanding Folds) + Out-of-Fold Conformal Calibration
         tscv = TimeSeriesSplit(n_splits=5)
         raw_rmse_list, mos_rmse_list, raw_mae_list, mos_mae_list = [], [], [], []
+        oof_residuals = []
 
         for train_idx, test_idx in tscv.split(X):
             X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-            y_tr, _ = y_err.iloc[train_idx], y_err.iloc[test_idx]
+            y_tr, y_te = y_err.iloc[train_idx], y_err.iloc[test_idx]
 
             self.model_mean.fit(X_tr, y_tr)
             pred_err = self.model_mean.predict(X_te)
+            oof_residuals.extend((y_te.values - pred_err).tolist())
 
-            actual_te = df["actual_temp_c"].iloc[test_idx]
-            raw_fc_te = df["nws_temp_c"].iloc[test_idx]
+            actual_te = df_sorted["actual_temp_c"].iloc[test_idx]
+            raw_fc_te = df_sorted["nws_temp_c"].iloc[test_idx]
             mos_fc_te = raw_fc_te + pred_err
 
             raw_rmse_list.append(root_mean_squared_error(actual_te, raw_fc_te))
@@ -432,7 +465,20 @@ class TassajaraMOSCorrector:
         self.model_p10.fit(X, y_err)
         self.model_p90.fit(X, y_err)
 
-        y_precip = _num_series(df, "actual_precip_mm", 0.0).clip(lower=0.0)
+        # Calibrate P10/P90 conformal interval scaling so empirical coverage targets 80%
+        in_sample_mean = self.model_mean.predict(X)
+        in_sample_p10 = np.minimum(self.model_p10.predict(X), in_sample_mean - 0.35)
+        in_sample_p90 = np.maximum(self.model_p90.predict(X), in_sample_mean + 0.35)
+        if oof_residuals:
+            oof_arr = np.array(oof_residuals, dtype=float)
+            oof_q10 = float(np.percentile(oof_arr, 10))
+            oof_q90 = float(np.percentile(oof_arr, 90))
+            mean_half_low = float(np.mean(in_sample_mean - in_sample_p10))
+            mean_half_high = float(np.mean(in_sample_p90 - in_sample_mean))
+            self.q_scale_low = float(np.clip(abs(oof_q10) / max(mean_half_low, 0.35), 1.0, 1.45))
+            self.q_scale_high = float(np.clip(abs(oof_q90) / max(mean_half_high, 0.35), 1.0, 1.45))
+
+        y_precip = _num_series(df_sorted, "actual_precip_mm", 0.0).clip(lower=0.0)
         y_wet = (y_precip >= TIPPING_BUCKET_MM).astype(int)
         wet_hours_count = int(y_wet.sum())
 
@@ -475,6 +521,46 @@ class TassajaraMOSCorrector:
             if wet_hours_count > 0
             else 0.0
         )
+
+        # 3. Precompute Permutation Feature Importances once on a representative 4,000-row slice
+        try:
+            sub_idx = X.tail(min(len(X), 4000)).index
+            X_sub = X.loc[sub_idx]
+            y_err_sub = y_err.loc[sub_idx].values
+            perm_t = permutation_importance(
+                self.model_mean,
+                X_sub,
+                y_err_sub,
+                scoring="neg_root_mean_squared_error",
+                n_repeats=4,
+                random_state=42,
+            )
+            t_raw = np.maximum(0.0, perm_t.importances_mean)
+            t_sum = float(t_raw.sum())
+            t_pct = (t_raw / t_sum * 100.0) if t_sum > 0 else np.zeros_like(t_raw)
+
+            if self.precip_ml_trained:
+                y_h_sub = hydro_preds.loc[sub_idx, "mos_qpf_mm"].values
+                perm_h = permutation_importance(
+                    self.model_qpf_mean,
+                    X_sub,
+                    y_h_sub,
+                    scoring="neg_root_mean_squared_error",
+                    n_repeats=4,
+                    random_state=42,
+                )
+                h_raw = np.maximum(0.0, perm_h.importances_mean)
+            else:
+                h_raw = np.zeros_like(t_raw)
+            h_sum = float(h_raw.sum())
+            h_pct = (h_raw / h_sum * 100.0) if h_sum > 0 else np.zeros_like(h_raw)
+
+            self.precomputed_importances = {
+                "thermal_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, t_pct)},
+                "hydro_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, h_pct)},
+            }
+        except Exception:
+            self.precomputed_importances = {}
 
         mean_raw_rmse = float(np.mean(raw_rmse_list))
         mean_mos_rmse = float(np.mean(mos_rmse_list))
@@ -553,13 +639,19 @@ class TassajaraMOSCorrector:
         err_p10 = self.model_p10.predict(X_fut)
         err_p90 = self.model_p90.predict(X_fut)
 
+        q_low_mult = float(getattr(self, "q_scale_low", 1.0))
+        q_high_mult = float(getattr(self, "q_scale_high", 1.0))
+        half_low = np.maximum(0.35, (err_mean - err_p10) * q_low_mult)
+        half_high = np.maximum(0.35, (err_p90 - err_mean) * q_high_mult)
+
         hydro_df = self._predict_hydro(X_fut)
 
         res = df_future[["issue_time_utc", "valid_time_utc", "nws_temp_c"]].copy()
+        corr_c = res["nws_temp_c"] + err_mean
         res["pred_temp_error_c"] = np.round(err_mean, 2)
-        res["corrected_temp_c"] = np.round(res["nws_temp_c"] + err_mean, 2)
-        res["corrected_temp_p10_c"] = np.round(res["nws_temp_c"] + err_p10, 2)
-        res["corrected_temp_p90_c"] = np.round(res["nws_temp_c"] + err_p90, 2)
+        res["corrected_temp_c"] = np.round(corr_c, 2)
+        res["corrected_temp_p10_c"] = np.round(corr_c - half_low, 2)
+        res["corrected_temp_p90_c"] = np.round(corr_c + half_high, 2)
 
         res["raw_nws_pop_pct"] = np.round(X_full["nws_pop_pct"].values, 1)
         res["mos_pop_pct"] = hydro_df["mos_pop_pct"].values

@@ -709,13 +709,13 @@ def apply_mos_inference_if_needed(
     sub["nws_qpf_1hr_mm"] = get_col(sub, "nws_qpf_1hr_mm", 0.0)
     sub["nws_sky_cover_pct"] = get_col(sub, "nws_sky_cover_pct", 20.0)
     sub["pressure_trend_3hr_hpa"] = get_col(sub, "pressure_trend_3hr_hpa", 0.0)
-    sub["issue_chews_temp_c"] = get_col(sub, "issue_chews_temp_c", sub["nws_temp_c"] + 2.0)
+    sub["issue_chews_temp_c"] = get_col(sub, "issue_chews_temp_c", sub["nws_temp_c"] - 6.83)
     sub["issue_chews_rh_pct"] = get_col(sub, "issue_chews_rh_pct", sub["nws_rh_pct"])
     sub["issue_chews_precip_mm"] = get_col(sub, "issue_chews_precip_mm", 0.0)
-    sub["issue_hastings_temp_c"] = get_col(sub, "issue_hastings_temp_c", sub["nws_temp_c"] + 0.5)
-    sub["issue_arroyo_temp_c"] = get_col(sub, "issue_arroyo_temp_c", sub["nws_temp_c"] + 1.4)
+    sub["issue_hastings_temp_c"] = get_col(sub, "issue_hastings_temp_c", sub["nws_temp_c"] - 0.60)
+    sub["issue_arroyo_temp_c"] = get_col(sub, "issue_arroyo_temp_c", sub["nws_temp_c"] + 1.41)
     sub["issue_arroyo_rh_pct"] = get_col(sub, "issue_arroyo_rh_pct", sub["nws_rh_pct"])
-    sub["issue_bigsur_temp_c"] = get_col(sub, "issue_bigsur_temp_c", sub["nws_temp_c"] + 0.8)
+    sub["issue_bigsur_temp_c"] = get_col(sub, "issue_bigsur_temp_c", sub["nws_temp_c"] + 2.45)
     sub["issue_bigsur_rh_pct"] = get_col(sub, "issue_bigsur_rh_pct", sub["nws_rh_pct"])
     sub["issue_bigsur_precip_mm"] = get_col(sub, "issue_bigsur_precip_mm", 0.0)
     sub["issue_ventana_temp_c"] = get_col(
@@ -943,7 +943,9 @@ def backfill_missing_hindcast_verification(
         init_bias_c = float(issue_tass_t) - float(issue_nws_t)
 
         def _get_h_ref(stid: str, col: str, default_val: float) -> float:
-            rec = ref_hist_map.get((hr_dt, stid))
+            rec = ref_hist_map.get((issue_dt, stid))
+            if rec is None or pd.isna(rec.get(col)):
+                rec = ref_hist_map.get((hr_dt, stid))
             if rec is not None and pd.notna(rec.get(col)):
                 return float(rec[col])
             return float(default_val)
@@ -1345,15 +1347,15 @@ def load_all_dashboard_data():
                         GROUP BY valid_time_utc
                     ) f_issue ON f.issue_time_utc = f_issue.valid_time_utc
                     LEFT JOIN reference_observations r_chews
-                        ON o.valid_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
+                        ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
                     LEFT JOIN reference_observations r_hast
-                        ON o.valid_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+                        ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
                     LEFT JOIN reference_observations r_arroyo
-                        ON o.valid_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
+                        ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
                     LEFT JOIN reference_observations r_bigsur
-                        ON o.valid_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
+                        ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
                     LEFT JOIN reference_observations r_vent
-                        ON o.valid_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
+                        ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
                     LEFT JOIN (
                         SELECT
                             valid_time_utc,
@@ -1466,8 +1468,12 @@ def load_all_dashboard_data():
     except Exception:
         pass
 
+    fresh_sqlite_refs = sum(
+        1 for d in ref_dict.values()
+        if d.get("online") and d.get("age_hours") is not None and float(d.get("age_hours", 99.0)) <= 0.42
+    )
     try:
-        live_refs = fetch_regional_reference_stations()
+        live_refs = fetch_regional_reference_stations() if fresh_sqlite_refs < 4 else {}
         if isinstance(live_refs, dict):
             ref_db_rows = []
             for stid, rdata in live_refs.items():
@@ -1610,6 +1616,61 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
             diag_out["feature_names"] = list(getattr(mos_obj, "feature_names", []))
             if getattr(mos_obj, "ols_summary", None):
                 diag_out["ols_summary_text"] = str(mos_obj.ols_summary)
+
+            ols_d = getattr(mos_obj, "ols_diagnostics", None)
+            pre_imp = getattr(mos_obj, "precomputed_importances", None)
+            if isinstance(ols_d, dict) and ols_d.get("coef_records") and isinstance(pre_imp, dict) and pre_imp.get("thermal_pct"):
+                diag_out["ols_summary_text"] = str(ols_d.get("ols_summary_text", diag_out["ols_summary_text"]))
+                diag_out["ols_r2"] = float(ols_d.get("ols_r2", np.nan))
+                diag_out["ols_adj_r2"] = float(ols_d.get("ols_adj_r2", np.nan))
+                diag_out["ols_fstat"] = float(ols_d.get("ols_fstat", np.nan))
+                diag_out["ols_aic"] = float(ols_d.get("ols_aic", np.nan))
+                diag_out["ols_cond_no"] = float(ols_d.get("ols_cond_no", np.nan))
+                diag_out["ols_nobs"] = int(ols_d.get("ols_nobs", 0))
+                coef_rows = []
+                for rec in ols_d["coef_records"]:
+                    feat = rec["feat"]
+                    if feat == "const":
+                        label, desc = (
+                            "Intercept (Mean Bias Offset)",
+                            "Mean systematic NWP temperature bias (C) at average predictor conditions.",
+                        )
+                    else:
+                        label, desc = FEATURE_METADATA.get(feat, (feat, "Engineered physical MOS predictor."))
+                    coef_rows.append({
+                        "Feature Key": feat,
+                        "Physical Predictor": label,
+                        "Std. Beta (C / 1-SD)": rec["beta"],
+                        "HAC Std Error": rec["bse"],
+                        "z-Statistic": rec["tval"],
+                        "p-Value": rec["pval"],
+                        "95% CI Low": rec["ci_low"],
+                        "95% CI High": rec["ci_high"],
+                        "Physical Interpretation": desc,
+                    })
+                diag_out["ols_coef_df"] = pd.DataFrame(coef_rows)
+
+                t_map = pre_imp.get("thermal_pct", {})
+                h_map = pre_imp.get("hydro_pct", {})
+                imp_rows = []
+                for f in diag_out["feature_names"]:
+                    label, desc = FEATURE_METADATA.get(f, (f, "Engineered physical MOS predictor."))
+                    t_val = round(float(t_map.get(f, 0.0)), 2)
+                    h_val = round(float(h_map.get(f, 0.0)), 2)
+                    imp_rows.append({
+                        "Feature Key": f,
+                        "Physical Predictor": label,
+                        "Thermal Importance (%)": t_val,
+                        "Hydrological Importance (%)": h_val,
+                        "Combined Share (%)": round(0.5 * (t_val + h_val), 2),
+                        "Physical Mechanism": desc,
+                    })
+                diag_out["imp_df"] = (
+                    pd.DataFrame(imp_rows)
+                    .sort_values("Thermal Importance (%)", ascending=False)
+                    .reset_index(drop=True)
+                )
+                return diag_out
         except Exception:
             mos_obj = None
 
@@ -2608,32 +2669,18 @@ def render_layman_forecast_view(
             get_col(fc_48, "mos_qpf_mm", get_col(fc_48, "nws_qpf_1hr_mm", 0.0)) / 25.4
         ).round(3)
 
-        fig_layman = make_subplots(specs=[[{"secondary_y": True}]])
-
-        fig_layman.add_trace(
-            go.Scatter(
-                x=fc_48["valid_local"],
-                y=fc_48["mos_pop"],
-                mode="lines",
-                fill="tozeroy",
-                fillcolor="rgba(2, 132, 199, 0.12)",
-                line=dict(color="rgba(2, 132, 199, 0.65)", width=1.6, dash="dot"),
-                name="Chance of Rain (%)",
+        fig_layman = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.10,
+            row_heights=[0.58, 0.42],
+            specs=[[{"secondary_y": False}], [{"secondary_y": True}]],
+            subplot_titles=(
+                "Canyon Temperature (°F)",
+                "Expected Rain Rate (in/hr) & Chance of Rain (%)",
             ),
-            secondary_y=True,
         )
-
-        if (fc_48["mos_rain_in"] > 0).any():
-            fig_layman.add_trace(
-                go.Bar(
-                    x=fc_48["valid_local"],
-                    y=fc_48["mos_rain_in"],
-                    name="Expected Rain (in/hr)",
-                    marker_color="#0284c7",
-                    opacity=0.65,
-                ),
-                secondary_y=True,
-            )
 
         fig_layman.add_trace(
             go.Scatter(
@@ -2642,41 +2689,90 @@ def render_layman_forecast_view(
                 mode="lines",
                 line=dict(color="#ea580c", width=3.2, shape="spline"),
                 name="Canyon Temperature (°F)",
+                hovertemplate="<b>Canyon Temp</b>: %{y:.1f} °F<extra></extra>",
             ),
+            row=1,
+            col=1,
+        )
+
+        if float(fc_48["smooth_temp_f"].min()) <= 38.0:
+            fig_layman.add_hline(
+                y=32.0,
+                line_dash="dot",
+                line_color="#0284c7",
+                annotation_text="Freezing (32°F)",
+                annotation_position="bottom right",
+                row=1,
+                col=1,
+            )
+
+        fig_layman.add_trace(
+            go.Bar(
+                x=fc_48["valid_local"],
+                y=fc_48["mos_rain_in"],
+                name="Expected Rain (in/hr)",
+                marker_color="#0284c7",
+                opacity=0.80,
+                hovertemplate="<b>Expected Rain</b>: %{y:.3f} in/hr<extra></extra>",
+            ),
+            row=2,
+            col=1,
             secondary_y=False,
         )
 
-        fig_layman.add_hline(
-            y=32.0,
-            line_dash="dot",
-            line_color="#0284c7",
-            annotation_text="Freezing (32°F)",
-            annotation_position="bottom right",
-            secondary_y=False,
-        )
-
-        fig_layman.update_yaxes(
-            title_text="Temperature (°F)",
-            gridcolor=GRID_RGBA,
-            secondary_y=False,
-        )
-        fig_layman.update_yaxes(
-            title_text="Rain Chance (%)",
-            range=[0, 105],
-            showgrid=False,
+        fig_layman.add_trace(
+            go.Scatter(
+                x=fc_48["valid_local"],
+                y=fc_48["mos_pop"],
+                mode="lines",
+                fill="tozeroy",
+                fillcolor="rgba(2, 132, 199, 0.10)",
+                line=dict(color="rgba(2, 132, 199, 0.75)", width=1.8, dash="dot"),
+                name="Chance of Rain (%)",
+                hovertemplate="<b>Rain Chance</b>: %{y:.0f}%<extra></extra>",
+            ),
+            row=2,
+            col=1,
             secondary_y=True,
         )
+
+        max_layman_rain = max(0.15, round(float(fc_48["mos_rain_in"].max()) * 1.30, 2))
+        fig_layman.update_yaxes(
+            title_text="Temp (°F)",
+            gridcolor=GRID_RGBA,
+            row=1,
+            col=1,
+        )
+        fig_layman.update_yaxes(
+            title_text="Rain (in/hr)",
+            range=[0, max_layman_rain],
+            gridcolor=GRID_RGBA,
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+        fig_layman.update_yaxes(
+            title_text="Chance (%)",
+            range=[0, 105],
+            showgrid=False,
+            row=2,
+            col=1,
+            secondary_y=True,
+        )
+        fig_layman.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
         fig_layman.update_xaxes(
             title_text="Local Canyon Time",
             gridcolor=GRID_RGBA,
+            row=2,
+            col=1,
         )
         fig_layman.update_layout(
-            height=390,
-            margin=dict(t=25, b=35, l=50, r=50),
+            height=460,
+            margin=dict(t=40, b=35, l=50, r=50),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_layman, use_container_width=True)
 
@@ -2909,7 +3005,9 @@ if not obs_df.empty and "valid_time_utc" in obs_df.columns:
         else obs_df.iloc[0]["valid_time_utc"]
     )
     last_obs_dt = pd.to_datetime(raw_obs_ts, utc=True).tz_convert(LOCAL_TZ)
-    last_obs_str = last_obs_dt.strftime("%Y-%m-%d %H:%M %Z")
+    obs_age_min = max(0.0, (pd.Timestamp(now_utc) - last_obs_dt.tz_convert("UTC")).total_seconds() / 60.0)
+    fresh_badge = "🟢 LIVE" if obs_age_min <= 90.0 else f"🟡 STALE ({obs_age_min/60.0:.1f}h old)"
+    last_obs_str = f"{last_obs_dt.strftime('%Y-%m-%d %H:%M %Z')} ({fresh_badge})"
 else:
     last_obs_str = "Awaiting Telemetry"
 
@@ -3598,6 +3696,7 @@ else:
                 mode="lines",
                 line=dict(color="rgba(2, 132, 199, 0.65)", width=1.4, dash="dot"),
                 name="Dewpoint Temperature (°F)",
+                hovertemplate="<b>Dewpoint</b>: %{y:.1f} °F<extra></extra>",
             ),
             row=1,
             col=1,
@@ -3609,6 +3708,7 @@ else:
                 mode="lines",
                 line=dict(color="#2563eb", width=2.0, dash="dash"),
                 name="Raw NWS Grid Forecast (°F)",
+                hovertemplate="<b>Raw NWS Temp</b>: %{y:.1f} °F<extra></extra>",
             ),
             row=1,
             col=1,
@@ -3617,9 +3717,11 @@ else:
             go.Scatter(
                 x=combined_df["valid_local"],
                 y=c_to_f(corr_c_series).round(1),
+                customdata=np.column_stack([p10_f.round(1), p90_f.round(1)]),
                 mode="lines",
                 line=dict(color="#ea580c", width=2.8),
                 name="Tassajara MOS Corrected (°F)",
+                hovertemplate="<b>MOS Temp</b>: %{y:.1f} °F <i>[P10: %{customdata[0]:.1f}°, P90: %{customdata[1]:.1f}°]</i><extra></extra>",
             ),
             row=1,
             col=1,
@@ -3637,20 +3739,22 @@ else:
                         line=dict(color="#059669", width=2.2),
                         marker=dict(color="#059669", size=5.5, symbol="circle"),
                         name="Stone Office Observed (°F)",
+                        hovertemplate="<b>Observed Temp</b>: %{y:.1f} °F<extra></extra>",
                     ),
                     row=1,
                     col=1,
                 )
 
-        fig.add_hline(
-            y=32.0,
-            line_dash="dot",
-            line_color="#0284c7",
-            annotation_text="Freeze Threshold (32.0 °F)",
-            annotation_position="bottom right",
-            row=1,
-            col=1,
-        )
+        if min(float(p10_f.min()), float(dew_f_series.min())) <= 38.0:
+            fig.add_hline(
+                y=32.0,
+                line_dash="dot",
+                line_color="#0284c7",
+                annotation_text="Freeze Threshold (32.0 °F)",
+                annotation_position="bottom right",
+                row=1,
+                col=1,
+            )
 
         gust_series_ms = (
             get_col(combined_df, "actual_wind_gust_ms", np.nan)
@@ -3675,6 +3779,7 @@ else:
                 mode="lines",
                 line=dict(color="#d97706", width=2.0),
                 name="Peak Wind Gust (mph)",
+                hovertemplate="<b>Peak Gust</b>: %{y:.1f} mph<extra></extra>",
             ),
             row=2,
             col=1,
@@ -3687,6 +3792,7 @@ else:
                 mode="lines",
                 line=dict(color="#9333ea", width=1.8, dash="dot"),
                 name="Relative Humidity (%)",
+                hovertemplate="<b>Rel. Humidity</b>: %{y:.0f}%<extra></extra>",
             ),
             row=2,
             col=1,
@@ -3711,9 +3817,10 @@ else:
                 y=mos_pop_pct.round(0),
                 mode="lines",
                 fill="tozeroy",
-                fillcolor="rgba(2, 132, 199, 0.14)",
-                line=dict(color="#0284c7", width=2.0),
+                fillcolor="rgba(2, 132, 199, 0.07)",
+                line=dict(color="#0284c7", width=1.8),
                 name="MOS Calibrated PoP (%)",
+                hovertemplate="<b>MOS PoP</b>: %{y:.0f}%<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3724,8 +3831,9 @@ else:
                 x=combined_df["valid_local"],
                 y=raw_pop_pct.round(0),
                 mode="lines",
-                line=dict(color="rgba(100, 116, 139, 0.70)", width=1.4, dash="dot"),
+                line=dict(color="rgba(100, 116, 139, 0.65)", width=1.3, dash="dot"),
                 name="Raw NWS PoP (%)",
+                hovertemplate="<b>Raw NWS PoP</b>: %{y:.0f}%<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3736,8 +3844,9 @@ else:
                 x=combined_df["valid_local"],
                 y=mos_p90_rain_in,
                 mode="lines",
-                line=dict(color="rgba(225, 29, 72, 0.75)", width=1.5, dash="dash"),
+                line=dict(color="rgba(225, 29, 72, 0.80)", width=1.6, dash="dash"),
                 name="MOS P90 Extreme Rate (in/hr)",
+                hovertemplate="<b>MOS P90 Rate</b>: %{y:.3f} in/hr<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3747,8 +3856,10 @@ else:
             go.Bar(
                 x=combined_df["valid_local"],
                 y=raw_rain_in,
+                width=2700000,
                 name="Raw NWS QPF (in/hr)",
-                marker_color="rgba(37, 99, 235, 0.50)",
+                marker_color="rgba(37, 99, 235, 0.38)",
+                hovertemplate="<b>Raw NWS QPF</b>: %{y:.3f} in/hr<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3758,8 +3869,10 @@ else:
             go.Bar(
                 x=combined_df["valid_local"],
                 y=mos_rain_in,
+                width=1650000,
                 name="MOS Calibrated QPF (in/hr)",
-                marker_color="#0284c7",
+                marker_color="rgba(2, 132, 199, 0.88)",
+                hovertemplate="<b>MOS QPF</b>: %{y:.3f} in/hr<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3769,8 +3882,10 @@ else:
             go.Bar(
                 x=combined_df["valid_local"],
                 y=actual_rain_in,
+                width=1050000,
                 name="Observed Tipping Bucket (in/hr)",
                 marker_color="#059669",
+                hovertemplate="<b>Observed Rain</b>: %{y:.3f} in/hr<extra></extra>",
             ),
             row=3,
             col=1,
@@ -3829,7 +3944,7 @@ else:
             height=880,
             margin=dict(t=60, b=40, l=55, r=55),
             hovermode="x unified",
-            barmode="group",
+            barmode="overlay",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0.0),

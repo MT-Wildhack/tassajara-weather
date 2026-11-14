@@ -208,20 +208,20 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 (o.temp_c - f.nws_temp_c) AS temp_error_c,
                 (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
                 -- CHWC1: Chews Ridge (1,536m Interior Crest)
-                COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, f.nws_temp_c + 2.0) AS issue_chews_temp_c,
+                COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
                 COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
                 COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
                 -- CAHC1: Hastings Reservation (546m Foothill Valley)
-                COALESCE(r_hast.temp_c, r_arroyo.temp_c - 1.80, f.nws_temp_c + 0.5) AS issue_hastings_temp_c,
+                COALESCE(r_hast.temp_c, r_arroyo.temp_c - 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) - 0.60) AS issue_hastings_temp_c,
                 -- ASRC1: Arroyo Seco RAWS (268m Gorge Outlet)
-                COALESCE(r_arroyo.temp_c, r_hast.temp_c + 1.80, f.nws_temp_c + 1.4) AS issue_arroyo_temp_c,
+                COALESCE(r_arroyo.temp_c, r_hast.temp_c + 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) + 1.41) AS issue_arroyo_temp_c,
                 COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
                 -- PPSC1: Big Sur RAWS (108m Coastal Slope)
-                COALESCE(r_bigsur.temp_c, f.nws_temp_c + 0.8) AS issue_bigsur_temp_c,
+                COALESCE(r_bigsur.temp_c, COALESCE(o_issue.temp_c, f.nws_temp_c) + 2.45) AS issue_bigsur_temp_c,
                 COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
                 COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
                 -- VTCC1: Ventana Cone (1,453m Windward Crest)
-                COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, f.nws_temp_c + 1.5) AS issue_ventana_temp_c,
+                COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
                 COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
                 -- Local Stone Office Initialization State
                 COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
@@ -889,18 +889,18 @@ def populate_mos_verification_and_active_forecasts(
                 return default_val
 
             vent_raw_t = _ref_val("VTCC1", "temp_c", np.nan)
-            chews_default_t = (vent_raw_t - 0.54) if not np.isnan(vent_raw_t) else (tass_t + 2.0)
+            chews_default_t = (vent_raw_t - 0.54) if not np.isnan(vent_raw_t) else (tass_t - 6.83)
             chews_t = _ref_val("CHWC1", "temp_c", chews_default_t)
             chews_rh = _ref_val("CHWC1", "rh_pct", base_nws_rh)
             chews_p = _ref_val("CHWC1", "precip_1hr_mm", 0.0)
 
             arroyo_raw_t = _ref_val("ASRC1", "temp_c", np.nan)
-            hast_default_t = (arroyo_raw_t - 1.80) if not np.isnan(arroyo_raw_t) else (tass_t + 0.5)
+            hast_default_t = (arroyo_raw_t - 2.01) if not np.isnan(arroyo_raw_t) else (tass_t - 0.60)
             hast_t = _ref_val("CAHC1", "temp_c", hast_default_t)
-            arroyo_t = _ref_val("ASRC1", "temp_c", hast_t + 1.80)
+            arroyo_t = _ref_val("ASRC1", "temp_c", hast_t + 2.01)
             arroyo_rh = _ref_val("ASRC1", "rh_pct", base_nws_rh)
 
-            bigsur_t = _ref_val("PPSC1", "temp_c", tass_t + 0.8)
+            bigsur_t = _ref_val("PPSC1", "temp_c", tass_t + 2.45)
             bigsur_rh = _ref_val("PPSC1", "rh_pct", base_nws_rh)
             bigsur_p = _ref_val("PPSC1", "precip_1hr_mm", 0.0)
 

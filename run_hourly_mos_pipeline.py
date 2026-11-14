@@ -357,18 +357,18 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
             return default_val
 
         vent_raw_t = _ref_val("VTCC1", "temp_c", np.nan)
-        chews_default_t = (vent_raw_t - 0.54) if not np.isnan(vent_raw_t) else (base_nws_t + 2.0)
+        chews_default_t = (vent_raw_t - 0.54) if not np.isnan(vent_raw_t) else (tass_t - 6.83)
         chews_t = _ref_val("CHWC1", "temp_c", chews_default_t)
         chews_rh = _ref_val("CHWC1", "rh_pct", base_nws_rh)
         chews_p = _ref_val("CHWC1", "precip_1hr_mm", 0.0)
 
         arroyo_raw_t = _ref_val("ASRC1", "temp_c", np.nan)
-        hast_default_t = (arroyo_raw_t - 2.01) if not np.isnan(arroyo_raw_t) else (base_nws_t + 0.5)
+        hast_default_t = (arroyo_raw_t - 2.01) if not np.isnan(arroyo_raw_t) else (tass_t - 0.60)
         hast_t = _ref_val("CAHC1", "temp_c", hast_default_t)
-        arroyo_t = _ref_val("ASRC1", "temp_c", hast_t + 1.80)
+        arroyo_t = _ref_val("ASRC1", "temp_c", hast_t + 2.01)
         arroyo_rh = _ref_val("ASRC1", "rh_pct", base_nws_rh)
 
-        bigsur_t = _ref_val("PPSC1", "temp_c", base_nws_t + 0.8)
+        bigsur_t = _ref_val("PPSC1", "temp_c", tass_t + 2.45)
         bigsur_rh = _ref_val("PPSC1", "rh_pct", base_nws_rh)
         bigsur_p = _ref_val("PPSC1", "precip_1hr_mm", 0.0)
 
