@@ -89,6 +89,9 @@ st.markdown(
         font-size: 0.76rem !important;
         font-variant-numeric: tabular-nums;
     }
+    div[data-testid="stMetricDelta"] svg {
+        display: none !important;
+    }
     h1, h2, h3 {
         letter-spacing: -0.01em;
         font-weight: 600;
@@ -2182,7 +2185,8 @@ def render_hydro_risk_section(
                     y=(p_sub["projected_runoff_coeff"] * 100.0).round(1),
                     mode="lines",
                     line=dict(color="#9333ea", width=1.8, dash="dot"),
-                    name="Projected Runoff Coeff C (%)",
+                    name="Runoff Coeff C (%)",
+                    showlegend=h_sub.empty,
                 ),
                 row=1,
                 col=1,
@@ -2263,6 +2267,7 @@ def render_hydro_risk_section(
 
         fig_hydro.update_yaxes(
             title_text="API Wetness (in)",
+            rangemode="tozero",
             gridcolor=GRID_RGBA,
             row=1,
             col=1,
@@ -2271,6 +2276,8 @@ def render_hydro_risk_section(
         fig_hydro.update_yaxes(
             title_text="Runoff Coeff C (%)",
             range=[0, 100],
+            tickmode="array",
+            tickvals=[0, 25, 50, 75, 100],
             showgrid=False,
             row=1,
             col=1,
@@ -2278,6 +2285,7 @@ def render_hydro_risk_section(
         )
         fig_hydro.update_yaxes(
             title_text="Creek Discharge (CFS)",
+            rangemode="tozero",
             gridcolor=GRID_RGBA,
             row=2,
             col=1,
@@ -2285,6 +2293,8 @@ def render_hydro_risk_section(
         )
         fig_hydro.update_yaxes(
             title_text="Runoff Rate (in/hr)",
+            rangemode="tozero",
+            nticks=5,
             showgrid=False,
             row=2,
             col=1,
@@ -2293,12 +2303,12 @@ def render_hydro_risk_section(
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=2, col=1)
         fig_hydro.update_layout(
-            height=440,
-            margin=dict(t=40, b=30, l=50, r=50),
+            height=490,
+            margin=dict(t=95, b=30, l=50, r=55),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.12, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_hydro, use_container_width=True)
 
@@ -2411,25 +2421,39 @@ def render_layman_forecast_view(
         w_card = deg_to_cardinal(w_dir) if w_mph > 0.4 else "Calm"
 
         rain_24_in = mm_to_in(float(get_col(last_24, "precip_1hr_mm", 0.0).sum()))
+        rain_1hr_now_in = mm_to_in(safe_float(latest.get("precip_1hr_mm"), 0.0))
     else:
         temp_f, hi_24_f, lo_24_f = 65.0, 72.0, 48.0
         rh_pct, dew_f = 50.0, 45.0
         w_mph, w_gst_mph, w_card = 0.0, 0.0, "Calm"
         rain_24_in = 0.0
+        rain_1hr_now_in = 0.0
 
     is_day = solar_el > 0.0
     in_shade = "Shadow" in solar_state
     cur_sky = 20.0
     cur_pop = 0.0
+    cur_fc_qpf_in = 0.0
     if not future_fc_df.empty:
         cur_sky = safe_float(future_fc_df.iloc[0].get("nws_sky_cover_pct"), 20.0)
         cur_pop = safe_float(
             future_fc_df.iloc[0].get("mos_pop_pct", future_fc_df.iloc[0].get("nws_pop_pct")),
             0.0,
         )
+        cur_fc_qpf_in = mm_to_in(
+            safe_float(
+                future_fc_df.iloc[0].get("mos_qpf_mm", future_fc_df.iloc[0].get("nws_qpf_1hr_mm")),
+                0.0,
+            )
+        )
 
     cur_icon, cur_cond = get_weather_icon_and_label(
-        cur_pop, rain_24_in, cur_sky, temp_f, is_daytime=is_day, in_canyon_shade=in_shade
+        cur_pop,
+        max(rain_1hr_now_in, cur_fc_qpf_in),
+        cur_sky,
+        temp_f,
+        is_daytime=is_day,
+        in_canyon_shade=in_shade,
     )
 
     if solar_el <= 0.0:
@@ -2754,6 +2778,8 @@ def render_layman_forecast_view(
         fig_layman.update_yaxes(
             title_text="Chance (%)",
             range=[0, 105],
+            tickmode="array",
+            tickvals=[0, 25, 50, 75, 100],
             showgrid=False,
             row=2,
             col=1,
@@ -2767,12 +2793,12 @@ def render_layman_forecast_view(
             col=1,
         )
         fig_layman.update_layout(
-            height=460,
-            margin=dict(t=40, b=35, l=50, r=50),
+            height=480,
+            margin=dict(t=75, b=35, l=50, r=50),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_layman, use_container_width=True)
 
@@ -3463,11 +3489,11 @@ else:
         obs_total_in = mm_to_in(float(v_sub["obs_rain_mm"].sum()))
         mos_total_in = mm_to_in(float(v_sub["mos_qpf_mm_val"].sum()))
 
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1, s2, s3 = st.columns(3)
         s1.metric(
             "Raw NWP/NWS Error (MAE)",
             f"± {nws_mae_f:.2f} °F",
-            f"RMSE: ± {nws_rmse_f:.2f} °F | Bias: {nws_bias_f:+.2f} °F",
+            f"RMSE: ± {nws_rmse_f:.2f} °F | Mean Bias: {nws_bias_f:+.2f} °F",
             delta_color="off",
             help=(
                 "Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and Mean Bias of "
@@ -3477,35 +3503,36 @@ else:
         s2.metric(
             "Tassajara MOS Error (MAE)",
             f"± {mos_mae_f:.2f} °F",
-            f"{mos_mae_f - nws_mae_f:+.2f} °F MAE vs Raw NWP",
+            f"{mos_mae_f - nws_mae_f:+.2f} °F MAE vs. Raw NWP",
             delta_color="inverse",
             help="Mean Absolute Error (MAE) of the Tassajara MOS HistGradientBoosting ensemble.",
         )
         s3.metric(
             "MOS RMSE Skill Score",
             f"{skill_pct:+.1f} %",
-            f"MOS RMSE: ± {mos_rmse_f:.2f} °F (Bias: {mos_bias_f:+.2f} °F)",
+            f"MOS RMSE: ± {mos_rmse_f:.2f} °F | Mean Bias: {mos_bias_f:+.2f} °F",
             delta_color="normal" if skill_pct >= 0 else "inverse",
             help="Forecast Skill Score defined as (1 - RMSE_MOS / RMSE_NWS) * 100%.",
         )
+        s4, s5, s6 = st.columns(3)
         s4.metric(
             "Hourly Win Frequency",
-            f"{win_rate_pct:.1f} % ({hours_mos_won}/{total_eval_hrs}h)",
-            f"Evaluated over {total_eval_hrs} paired hours",
+            f"{win_rate_pct:.1f} % ({hours_mos_won} / {total_eval_hrs} hrs)",
+            f"Evaluated over {total_eval_hrs} paired verification hours",
             delta_color="off",
             help="Percentage of hours where |E_MOS| <= |E_NWS|.",
         )
         s5.metric(
             "P10–P90 Interval Coverage",
             f"{in_bounds:.1f} %",
-            "Nominal 80% Quantile Envelope",
+            "Target: Nominal 80.0% Quantile Envelope",
             delta_color="off",
             help="Percentage of observations within the predicted P10-P90 interval.",
         )
         s6.metric(
-            "Hydrological Brier & QPF",
+            "Hydrological Brier Score & QPF",
             f"BS: {mos_brier:.4f}",
-            f"Obs: {obs_total_in:.2f}\" | MOS: {mos_total_in:.2f}\"",
+            f"Window Rain — Obs: {obs_total_in:.2f} in | MOS: {mos_total_in:.2f} in",
             delta_color="off",
             help="Brier Score and total accumulation comparison for the evaluation window.",
         )
@@ -3852,11 +3879,16 @@ else:
             col=1,
             secondary_y=False,
         )
+        bar_scale = 0.72 if len(combined_df) > 180 else 1.0
+        raw_rain_plot = np.where(raw_rain_in > 0.0, raw_rain_in, np.nan)
+        mos_rain_plot = np.where(mos_rain_in > 0.0, mos_rain_in, np.nan)
+        act_rain_plot = np.where(actual_rain_in > 0.0, actual_rain_in, np.nan)
+
         fig.add_trace(
             go.Bar(
                 x=combined_df["valid_local"],
-                y=raw_rain_in,
-                width=2700000,
+                y=raw_rain_plot,
+                width=int(2600000 * bar_scale),
                 name="Raw NWS QPF (in/hr)",
                 marker_color="rgba(37, 99, 235, 0.38)",
                 hovertemplate="<b>Raw NWS QPF</b>: %{y:.3f} in/hr<extra></extra>",
@@ -3868,8 +3900,8 @@ else:
         fig.add_trace(
             go.Bar(
                 x=combined_df["valid_local"],
-                y=mos_rain_in,
-                width=1650000,
+                y=mos_rain_plot,
+                width=int(1650000 * bar_scale),
                 name="MOS Calibrated QPF (in/hr)",
                 marker_color="rgba(2, 132, 199, 0.88)",
                 hovertemplate="<b>MOS QPF</b>: %{y:.3f} in/hr<extra></extra>",
@@ -3881,8 +3913,8 @@ else:
         fig.add_trace(
             go.Bar(
                 x=combined_df["valid_local"],
-                y=actual_rain_in,
-                width=1050000,
+                y=act_rain_plot,
+                width=int(1050000 * bar_scale),
                 name="Observed Tipping Bucket (in/hr)",
                 marker_color="#059669",
                 hovertemplate="<b>Observed Rain</b>: %{y:.3f} in/hr<extra></extra>",
@@ -3924,7 +3956,16 @@ else:
             col=1,
             secondary_y=False,
         )
-        fig.update_yaxes(title_text="RH (%)", range=[0, 105], showgrid=False, row=2, col=1, secondary_y=True)
+        fig.update_yaxes(
+            title_text="RH (%)",
+            range=[0, 105],
+            tickmode="array",
+            tickvals=[0, 25, 50, 75, 100],
+            showgrid=False,
+            row=2,
+            col=1,
+            secondary_y=True,
+        )
         fig.update_yaxes(
             title_text="Rain Rate (in/hr)",
             range=[0, rain_y_top],
@@ -3933,7 +3974,16 @@ else:
             col=1,
             secondary_y=False,
         )
-        fig.update_yaxes(title_text="PoP (%)", range=[0, 105], showgrid=False, row=3, col=1, secondary_y=True)
+        fig.update_yaxes(
+            title_text="PoP (%)",
+            range=[0, 105],
+            tickmode="array",
+            tickvals=[0, 25, 50, 75, 100],
+            showgrid=False,
+            row=3,
+            col=1,
+            secondary_y=True,
+        )
         x_min = combined_df["valid_local"].min()
         x_max = combined_df["valid_local"].max()
         for r_idx in (1, 2, 3):
@@ -3941,13 +3991,13 @@ else:
         fig.update_xaxes(title_text="Local Time (America/Los_Angeles)", row=3, col=1)
 
         fig.update_layout(
-            height=880,
-            margin=dict(t=60, b=40, l=55, r=55),
+            height=920,
+            margin=dict(t=105, b=40, l=55, r=55),
             hovermode="x unified",
             barmode="overlay",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.07, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -4073,15 +4123,27 @@ else:
             _met_regime, axis=1
         )
 
+        daily_summary["MOS High / Low (°F)"] = (
+            daily_summary["MOS_High_F"].map(lambda v: f"{v:.1f}°")
+            + " / "
+            + daily_summary["MOS_Low_F"].map(lambda v: f"{v:.1f}°")
+        )
+        daily_summary["P10 Floor / P90 Peak (°F)"] = (
+            daily_summary["Cold_Pool_Floor_F"].map(lambda v: f"{v:.1f}°")
+            + " / "
+            + daily_summary["Thermal_Peak_P90_F"].map(lambda v: f"{v:.1f}°")
+        )
+        daily_summary["Raw NWS High / Low (°F)"] = (
+            daily_summary["NWS_High_F"].map(lambda v: f"{v:.1f}°")
+            + " / "
+            + daily_summary["NWS_Low_F"].map(lambda v: f"{v:.1f}°")
+        )
         display_daily = daily_summary[
             [
                 "Date_Key",
-                "MOS_High_F",
-                "MOS_Low_F",
-                "Cold_Pool_Floor_F",
-                "Thermal_Peak_P90_F",
-                "NWS_High_F",
-                "NWS_Low_F",
+                "MOS High / Low (°F)",
+                "P10 Floor / P90 Peak (°F)",
+                "Raw NWS High / Low (°F)",
                 "MOS_Max_PoP_Pct",
                 "MOS_QPF_In",
                 "MOS_P90_QPF_In",
@@ -4093,16 +4155,10 @@ else:
         ].rename(
             columns={
                 "Date_Key": "Date",
-                "MOS_High_F": "MOS High (°F)",
-                "MOS_Low_F": "MOS Low (°F)",
-                "Cold_Pool_Floor_F": "P10 Floor (°F)",
-                "Thermal_Peak_P90_F": "P90 Ceiling (°F)",
-                "NWS_High_F": "Raw NWS High (°F)",
-                "NWS_Low_F": "Raw NWS Low (°F)",
                 "MOS_Max_PoP_Pct": "MOS PoP (%)",
                 "MOS_QPF_In": "MOS QPF (in)",
-                "MOS_P90_QPF_In": "P90 Ceiling QPF (in)",
-                "Raw_QPF_In": "Raw NWS QPF (in)",
+                "MOS_P90_QPF_In": "P90 QPF (in)",
+                "Raw_QPF_In": "Raw QPF (in)",
                 "Min_RH_Pct": "Min RH (%)",
                 "Peak_Gust_MPH": "Peak Gust (mph)",
             }
@@ -4124,49 +4180,52 @@ else:
     with tab_imp:
         imp_df = model_diag["imp_df"]
         if not imp_df.empty:
-            top_n = imp_df.sort_values("Combined Share (%)", ascending=True).tail(16)
+            top_thermal = imp_df.sort_values("Thermal Importance (%)", ascending=True).tail(12)
+            top_hydro = imp_df.sort_values("Hydrological Importance (%)", ascending=True).tail(12)
 
             fig_imp = make_subplots(
                 rows=1,
                 cols=2,
-                shared_yaxes=True,
-                horizontal_spacing=0.06,
+                shared_yaxes=False,
+                horizontal_spacing=0.26,
                 subplot_titles=(
-                    "Thermal MOS Predictor Attribution (% RMSE Share)",
-                    "Hydrological Hurdle Predictor Attribution (% QPF/PoP Share)",
+                    "Top 12 Thermal MOS Predictors (% RMSE Share)",
+                    "Top 12 Hydrological Hurdle Predictors (% QPF/PoP Share)",
                 ),
             )
             fig_imp.add_trace(
                 go.Bar(
-                    x=top_n["Thermal Importance (%)"],
-                    y=top_n["Physical Predictor"],
+                    x=top_thermal["Thermal Importance (%)"],
+                    y=top_thermal["Physical Predictor"],
                     orientation="h",
                     marker_color="#ea580c",
                     name="Thermal MOS Share (%)",
-                    text=top_n["Thermal Importance (%)"].map(lambda v: f"{v:.1f}%"),
+                    text=top_thermal["Thermal Importance (%)"].map(lambda v: f"{v:.1f}%"),
                     textposition="auto",
+                    hovertemplate="<b>%{y}</b>: %{x:.2f}% Thermal Share<extra></extra>",
                 ),
                 row=1,
                 col=1,
             )
             fig_imp.add_trace(
                 go.Bar(
-                    x=top_n["Hydrological Importance (%)"],
-                    y=top_n["Physical Predictor"],
+                    x=top_hydro["Hydrological Importance (%)"],
+                    y=top_hydro["Physical Predictor"],
                     orientation="h",
                     marker_color="#0284c7",
                     name="Hydrological Hurdle Share (%)",
-                    text=top_n["Hydrological Importance (%)"].map(lambda v: f"{v:.1f}%"),
+                    text=top_hydro["Hydrological Importance (%)"].map(lambda v: f"{v:.1f}%"),
                     textposition="auto",
+                    hovertemplate="<b>%{y}</b>: %{x:.2f}% Hydrological Share<extra></extra>",
                 ),
                 row=1,
                 col=2,
             )
-            fig_imp.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
-            fig_imp.update_xaxes(gridcolor=GRID_RGBA, row=1, col=2)
+            fig_imp.update_xaxes(title_text="Thermal Share (%)", gridcolor=GRID_RGBA, row=1, col=1)
+            fig_imp.update_xaxes(title_text="Hydrological Share (%)", gridcolor=GRID_RGBA, row=1, col=2)
             fig_imp.update_layout(
-                height=520,
-                margin=dict(t=50, b=35, l=20, r=25),
+                height=480,
+                margin=dict(t=55, b=40, l=20, r=25),
                 plot_bgcolor=PLOT_BG_RGBA,
                 paper_bgcolor="rgba(0,0,0,0)",
                 showlegend=False,
