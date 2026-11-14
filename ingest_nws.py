@@ -238,6 +238,25 @@ def fetch_open_meteo_nwp_map(past_days: int = 1, forecast_days: int = 8) -> Dict
         timeout=12,
         retries=2,
     )
+    if not isinstance(data, dict) and past_days > 0:
+        hist_params = {
+            "latitude": TASS_LAT,
+            "longitude": TASS_LON,
+            "elevation": NWP_GRID_ELEV_M,
+            "start_date": (datetime.now(timezone.utc).date() - timedelta(days=int(past_days) + 1)).isoformat(),
+            "end_date": (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat(),
+            "hourly": params["hourly"],
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "ms",
+            "precipitation_unit": "mm",
+            "timezone": "UTC",
+        }
+        data = _get_json_with_retries(
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+            params=hist_params,
+            timeout=14,
+            retries=2,
+        )
     if not isinstance(data, dict):
         return supp
 
@@ -418,9 +437,12 @@ def fetch_nws_gridpoints_dataframe(
     hr_list = [start_dt + timedelta(hours=i) for i in range(total_hours)]
 
     rows: List[Dict[str, Any]] = []
-    last_temp_c = 15.0
-    last_rh_pct = 50.0
-    last_wspd_ms = 1.5
+    first_t = next((float(grid_temp_map[k]) for k in sorted(grid_temp_map.keys())), 12.0)
+    first_rh = next((float(grid_rh_map[k]) for k in sorted(grid_rh_map.keys())), 65.0)
+    first_wspd = next((float(grid_wspd_map[k]) for k in sorted(grid_wspd_map.keys())), 1.5)
+    last_temp_c = first_t
+    last_rh_pct = first_rh
+    last_wspd_ms = first_wspd
     last_wdir_deg = 295.0
     last_pop_pct = 0.0
     last_sky_pct = 20.0

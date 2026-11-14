@@ -85,6 +85,12 @@ st.markdown(
         font-variant-numeric: tabular-nums;
         color: var(--text-color) !important;
     }
+    section[data-testid="stSidebar"] div[data-testid="stMetricValue"] > div {
+        font-size: 1.18rem !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stMetricLabel"] > div {
+        font-size: 0.72rem !important;
+    }
     div[data-testid="stMetricDelta"] > div {
         font-size: 0.76rem !important;
         font-variant-numeric: tabular-nums;
@@ -2977,14 +2983,14 @@ with st.sidebar:
         "diagnostics for Station 36966 (Stone Office Davis Vantage Pro2, 485 m MSL)."
     )
     st.metric(
-        "Serialized Model Artifact",
-        "Loaded (v1.joblib)" if model_diag["model_loaded"] else "Physics Fallback",
-        f"Features: {len(model_diag['feature_names']) or 25} predictors",
+        "Model Artifact",
+        "Loaded (v1)" if model_diag["model_loaded"] else "Physics Mode",
+        f"{len(model_diag['feature_names']) or 25} physical predictors",
         delta_color="off",
         help="Indicates whether models/tassajara_mos_v1.joblib is loaded in memory.",
     )
     st.metric(
-        "OLS Explained Variance (R²)",
+        "OLS R² (Explained Bias)",
         f"{model_diag['ols_r2']:.3f}" if not math.isnan(model_diag["ols_r2"]) else "N/A",
         f"Adj R²: {model_diag['ols_adj_r2']:.3f} (n={model_diag['ols_nobs']})"
         if not math.isnan(model_diag["ols_adj_r2"])
@@ -2993,15 +2999,15 @@ with st.sidebar:
         help="Proportion of linear NWP temperature bias variance explained by the physical predictors.",
     )
     st.metric(
-        "Archive Wet Hours (>=0.01 in)",
+        "Archive Wet Hours",
         f"{archive_stats['wet_hours']} hrs",
-        f"Total Archive Rain: {mm_to_in(archive_stats['total_rain_mm']):.2f} in",
+        f"Archive Rain: {mm_to_in(archive_stats['total_rain_mm']):.2f} in",
         delta_color="off",
         help="Total hours with tipping-bucket rainfall >= 0.254 mm in local_observations.",
     )
     st.metric(
-        "Flood & Road Alert Tier",
-        f"{hydro_bundle['summary']['icon']} {hydro_bundle['summary']['alert_code']} (Tier {hydro_bundle['summary']['alert_tier']})",
+        "Flood & Road Tier",
+        f"{hydro_bundle['summary']['icon']} {hydro_bundle['summary']['alert_code']} (T{hydro_bundle['summary']['alert_tier']})",
         f"API: {hydro_bundle['summary']['api_in']:.2f} in | C: {hydro_bundle['summary']['runoff_coeff_pct']:.0f}%",
         delta_color="off",
         help="Active 4-tier Flood & Tassajara Road Washout status driven by Antecedent Precipitation Index (API) and MOS QPF/P90.",
@@ -3542,22 +3548,22 @@ else:
             expanded=False,
         ):
             ver_table = pd.DataFrame({
-                "Valid Time (Local)": v_sub["valid_local"].dt.strftime("%Y-%m-%d %H:%M"),
-                "Lead (hr)": pd.to_numeric(v_sub["lead_time_hours"], errors="coerce").fillna(6).astype(int),
+                "Valid Time": v_sub["valid_local"].dt.strftime("%m-%d %H:%M"),
+                "Lead": pd.to_numeric(v_sub["lead_time_hours"], errors="coerce").fillna(6).astype(int),
                 "Actual (°F)": v_sub["actual_f"].round(1),
-                "MOS Forecast (°F)": v_sub["mos_f"].round(1),
-                "MOS [P10, P90] (°F)": (
+                "MOS (°F)": v_sub["mos_f"].round(1),
+                "[P10, P90]": (
                     "[" + v_sub["p10_f"].round(1).astype(str) + ", " + v_sub["p90_f"].round(1).astype(str) + "]"
                 ),
-                "Raw NWS/NWP (°F)": v_sub["nws_f"].round(1),
-                "MOS Residual (°F)": v_sub["mos_err_f"].round(2),
-                "NWS Residual (°F)": v_sub["nws_err_f"].round(2),
-                "|MOS| Gain (°F)": (v_sub["nws_abs_err_f"] - v_sub["mos_abs_err_f"]).round(2),
-                "Obs Rain (in)": (v_sub["obs_rain_mm"] / 25.4).round(3),
-                "MOS QPF (in)": (v_sub["mos_qpf_mm_val"] / 25.4).round(3),
-                "MOS PoP (%)": v_sub["mos_pop_val"].round(0).astype(int),
-                "Superior Model": np.where(
-                    v_sub["mos_abs_err_f"] <= v_sub["nws_abs_err_f"], "Tassajara MOS", "Raw NWS"
+                "Raw NWS (°F)": v_sub["nws_f"].round(1),
+                "MOS Err": v_sub["mos_err_f"].round(2),
+                "NWS Err": v_sub["nws_err_f"].round(2),
+                "Gain (°F)": (v_sub["nws_abs_err_f"] - v_sub["mos_abs_err_f"]).round(2),
+                "Obs Rain": (v_sub["obs_rain_mm"] / 25.4).round(2),
+                "MOS QPF": (v_sub["mos_qpf_mm_val"] / 25.4).round(2),
+                "PoP (%)": v_sub["mos_pop_val"].round(0).astype(int),
+                "Winner": np.where(
+                    v_sub["mos_abs_err_f"] <= v_sub["nws_abs_err_f"], "MOS", "NWS"
                 ),
             }).iloc[::-1].reset_index(drop=True)
 
@@ -3991,13 +3997,13 @@ else:
         fig.update_xaxes(title_text="Local Time (America/Los_Angeles)", row=3, col=1)
 
         fig.update_layout(
-            height=920,
-            margin=dict(t=105, b=40, l=55, r=55),
+            height=940,
+            margin=dict(t=115, b=40, l=55, r=55),
             hovermode="x unified",
             barmode="overlay",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.07, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig, use_container_width=True)
 
