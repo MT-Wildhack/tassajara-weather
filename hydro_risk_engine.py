@@ -215,9 +215,12 @@ def compute_runoff_coefficient(
 ) -> float:
     """
     Scales the effective runoff coefficient C in [0.08, 0.86] as a nonlinear function
-    of current soil wetness state (API_t) and 72-hour deep regolith priming.
+    of current soil wetness state (API_t), with bounded deep-regolith priming so C
+    returns to baseline once API_t drains after a past storm.
     """
-    effective_wetness_mm = max(0.0, float(api_mm or 0.0)) + 0.18 * max(0.0, float(precip_72hr_mm or 0.0))
+    api_clean = max(0.0, float(api_mm or 0.0))
+    deep_priming_mm = min(api_clean * 0.35, 0.05 * max(0.0, float(precip_72hr_mm or 0.0)))
+    effective_wetness_mm = api_clean + deep_priming_mm
     logistic = 1.0 / (1.0 + math.exp(-(effective_wetness_mm - API_MIDPOINT_MM) / API_SCALE_MM))
     c_val = RUNOFF_C_MIN + (RUNOFF_C_MAX - RUNOFF_C_MIN) * logistic
     return round(float(np.clip(c_val, RUNOFF_C_MIN, RUNOFF_C_MAX)), 3)
@@ -277,18 +280,19 @@ def evaluate_flood_and_road_tier(
     max_1hr_rate_mm = max(float(precip_1hr_mm or 0.0), float(peak_qpf_1hr_24h_mm or 0.0))
     max_p90_rate_mm = max(max_1hr_rate_mm, float(peak_p90_1hr_24h_mm or 0.0))
     rolling_24h_mm = max(float(precip_24hr_mm or 0.0), float(forecast_qpf_24hr_mm or 0.0))
+    active_48h_Bridge_mm = float(precip_24hr_mm or 0.0) + float(forecast_qpf_24hr_mm or 0.0)
     total_72h_window_mm = max(
-        float(precip_72hr_mm or 0.0),
-        float(precip_24hr_mm or 0.0) + float(forecast_qpf_24hr_mm or 0.0),
+        active_48h_Bridge_mm,
         float(forecast_qpf_72hr_mm or 0.0),
     )
     soil_primed = (api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
+    imminent_24h_wet = (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
 
     red_reasons: List[str] = []
     orange_reasons: List[str] = []
     yellow_reasons: List[str] = []
 
-    # --- Check RED (Tier 3: Flash Flood Warning / Road Closure) ---
+    # --- Check RED (Tier 3: Immediate Flash Flood Warning / Road Closure) ---
     if max_1hr_rate_mm >= RED_QPF_RATE_MM_HR:
         red_reasons.append(
             f"Extreme rainfall rate {max_1hr_rate_mm / MM_PER_INCH:.2f} in/hr "
@@ -299,12 +303,16 @@ def evaluate_flood_and_road_tier(
             f"Extreme MOS P90 downpour rate {max_p90_rate_mm / MM_PER_INCH:.2f} in/hr "
             f"on primed catchment (API {eff_api_mm / MM_PER_INCH:.2f} in)"
         )
-    if total_72h_window_mm >= RED_RAIN_72H_ABSOLUTE_MM:
+    if active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed:
         red_reasons.append(
-            f"Cumulative 3-day storm total {total_72h_window_mm / MM_PER_INCH:.2f} in "
+            f"Active 48h storm total {active_48h_Bridge_mm / MM_PER_INCH:.2f} in "
             f"exceeds critical 4.00 in road washout threshold"
         )
-    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and eff_api_mm >= ORANGE_API_MM:
+    elif (
+        total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM
+        and eff_api_mm >= ORANGE_API_MM
+        and imminent_24h_wet
+    ):
         red_reasons.append(
             f"3-day rainfall {total_72h_window_mm / MM_PER_INCH:.2f} in combined with "
             f"heavily saturated soil (API {eff_api_mm / MM_PER_INCH:.2f} in)"

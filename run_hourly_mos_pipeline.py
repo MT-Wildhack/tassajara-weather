@@ -171,10 +171,10 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
                 ),
             )
 
-        # Reconcile 24-hour / storm rain if /v2/historic did not report sub-hourly clicks
-        reported_24h_mm = max(
+        # Reconcile 24-hour rain ONLY from true 24h / last-hour gauge fields (never multi-day storm total)
+        reported_24h_mm = min(
             clean_num(tass_obs.get("precip_24hr_mm"), 0.0) or 0.0,
-            clean_num(tass_obs.get("precip_storm_mm"), 0.0) or 0.0,
+            clean_num(tass_obs.get("precip_1hr_mm"), 0.0) or 0.0,
         )
         if reported_24h_mm > 0.0:
             window_start_iso = conn.execute(

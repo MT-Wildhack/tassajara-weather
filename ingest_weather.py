@@ -124,32 +124,32 @@ def compute_vpd_kpa(temp_c: Optional[float], rh_pct: Optional[float]) -> Optiona
 
 def extract_archive_rain_mm(rec: Dict[str, Any]) -> float:
     """
-    Extracts incremental rainfall (mm) from a single WeatherLink v2 archive record
-    across all Davis ISS / WeatherLink Console / WeatherLink Live schemas.
+    Extracts strictly incremental archive-interval rainfall (mm) from a single
+    WeatherLink v2 /historic/ record. Never uses rolling 60-minute fields
+    (rainfall_last_60_min_*), which would multiply rain by 4x-12x when summed
+    across 5- or 15-minute sub-hourly archive packets.
     """
-    rain_mm = first_not_none(
-        rec.get("rainfall_mm"),
-        rec.get("rain_mm"),
-        rec.get("rainfall_last_60_min_mm"),
-    )
-    if rain_mm is not None and float(rain_mm) > 0.0:
-        return round(float(rain_mm), 3)
-
     rain_in = first_not_none(
         rec.get("rainfall_in"),
         rec.get("rain_in"),
-        rec.get("rainfall_last_60_min_in"),
     )
-    if rain_in is not None and float(rain_in) > 0.0:
-        return round(float(rain_in) * 25.4, 3)
+    if rain_in is not None:
+        return round(max(0.0, float(rain_in) * 25.4), 3)
+
+    rain_mm = first_not_none(
+        rec.get("rainfall_mm"),
+        rec.get("rain_mm"),
+    )
+    if rain_mm is not None:
+        return round(max(0.0, float(rain_mm)), 3)
 
     clicks = first_not_none(
         rec.get("rainfall_clicks"),
         rec.get("rain_clicks"),
         rec.get("rainfall"),
     )
-    if clicks is not None and float(clicks) > 0.0:
-        return round(float(clicks) * 0.254, 3)
+    if clicks is not None:
+        return round(max(0.0, float(clicks) * 0.254), 3)
 
     return 0.0
 
