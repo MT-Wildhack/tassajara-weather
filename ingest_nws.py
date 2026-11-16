@@ -556,10 +556,14 @@ def fetch_nws_gridpoints_dataframe(
 
         if nws_grid_qpf > 0.0:
             qpf_1hr_mm = round(nws_grid_qpf, 3)
-        elif om_qpf > 0.0:
+        elif not grid_qpf_map and om_qpf > 0.0:
             qpf_1hr_mm = round(om_qpf, 3)
-        else:
+        elif pop_pct >= 25.0 and om_qpf > 0.0:
+            qpf_1hr_mm = round(min(om_qpf, synth_qpf * 1.5 if synth_qpf > 0 else om_qpf), 3)
+        elif not grid_qpf_map:
             qpf_1hr_mm = round(synth_qpf, 3)
+        else:
+            qpf_1hr_mm = 0.0
 
         # Sky Cover (%)
         if v_iso in grid_sky_map:
