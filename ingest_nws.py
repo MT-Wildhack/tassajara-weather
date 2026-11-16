@@ -663,18 +663,13 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
                 qpf_repair_rows,
             )
 
+        # Clean any low-PoP (<20%) forecast rows that have spurious QPF
         conn.execute(
             """
             UPDATE nws_forecasts
-            SET nws_qpf_1hr_mm = ROUND(
-                CASE
-                    WHEN nws_pop_pct >= 60.0 THEN 1.35 * POWER(nws_pop_pct / 100.0, 1.15) * MAX(0.30, COALESCE(nws_rh_pct, 50.0) / 100.0)
-                    ELSE 0.65 * POWER(nws_pop_pct / 100.0, 1.35) * MAX(0.30, COALESCE(nws_rh_pct, 50.0) / 100.0)
-                END,
-                3
-            )
-            WHERE COALESCE(nws_qpf_1hr_mm, 0.0) <= 0.0
-              AND COALESCE(nws_pop_pct, 0.0) >= 20.0
+            SET nws_qpf_1hr_mm = 0.0
+            WHERE COALESCE(nws_pop_pct, 0.0) < 20.0
+              AND COALESCE(nws_qpf_1hr_mm, 0.0) > 0.0
             """
         )
         conn.commit()

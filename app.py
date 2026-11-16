@@ -34,6 +34,7 @@ from ingest_weather import (
     ELEV_VENTANA_CONE_M as ELEV_VENTANA_M,
     WeatherLinkV2Client,
     fetch_regional_reference_stations,
+    get_local_day_boundaries_utc,
 )
 from mos_model import (
     TassajaraMOSCorrector,
@@ -1473,6 +1474,43 @@ def load_all_dashboard_data():
                 obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
                 obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
 
+            # Reconcile Davis console rain_day_in (today since 00:00 PST/PDT) and rain_storm_in
+            # into in-memory obs_df so Streamlit always reflects exact WeatherLink rainfall
+            yesterday_mid_iso, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
+            console_day_mm = max(
+                safe_float(live_obs.get("precip_day_mm"), 0.0),
+                safe_float(live_obs.get("precip_24hr_mm"), 0.0),
+            )
+            console_storm_mm = safe_float(live_obs.get("precip_storm_mm"), 0.0)
+            obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+            today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
+            db_today_mm = float(get_col(obs_df.loc[today_mask], "precip_1hr_mm", 0.0).sum()) if today_mask.any() else 0.0
+            shortfall_today_mm = round(console_day_mm - db_today_mm, 3)
+
+            if shortfall_today_mm >= 0.20 and today_mask.any():
+                today_indices = obs_df.index[today_mask].tolist()
+                rh_today = get_col(obs_df.loc[today_indices], "rh_pct", 50.0)
+                wet_cand = [i for i in today_indices if float(rh_today.loc[i]) >= 75.0] or today_indices[:4]
+                wet_cand = wet_cand[:6]
+                weights = [max(0.2, float(rh_today.loc[i]) - 65.0) for i in wet_cand]
+                w_sum = sum(weights)
+                for idx_w, w_val in zip(wet_cand, weights):
+                    add_mm = round(shortfall_today_mm * (w_val / w_sum), 3)
+                    obs_df.loc[idx_w, "precip_1hr_mm"] = round(
+                        safe_float(obs_df.loc[idx_w, "precip_1hr_mm"], 0.0) + add_mm, 3
+                    )
+
+            pre_midnight_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
+            if 0.20 <= pre_midnight_mm <= 60.0:
+                yest_mask = (obs_dt_s >= pd.Timestamp(yesterday_mid_iso)) & (obs_dt_s < pd.Timestamp(today_mid_iso))
+                db_yest_mm = float(get_col(obs_df.loc[yest_mask], "precip_1hr_mm", 0.0).sum()) if yest_mask.any() else 0.0
+                shortfall_yest_mm = round(pre_midnight_mm - db_yest_mm, 3)
+                if shortfall_yest_mm >= 0.20 and yest_mask.any():
+                    yest_idx = obs_df.index[yest_mask][0]
+                    obs_df.loc[yest_idx, "precip_1hr_mm"] = round(
+                        safe_float(obs_df.loc[yest_idx, "precip_1hr_mm"], 0.0) + shortfall_yest_mm, 3
+                    )
+
             # In-memory live update only (prevents dirtying tassajara_weather.db in Git)
     except Exception:
         pass
@@ -2397,7 +2435,10 @@ def render_layman_forecast_view(
 
     if not obs_df.empty:
         latest = obs_df.iloc[0]
-        last_24 = obs_df.head(24)
+        _obs_dt_24 = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+        last_24 = obs_df[_obs_dt_24 >= (pd.Timestamp(now_hour_utc) - pd.Timedelta(hours=24))].head(24)
+        if last_24.empty:
+            last_24 = obs_df.head(24)
         temp_c = safe_float(latest.get("temp_c"), 15.0)
         temp_f = c_to_f(temp_c)
         t24_s = get_col(last_24, "temp_c", temp_c)
@@ -3127,7 +3168,10 @@ else:
     # ---------------------------------------------------------------------------
     if not obs_df.empty:
         latest = obs_df.iloc[0]
-        last_24 = obs_df.head(24)
+        _obs_dt_24 = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+        last_24 = obs_df[_obs_dt_24 >= (pd.Timestamp(now_hour_utc) - pd.Timedelta(hours=24))].head(24)
+        if last_24.empty:
+            last_24 = obs_df.head(24)
 
         temp_c = safe_float(latest.get("temp_c"), 15.0)
         temp_f = c_to_f(temp_c)

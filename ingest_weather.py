@@ -262,8 +262,11 @@ class WeatherLinkV2Client:
             "mslp_hpa": None,
             "pressure_trend_hpa": None,
             "precip_1hr_mm": 0.0,
+            "precip_day_mm": 0.0,
             "precip_24hr_mm": 0.0,
             "precip_storm_mm": 0.0,
+            "precip_month_mm": 0.0,
+            "precip_year_mm": 0.0,
             "precip_rate_mm_hr": 0.0,
             "solar_rad_wm2": None,
             "uv_index": None,
@@ -372,17 +375,34 @@ class WeatherLinkV2Client:
             if rain_1hr_mm is not None:
                 parsed["precip_1hr_mm"] = max(parsed["precip_1hr_mm"], round(float(rain_1hr_mm), 3))
 
-            rain_24hr_mm = first_not_none(
-                latest.get("rainfall_last_24_hr_mm"),
-                latest.get("rain_24_hr_mm"),
+            rain_day_mm = first_not_none(
                 latest.get("rainfall_daily_mm"),
                 latest.get("rain_day_mm"),
                 in_to_mm(
                     first_not_none(
-                        latest.get("rainfall_last_24_hr_in"),
-                        latest.get("rain_24_hr_in"),
                         latest.get("rainfall_daily_in"),
                         latest.get("rain_day_in"),
+                    )
+                ),
+            )
+            if rain_day_mm is None:
+                clicks_day = first_not_none(
+                    latest.get("rainfall_daily_clicks"),
+                    latest.get("rainfall_daily"),
+                    latest.get("rain_day_clicks"),
+                )
+                if clicks_day is not None:
+                    rain_day_mm = float(clicks_day) * 0.254
+            if rain_day_mm is not None:
+                parsed["precip_day_mm"] = max(parsed.get("precip_day_mm", 0.0), round(float(rain_day_mm), 3))
+
+            rain_24hr_mm = first_not_none(
+                latest.get("rainfall_last_24_hr_mm"),
+                latest.get("rain_24_hr_mm"),
+                in_to_mm(
+                    first_not_none(
+                        latest.get("rainfall_last_24_hr_in"),
+                        latest.get("rain_24_hr_in"),
                     )
                 ),
             )
@@ -391,14 +411,33 @@ class WeatherLinkV2Client:
                     latest.get("rainfall_last_24_hr_clicks"),
                     latest.get("rainfall_last_24_hr"),
                     latest.get("rain_24_hr"),
-                    latest.get("rainfall_daily_clicks"),
-                    latest.get("rainfall_daily"),
-                    latest.get("rain_day_clicks"),
                 )
                 if clicks_24h is not None:
                     rain_24hr_mm = float(clicks_24h) * 0.254
+            if rain_24hr_mm is None:
+                rain_24hr_mm = parsed.get("precip_day_mm", 0.0)
             if rain_24hr_mm is not None:
-                parsed["precip_24hr_mm"] = max(parsed["precip_24hr_mm"], round(float(rain_24hr_mm), 3))
+                parsed["precip_24hr_mm"] = max(
+                    parsed["precip_24hr_mm"],
+                    parsed.get("precip_day_mm", 0.0),
+                    round(float(rain_24hr_mm), 3),
+                )
+
+            rain_month_mm = first_not_none(
+                latest.get("rainfall_monthly_mm"),
+                latest.get("rain_month_mm"),
+                in_to_mm(first_not_none(latest.get("rainfall_monthly_in"), latest.get("rain_month_in"))),
+            )
+            if rain_month_mm is not None:
+                parsed["precip_month_mm"] = max(parsed.get("precip_month_mm", 0.0), round(float(rain_month_mm), 3))
+
+            rain_year_mm = first_not_none(
+                latest.get("rainfall_year_mm"),
+                latest.get("rain_year_mm"),
+                in_to_mm(first_not_none(latest.get("rainfall_year_in"), latest.get("rain_year_in"))),
+            )
+            if rain_year_mm is not None:
+                parsed["precip_year_mm"] = max(parsed.get("precip_year_mm", 0.0), round(float(rain_year_mm), 3))
 
             rain_storm_mm = first_not_none(
                 latest.get("rain_storm_mm"),
@@ -832,3 +871,24 @@ def compute_microclimate_diagnostics(
         )
 
     return diagnostics
+
+def get_local_day_boundaries_utc(ref_utc: Optional[datetime] = None) -> Tuple[str, str, str]:
+    """
+    Returns (yesterday_midnight_utc_iso, today_midnight_utc_iso, now_hour_utc_iso)
+    anchored to 00:00:00 America/Los_Angeles (the exact time the Davis Vantage Pro2
+    console resets rain_day_in to 0.00).
+    """
+    from zoneinfo import ZoneInfo
+    tz_local = ZoneInfo("America/Los_Angeles")
+    if ref_utc is None:
+        ref_utc = datetime.now(timezone.utc)
+    now_hr_utc = ref_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    local_dt = now_hr_utc.astimezone(tz_local)
+    today_midnight_local = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    yesterday_midnight_local = today_midnight_local - timedelta(days=1)
+    return (
+        yesterday_midnight_local.astimezone(timezone.utc).isoformat(),
+        today_midnight_local.astimezone(timezone.utc).isoformat(),
+        now_hr_utc.isoformat(),
+    )

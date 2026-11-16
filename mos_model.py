@@ -128,12 +128,13 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
 
     pop_frac = pop_pct / 100.0
     rh_frac = np.clip(rh_pct / 100.0, 0.30, 1.0)
+    batch_has_qpf = bool((raw_qpf_mm > 0.0).any())
     synth_qpf_prior = np.where(
-        pop_pct >= 20.0,
+        (not batch_has_qpf) & (pop_pct >= 35.0),
         np.where(
-            pop_pct >= 60.0,
-            1.35 * (pop_frac ** 1.15) * rh_frac,
-            0.65 * (pop_frac ** 1.35) * rh_frac,
+            pop_pct >= 65.0,
+            1.15 * (pop_frac ** 1.25) * rh_frac,
+            0.45 * (pop_frac ** 1.45) * rh_frac,
         ),
         0.0,
     )
@@ -316,16 +317,17 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
 
     pop_frac = mos_pop / 100.0
     rh_factor = np.clip((rh - 35.0) / 65.0, 0.25, 1.0)
+    batch_has_raw_qpf = bool((raw_qpf > 0.0).any())
     conditional_qpf_prior = np.where(
-        mos_pop >= 20.0,
+        (not batch_has_raw_qpf) & (mos_pop >= 35.0),
         np.where(
-            mos_pop >= 60.0,
-            1.25 * (pop_frac ** 1.15) * rh_factor,
-            0.55 * (pop_frac ** 1.30) * rh_factor,
+            mos_pop >= 65.0,
+            1.10 * (pop_frac ** 1.25) * rh_factor,
+            0.40 * (pop_frac ** 1.45) * rh_factor,
         ),
         0.0,
     )
-    effective_base_qpf = np.maximum(raw_qpf, conditional_qpf_prior)
+    effective_base_qpf = np.where(raw_qpf > 0.0, raw_qpf, conditional_qpf_prior)
 
     mos_qpf = effective_base_qpf * net_multiplier
     mos_qpf = np.where(mos_pop < 15.0, 0.0, mos_qpf)

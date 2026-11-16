@@ -31,6 +31,7 @@ from ingest_weather import (
     WeatherLinkV2Client,
     fetch_regional_reference_stations,
     compute_microclimate_diagnostics,
+    get_local_day_boundaries_utc,
 )
 from mos_model import (
     TassajaraMOSCorrector,
@@ -171,59 +172,115 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
                 ),
             )
 
-        # Reconcile 24-hour rain ONLY from true 24h / last-hour gauge fields (never multi-day storm total)
-        reported_24h_mm = min(
-            clean_num(tass_obs.get("precip_24hr_mm"), 0.0) or 0.0,
-            clean_num(tass_obs.get("precip_1hr_mm"), 0.0) or 0.0,
+        # Reconcile Davis console rain_day_in (since 00:00 America/Los_Angeles today)
+        # and pre-midnight storm rain (rain_storm_in - rain_day_in in yesterday's window).
+        yesterday_mid_iso, today_mid_iso, _ = get_local_day_boundaries_utc(
+            pd.to_datetime(obs_hour_iso, utc=True).to_pydatetime()
         )
-        if reported_24h_mm > 0.0:
-            window_start_iso = conn.execute(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?, '-23 hours')",
-                (obs_hour_iso,),
-            ).fetchone()[0]
+        console_day_mm = max(
+            clean_num(tass_obs.get("precip_day_mm"), 0.0) or 0.0,
+            clean_num(tass_obs.get("precip_24hr_mm"), 0.0) or 0.0,
+        )
+        console_storm_mm = clean_num(tass_obs.get("precip_storm_mm"), 0.0) or 0.0
+        reported_24h_mm = max(console_day_mm, console_storm_mm)
 
-            db_24h_sum = float(
+        if console_day_mm > 0.0:
+            db_today_sum = float(
                 conn.execute(
                     """
                     SELECT COALESCE(SUM(precip_1hr_mm), 0.0)
                     FROM local_observations
                     WHERE valid_time_utc >= ? AND valid_time_utc <= ?
                     """,
-                    (window_start_iso, obs_hour_iso),
+                    (today_mid_iso, obs_hour_iso),
                 ).fetchone()[0]
                 or 0.0
             )
-
-            shortfall_mm = round(reported_24h_mm - db_24h_sum, 3)
-            if shortfall_mm >= 0.20:
-                target_row = conn.execute(
+            shortfall_today_mm = round(console_day_mm - db_today_sum, 3)
+            if shortfall_today_mm >= 0.20:
+                cand_rows = conn.execute(
                     """
-                    SELECT o.valid_time_utc
+                    SELECT o.valid_time_utc, COALESCE(m.mqpf, 0.0) AS mqpf, COALESCE(o.rh_pct, 50.0) AS rh
                     FROM local_observations o
                     LEFT JOIN (
-                        SELECT valid_time_utc, MAX(COALESCE(mos_qpf_mm, 0.0)) AS mqpf
+                        SELECT valid_time_utc, MAX(COALESCE(mos_qpf_mm, raw_nws_qpf_mm, 0.0)) AS mqpf
                         FROM mos_corrected_forecasts
                         GROUP BY valid_time_utc
                     ) m ON o.valid_time_utc = m.valid_time_utc
                     WHERE o.valid_time_utc >= ? AND o.valid_time_utc <= ?
                     ORDER BY COALESCE(m.mqpf, 0.0) DESC, COALESCE(o.rh_pct, 0.0) DESC, o.valid_time_utc DESC
-                    LIMIT 1
+                    LIMIT 6
                     """,
-                    (window_start_iso, obs_hour_iso),
-                ).fetchone()
-                target_hr = target_row[0] if target_row else obs_hour_iso
+                    (today_mid_iso, obs_hour_iso),
+                ).fetchall()
+                if not cand_rows or shortfall_today_mm <= 2.5:
+                    target_hr = cand_rows[0][0] if cand_rows else obs_hour_iso
+                    conn.execute(
+                        """
+                        UPDATE local_observations
+                        SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                        WHERE valid_time_utc = ?
+                        """,
+                        (shortfall_today_mm, target_hr),
+                    )
+                else:
+                    weights = [max(0.1, float(r[1]) * 2.0 + max(0.0, (float(r[2]) - 70.0) / 10.0)) for r in cand_rows]
+                    w_sum = sum(weights)
+                    for (r_ts, _, _), w_val in zip(cand_rows, weights):
+                        share_mm = round(shortfall_today_mm * (w_val / w_sum), 3)
+                        if share_mm > 0.0:
+                            conn.execute(
+                                """
+                                UPDATE local_observations
+                                SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                                WHERE valid_time_utc = ?
+                                """,
+                                (share_mm, r_ts),
+                            )
+                logger.info(
+                    f"Reconciled {shortfall_today_mm:.2f} mm ({shortfall_today_mm/25.4:.2f} in) of today's console rain "
+                    f"(rain_day_in={console_day_mm/25.4:.2f} in) into local_observations since {today_mid_iso}."
+                )
+
+        pre_midnight_storm_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
+        if 0.20 <= pre_midnight_storm_mm <= 60.0:
+            db_yest_sum = float(
                 conn.execute(
                     """
-                    UPDATE local_observations
-                    SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
-                    WHERE valid_time_utc = ?
+                    SELECT COALESCE(SUM(precip_1hr_mm), 0.0)
+                    FROM local_observations
+                    WHERE valid_time_utc >= ? AND valid_time_utc < ?
                     """,
-                    (shortfall_mm, target_hr),
-                )
-                logger.info(
-                    f"Reconciled {shortfall_mm:.2f} mm ({shortfall_mm/25.4:.2f} in) of 24h console rain "
-                    f"into local_observations at {target_hr}."
-                )
+                    (yesterday_mid_iso, today_mid_iso),
+                ).fetchone()[0]
+                or 0.0
+            )
+            shortfall_yest_mm = round(pre_midnight_storm_mm - db_yest_sum, 3)
+            if shortfall_yest_mm >= 0.20:
+                yest_row = conn.execute(
+                    """
+                    SELECT valid_time_utc
+                    FROM local_observations
+                    WHERE valid_time_utc >= strftime('%Y-%m-%dT%H:%M:%S+00:00', ?, '-8 hours')
+                      AND valid_time_utc < ?
+                    ORDER BY COALESCE(rh_pct, 0.0) DESC, valid_time_utc DESC
+                    LIMIT 1
+                    """,
+                    (today_mid_iso, today_mid_iso),
+                ).fetchone()
+                if yest_row:
+                    conn.execute(
+                        """
+                        UPDATE local_observations
+                        SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                        WHERE valid_time_utc = ?
+                        """,
+                        (shortfall_yest_mm, yest_row[0]),
+                    )
+                    logger.info(
+                        f"Reconciled {shortfall_yest_mm:.2f} mm ({shortfall_yest_mm/25.4:.2f} in) of pre-midnight storm rain "
+                        f"into {yest_row[0]}."
+                    )
 
         ref_rows = []
         for stid, rdata in ref_obs.items():
