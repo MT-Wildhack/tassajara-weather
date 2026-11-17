@@ -103,7 +103,7 @@ TIER_METADATA: Dict[str, Dict[str, Any]] = {
         "creek_status": "Elevated Flow — Turbid water and moderate rise in Tassajara Creek",
         "recommended_action": (
             "4WD required on Tassajara Road; postpone non-essential low-clearance trips. "
-            "Clear leaves/branches from Stone Office & road culverts; monitor creek footbridges."
+            "Monitor creek footbridges."
         ),
     },
     "ORANGE": {
