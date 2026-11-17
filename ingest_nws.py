@@ -101,12 +101,15 @@ def expand_nws_grid_series(
     prop_or_values: Any,
     is_accumulation: bool = False,
     unit_scale: Optional[float] = None,
+    hourly_weights_map: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     """
     Expands a NWS /gridpoints/MTR/{x},{y} property dict (or values list) with validTime
-    intervals ('2026-11-13T12:00:00+00:00/PT6H') into top-of-hour UTC ISO strings.
-    When is_accumulation=True (e.g., quantitativePrecipitation), divides the interval total
-    by the interval duration in hours to yield the hourly accumulation rate (mm/hr).
+    intervals ('2026-11-18T18:00:00+00:00/PT6H') into top-of-hour UTC ISO strings.
+    When is_accumulation=True (e.g., quantitativePrecipitation) and n_hours > 1,
+    disaggregates the multi-hour block total across its constituent hours using
+    1-hour NWP (Open-Meteo) QPF/PoP/RH temporal weights while strictly preserving
+    100% of the official NOAA NWS block accumulation.
     """
     if isinstance(prop_or_values, dict):
         uom = str(prop_or_values.get("uom") or "")
@@ -143,10 +146,29 @@ def expand_nws_grid_series(
                 scaled_val = val_f * float(unit_scale)
             else:
                 scaled_val = _convert_grid_value(val_f, uom, is_accumulation=is_accumulation)
-            per_hour_val = max(0.0, scaled_val / float(n_hours)) if is_accumulation else scaled_val
-            for h in range(n_hours):
-                hr_iso = (start_dt + timedelta(hours=h)).isoformat()
-                hourly_map[hr_iso] = round(per_hour_val, 3)
+
+            block_isos = [(start_dt + timedelta(hours=h)).isoformat() for h in range(n_hours)]
+            if is_accumulation and n_hours > 1 and scaled_val > 0.0:
+                weights = []
+                for idx_h, h_iso in enumerate(block_isos):
+                    w_node = (hourly_weights_map or {}).get(h_iso, {})
+                    om_q = float(w_node.get("qpf_mm") or 0.0)
+                    om_pop = float(w_node.get("pop_pct") or 50.0)
+                    om_rh = float(w_node.get("rh_pct") or 75.0)
+                    # Smooth frontal wave shape across the block so hours are never identical flat steps
+                    wave = 1.0 + 0.28 * np.sin(np.pi * (idx_h + 0.5) / float(n_hours))
+                    if om_q > 0.0:
+                        w_h = (om_q + 0.15 * (scaled_val / float(n_hours))) * wave
+                    else:
+                        w_h = max(0.05, (om_pop / 100.0) * max(0.2, (om_rh - 40.0) / 60.0)) * wave
+                    weights.append(float(w_h))
+                w_sum = sum(weights)
+                for h_iso, w_h in zip(block_isos, weights):
+                    hourly_map[h_iso] = round(max(0.0, scaled_val * (w_h / w_sum)), 3)
+            else:
+                per_hour_val = max(0.0, scaled_val / float(n_hours)) if is_accumulation else scaled_val
+                for h_iso in block_isos:
+                    hourly_map[h_iso] = round(per_hour_val, 3)
         except Exception:
             continue
     return hourly_map
@@ -346,6 +368,10 @@ def fetch_nws_gridpoints_dataframe(
     issue_iso = now_hour_utc.isoformat()
     grid_url, hourly_url = resolve_nws_endpoints(TASS_LAT, TASS_LON)
 
+    # 0. Fetch Open-Meteo 1-Hour NWP Supplement first so its hourly profile can disaggregate PT6H NWS QPF blocks
+    past_days_om = max(1, int(np.ceil(include_past_hours / 24.0)) + 1) if include_past_hours > 0 else 1
+    om_map = fetch_open_meteo_nwp_map(past_days=past_days_om, forecast_days=8)
+
     # 1. Fetch Raw NWS Gridpoint Arrays (/gridpoints/MTR/...)
     grid_qpf_map: Dict[str, float] = {}
     grid_pop_map: Dict[str, float] = {}
@@ -362,7 +388,9 @@ def fetch_nws_gridpoints_dataframe(
         if isinstance(g_data, dict):
             g_props = g_data.get("properties") or {}
             grid_qpf_map = expand_nws_grid_series(
-                g_props.get("quantitativePrecipitation"), is_accumulation=True
+                g_props.get("quantitativePrecipitation"),
+                is_accumulation=True,
+                hourly_weights_map=om_map,
             )
             grid_pop_map = expand_nws_grid_series(
                 g_props.get("probabilityOfPrecipitation"), is_accumulation=False
@@ -424,9 +452,7 @@ def fetch_nws_gridpoints_dataframe(
                 except Exception:
                     continue
 
-    # 3. Fetch Open-Meteo NWP Supplement (at 880m MSL)
-    past_days_om = max(1, int(np.ceil(include_past_hours / 24.0)) + 1) if include_past_hours > 0 else 1
-    om_map = fetch_open_meteo_nwp_map(past_days=past_days_om, forecast_days=8)
+    # 3. Open-Meteo NWP Supplement already loaded above in `om_map`
 
     if not grid_temp_map and not hourly_periods_map and not om_map:
         return pd.DataFrame()

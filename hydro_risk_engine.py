@@ -38,10 +38,10 @@ API_DECAY_K_MIN = 0.88
 API_DECAY_K_MAX = 0.94
 
 # Runoff Coefficient (C) Sigmoid Bounds
-RUNOFF_C_MIN = 0.08        # Dry fractured granite / chaparral duff initial abstraction
-RUNOFF_C_MAX = 0.86        # Saturated canyon regolith & bedrock sheetflow ceiling
-API_MIDPOINT_MM = 32.0     # ~1.26 in API inflection point where macropore flow accelerates
-API_SCALE_MM = 11.5        # Sigmoid steepness parameter (mm)
+RUNOFF_C_MIN = 0.06        # Dry fractured granite / chaparral duff initial abstraction
+RUNOFF_C_MAX = 0.72        # Saturated canyon regolith & bedrock sheetflow ceiling
+API_MIDPOINT_MM = 55.0     # ~2.17 in API inflection point where vadose storage fills and macropore flow accelerates
+API_SCALE_MM = 15.0        # Sigmoid steepness parameter (mm)
 
 # 3-Hour Steep-Canyon Kinematic Unit Hydrograph Weights (Tc ~ 1.5 - 2.5 hrs off Black Cone/Pine Ridge)
 UNIT_HYDROGRAPH_WEIGHTS = (0.48, 0.34, 0.18)
@@ -240,20 +240,20 @@ def route_runoff_to_discharge_cfs(
     In steep mountain watersheds with transmission losses and channel storage, the
     effective quickflow delivery factor to the narrow gorge is ~0.22.
     """
-    cfs_per_mm_hr = catchment_area_km2 * 0.27778 * 35.3147 * 0.14  # ~98.9 CFS per 1 mm/hr effective quickflow
+    cfs_per_mm_hr = catchment_area_km2 * 0.27778 * 35.3147 * 0.075  # ~53.0 CFS per 1 mm/hr effective canyon quickflow
     w0, w1, w2 = UNIT_HYDROGRAPH_WEIGHTS
     out_cfs: List[float] = []
     interflow_mm_hr = 0.0
     n = len(runoff_mm_hr_series)
     for i in range(n):
         r_raw = max(0.0, float(runoff_mm_hr_series[i]))
-        # Initial infiltration abstraction: first 0.35 mm/hr of computed runoff enters slow interflow
-        quick_0 = max(0.0, r_raw - 0.35)
-        r_prev1 = max(0.0, float(runoff_mm_hr_series[i - 1]) - 0.35) if i >= 1 else quick_0 * 0.5
-        r_prev2 = max(0.0, float(runoff_mm_hr_series[i - 2]) - 0.35) if i >= 2 else r_prev1 * 0.5
+        # Initial infiltration abstraction: first 0.45 mm/hr of computed runoff enters slow subsurface interflow
+        quick_0 = max(0.0, r_raw - 0.45)
+        r_prev1 = max(0.0, float(runoff_mm_hr_series[i - 1]) - 0.45) if i >= 1 else quick_0 * 0.5
+        r_prev2 = max(0.0, float(runoff_mm_hr_series[i - 2]) - 0.45) if i >= 2 else r_prev1 * 0.5
         routed_quick = w0 * quick_0 + w1 * r_prev1 + w2 * r_prev2
-        interflow_mm_hr = 0.88 * interflow_mm_hr + 0.12 * min(r_raw, 0.60)
-        q_cfs = baseflow_cfs + routed_quick * cfs_per_mm_hr + interflow_mm_hr * 18.0
+        interflow_mm_hr = 0.90 * interflow_mm_hr + 0.10 * min(r_raw, 0.80)
+        q_cfs = baseflow_cfs + routed_quick * cfs_per_mm_hr + interflow_mm_hr * 16.0
         out_cfs.append(round(q_cfs, 1))
     return out_cfs
 
@@ -290,26 +290,24 @@ def evaluate_flood_and_road_tier(
     fc_24h_mm = float(forecast_qpf_24hr_mm or 0.0)
     fc_72h_mm = float(forecast_qpf_72hr_mm or 0.0)
 
-    # Past rainfall remains an active flood/road trigger only while rain is ongoing/imminent
-    # or while catchment soil wetness (API_t) remains above advisory/primed thresholds.
+    # Separate CURRENT soil saturation (cur_soil_primed) from 24-hour projected saturation (proj_soil_primed)
+    # so dry pre-storm days do not fire immediate RED evacuation warnings.
     active_or_imminent_rain = (max_1hr_rate_mm >= 0.254) or (fc_24h_mm >= 2.54)
-    soil_primed = (cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
+    cur_soil_primed = cur_api_mm >= ORANGE_SATURATED_FLOOR_MM  # >= 0.80 in right now
+    cur_soil_saturated = cur_api_mm >= ORANGE_API_MM           # >= 1.75 in right now
+    proj_soil_primed = eff_api_mm >= YELLOW_API_MM             # >= 1.00 in within 24h
 
     rolling_24h_mm = max(
         fc_24h_mm,
         obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= YELLOW_API_MM) else 0.0,
     )
     active_48h_Bridge_mm = (
-        (obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) else 0.0)
-        + fc_24h_mm
+        (obs_24h_mm if cur_soil_primed else 0.0) + fc_24h_mm
     )
     total_72h_window_mm = max(
         active_48h_Bridge_mm,
         fc_72h_mm,
-        obs_72h_mm if (active_or_imminent_rain or eff_api_mm >= YELLOW_API_MM) else 0.0,
-    )
-    imminent_24h_wet = (
-        (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
+        obs_72h_mm if (active_or_imminent_rain or cur_soil_primed) else 0.0,
     )
 
     red_reasons: List[str] = []
@@ -317,31 +315,27 @@ def evaluate_flood_and_road_tier(
     yellow_reasons: List[str] = []
 
     # --- Check RED (Tier 3: Immediate Flash Flood Warning / Road Closure) ---
+    # Requires extreme intensity (>= 1.00 in/hr), extreme P90 (>= 1.25 in/hr) on primed ground,
+    # or >= 3.50-4.00 in storm totals when the catchment is ALREADY heavily saturated (cur_api_mm >= 1.50 in).
     if max_1hr_rate_mm >= RED_QPF_RATE_MM_HR:
         red_reasons.append(
             f"Extreme rainfall rate {max_1hr_rate_mm / MM_PER_INCH:.2f} in/hr "
             f"(>= 1.00 in/hr flash flood threshold)"
         )
-    if max_p90_rate_mm >= RED_P90_RATE_MM_HR and soil_primed:
+    if max_p90_rate_mm >= RED_P90_RATE_MM_HR and cur_soil_primed:
         red_reasons.append(
             f"Extreme MOS P90 downpour rate {max_p90_rate_mm / MM_PER_INCH:.2f} in/hr "
-            f"on primed catchment (API {eff_api_mm / MM_PER_INCH:.2f} in)"
+            f"on primed catchment (API {cur_api_mm / MM_PER_INCH:.2f} in)"
         )
-    if (active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed) or (
-        fc_72h_mm >= RED_RAIN_72H_ABSOLUTE_MM
-    ):
-        storm_tot_mm = max(active_48h_Bridge_mm, fc_72h_mm)
+    if rolling_24h_mm >= 82.55 and (cur_soil_saturated or eff_api_mm >= RED_API_EXTREME_MM):
         red_reasons.append(
-            f"Cumulative storm total {storm_tot_mm / MM_PER_INCH:.2f} in "
-            f"exceeds critical 4.00 in road washout threshold"
+            f"Extreme 24-hour storm total {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 3.25 in) "
+            f"on saturated catchment (API {eff_api_mm / MM_PER_INCH:.2f} in)"
         )
-    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and (
-        (eff_api_mm >= ORANGE_API_MM and imminent_24h_wet)
-        or (fc_72h_mm >= RED_RAIN_72H_CRITICAL_MM and soil_primed)
-    ):
+    elif total_72h_window_mm >= RED_RAIN_72H_ABSOLUTE_MM and cur_soil_saturated and max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR:
         red_reasons.append(
-            f"3-day rainfall {total_72h_window_mm / MM_PER_INCH:.2f} in combined with "
-            f"heavily saturated soil (API {eff_api_mm / MM_PER_INCH:.2f} in)"
+            f"Cumulative 72h storm total {total_72h_window_mm / MM_PER_INCH:.2f} in (>= 4.00 in) "
+            f"with active heavy rain on saturated soil (API {cur_api_mm / MM_PER_INCH:.2f} in)"
         )
     if eff_api_mm >= RED_API_EXTREME_MM and max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR:
         red_reasons.append(
@@ -359,32 +353,32 @@ def evaluate_flood_and_road_tier(
         red_reasons.append(f"Rapid creek surge +{float(rate_of_rise_m_hr):.2f} m/hr")
 
     # --- Check ORANGE (Tier 2: Flash Flood Watch / Road Risk) ---
-    if max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR and soil_primed:
+    if max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR and proj_soil_primed:
         orange_reasons.append(
-            f"Heavy rain band ({max_1hr_rate_mm / MM_PER_INCH:.2f} in/hr > 0.50 in/hr) "
-            f"on saturated ground (API {eff_api_mm / MM_PER_INCH:.2f} in)"
+            f"Heavy rain band ({max_1hr_rate_mm / MM_PER_INCH:.2f} in/hr >= 0.50 in/hr) "
+            f"with catchment API reaching {eff_api_mm / MM_PER_INCH:.2f} in"
         )
     elif max_1hr_rate_mm >= 16.5:
         orange_reasons.append(
             f"Intense hourly downpour rate {max_1hr_rate_mm / MM_PER_INCH:.2f} in/hr approaching canyon"
         )
-    if max_p90_rate_mm >= ORANGE_P90_RATE_MM_HR and soil_primed:
+    if max_p90_rate_mm >= ORANGE_P90_RATE_MM_HR and proj_soil_primed:
         orange_reasons.append(
             f"MOS P90 downpour rate {max_p90_rate_mm / MM_PER_INCH:.2f} in/hr "
-            f"(> 0.75 in/hr) over wet catchment"
+            f"(>= 0.75 in/hr) over wetting catchment"
         )
     if rolling_24h_mm >= ORANGE_RAIN_24H_MM:
         orange_reasons.append(
             f"24-hour rainfall accumulation {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 2.00 in)"
         )
-    elif (fc_72h_mm >= 69.85 or total_72h_window_mm >= 63.50) and soil_primed and active_or_imminent_rain:
+    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and cur_soil_primed and active_or_imminent_rain:
         orange_reasons.append(
-            f"72-hour storm accumulation {max(fc_72h_mm, total_72h_window_mm) / MM_PER_INCH:.2f} in "
-            f"on primed catchment elevates canyon slipout and creek rise risk"
+            f"Multi-day storm total {total_72h_window_mm / MM_PER_INCH:.2f} in "
+            f"on primed soil (API {cur_api_mm / MM_PER_INCH:.2f} in) elevates road slipout risk"
         )
     if eff_api_mm >= ORANGE_API_MM and max_1hr_rate_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(
-            f"High catchment wetness (API {eff_api_mm / MM_PER_INCH:.2f} in) with active rain"
+            f"High catchment wetness (API {eff_api_mm / MM_PER_INCH:.2f} in) with moderate-to-heavy rain"
         )
     if peak_runoff_24hr_mm_hr >= ORANGE_RUNOFF_MM_HR:
         orange_reasons.append(
@@ -647,7 +641,7 @@ def project_forward_hydro_series(
             precip_72hr_mm=float(cum_qpf_72_series[idx]),
             peak_qpf_1hr_24h_mm=q_exp,
             peak_p90_1hr_24h_mm=q_p90,
-            forecast_qpf_24hr_mm=float(cum_qpf_series[idx]),
+            forecast_qpf_24hr_mm=0.0,
             peak_runoff_24hr_mm_hr=r_exp,
         )
 

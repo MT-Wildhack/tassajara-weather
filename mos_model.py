@@ -287,14 +287,16 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
         1.0,
     )
 
+    # Tassajara (485m) sits in the lee of the 1,450-1,536m Santa Lucia crest relative to the 880m NWP grid:
+    # Weak upslope flow experiences lee rain-shadowing (~0.88x), while strong SSW IVT & frontal lift produce spillover (>1.0x).
     orographic_factor = (
-        1.0
-        + 0.08 * np.clip(upslope_flux, 0.0, 5.0)
-        + 0.05 * np.clip(-p_fall, 0.0, 4.0)
-        + 0.07 * np.clip(spillover_seed, 0.0, 3.5)
+        0.88
+        + 0.06 * np.clip(upslope_flux, 0.0, 4.5)
+        + 0.04 * np.clip(-p_fall, 0.0, 3.5)
+        + 0.05 * np.clip(spillover_seed, 0.0, 3.0)
     )
 
-    net_multiplier = np.clip(virga_factor * orographic_factor, 0.20, 1.85)
+    net_multiplier = np.clip(virga_factor * orographic_factor, 0.20, 1.35)
 
     mos_pop = np.clip(
         raw_pop * np.clip(virga_factor * (1.0 + 0.04 * upslope_flux), 0.30, 1.35)
@@ -572,11 +574,9 @@ class TassajaraMOSCorrector:
         try:
             X_aligned = X_fut[self.feature_names] if self.feature_names else X_fut
             prob_wet = self.model_pop.predict_proba(X_aligned)[:, 1]
+            # Weight physical PoP higher when ML classifier was trained on a small wet sample
             mos_pop_pct = np.clip(
-                np.maximum(
-                    0.60 * (prob_wet * 100.0) + 0.40 * phys_df["mos_pop_pct"].values,
-                    0.75 * phys_df["mos_pop_pct"].values,
-                ),
+                0.30 * (prob_wet * 100.0) + 0.70 * phys_df["mos_pop_pct"].values,
                 0.0,
                 100.0,
             )
@@ -602,9 +602,13 @@ class TassajaraMOSCorrector:
                 0.0,
             )
 
-            mos_qpf_mm = np.maximum(
-                0.65 * ml_qpf_mm + 0.35 * phys_df["mos_qpf_mm"].values,
-                0.70 * phys_df["mos_qpf_mm"].values,
+            mos_qpf_mm = np.where(
+                raw_qpf_arr >= 2.5,
+                0.20 * ml_qpf_mm + 0.80 * phys_df["mos_qpf_mm"].values,
+                np.maximum(
+                    0.50 * ml_qpf_mm + 0.50 * phys_df["mos_qpf_mm"].values,
+                    0.75 * phys_df["mos_qpf_mm"].values,
+                ),
             )
             mos_qpf_mm = np.where(~active_qpf_mask, 0.0, mos_qpf_mm)
 
