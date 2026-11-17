@@ -1473,11 +1473,27 @@ def load_all_dashboard_data():
 
             if shortfall_today_mm >= 0.20 and today_mask.any():
                 clicks = max(1, int(round(shortfall_today_mm / 0.254)))
-                add_mm = round(clicks * 0.254, 3)
-                top_idx = obs_df.index[today_mask][0]
-                obs_df.loc[top_idx, "precip_1hr_mm"] = round(
-                    safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + add_mm, 3
-                )
+                live_rate_mm = safe_float(live_obs.get("precip_rate_mm_hr"), 0.0)
+                today_indices = obs_df.index[today_mask].tolist()
+                prior_wet = [
+                    i for i in today_indices[1:]
+                    if safe_float(obs_df.loc[i].get("rh_pct"), 50.0) >= 88.0
+                ][:8]
+                if live_rate_mm > 0.0 or clicks <= 2 or not prior_wet:
+                    top_idx = today_indices[0]
+                    obs_df.loc[top_idx, "precip_1hr_mm"] = round(
+                        safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + round(clicks * 0.254, 3), 3
+                    )
+                else:
+                    n_t = min(len(prior_wet), clicks)
+                    b_c = clicks // n_t
+                    r_c = clicks % n_t
+                    for idx_i, row_idx in enumerate(prior_wet[:n_t]):
+                        c_i = b_c + (1 if idx_i < r_c else 0)
+                        if c_i > 0:
+                            obs_df.loc[row_idx, "precip_1hr_mm"] = round(
+                                safe_float(obs_df.loc[row_idx, "precip_1hr_mm"], 0.0) + round(c_i * 0.254, 3), 3
+                            )
 
             pre_midnight_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
             if 0.20 <= pre_midnight_mm <= 60.0 and str(storm_start_iso) >= str(yesterday_mid_iso):

@@ -240,16 +240,20 @@ def route_runoff_to_discharge_cfs(
     In steep mountain watersheds with transmission losses and channel storage, the
     effective quickflow delivery factor to the narrow gorge is ~0.22.
     """
-    cfs_per_mm_hr = catchment_area_km2 * 0.27778 * 35.3147 * 0.22  # ~155.4 CFS per 1 mm/hr basin-wide
+    cfs_per_mm_hr = catchment_area_km2 * 0.27778 * 35.3147 * 0.14  # ~98.9 CFS per 1 mm/hr effective quickflow
     w0, w1, w2 = UNIT_HYDROGRAPH_WEIGHTS
     out_cfs: List[float] = []
+    interflow_mm_hr = 0.0
     n = len(runoff_mm_hr_series)
     for i in range(n):
-        r0 = max(0.0, float(runoff_mm_hr_series[i]))
-        r1 = max(0.0, float(runoff_mm_hr_series[i - 1])) if i >= 1 else r0 * 0.5
-        r2 = max(0.0, float(runoff_mm_hr_series[i - 2])) if i >= 2 else r1 * 0.5
-        routed_r = w0 * r0 + w1 * r1 + w2 * r2
-        q_cfs = baseflow_cfs + routed_r * cfs_per_mm_hr
+        r_raw = max(0.0, float(runoff_mm_hr_series[i]))
+        # Initial infiltration abstraction: first 0.35 mm/hr of computed runoff enters slow interflow
+        quick_0 = max(0.0, r_raw - 0.35)
+        r_prev1 = max(0.0, float(runoff_mm_hr_series[i - 1]) - 0.35) if i >= 1 else quick_0 * 0.5
+        r_prev2 = max(0.0, float(runoff_mm_hr_series[i - 2]) - 0.35) if i >= 2 else r_prev1 * 0.5
+        routed_quick = w0 * quick_0 + w1 * r_prev1 + w2 * r_prev2
+        interflow_mm_hr = 0.88 * interflow_mm_hr + 0.12 * min(r_raw, 0.60)
+        q_cfs = baseflow_cfs + routed_quick * cfs_per_mm_hr + interflow_mm_hr * 18.0
         out_cfs.append(round(q_cfs, 1))
     return out_cfs
 
@@ -373,10 +377,10 @@ def evaluate_flood_and_road_tier(
         orange_reasons.append(
             f"24-hour rainfall accumulation {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 2.00 in)"
         )
-    elif fc_72h_mm >= 69.85 or (total_72h_window_mm >= 63.50 and soil_primed and active_or_imminent_rain):
+    elif (fc_72h_mm >= 69.85 or total_72h_window_mm >= 63.50) and soil_primed and active_or_imminent_rain:
         orange_reasons.append(
             f"72-hour storm accumulation {max(fc_72h_mm, total_72h_window_mm) / MM_PER_INCH:.2f} in "
-            f"elevates canyon slipout and creek rise risk"
+            f"on primed catchment elevates canyon slipout and creek rise risk"
         )
     if eff_api_mm >= ORANGE_API_MM and max_1hr_rate_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(

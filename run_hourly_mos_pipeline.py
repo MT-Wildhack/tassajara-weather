@@ -199,22 +199,55 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
             )
             shortfall_today_mm = round(console_day_mm - db_today_sum, 3)
             if shortfall_today_mm >= 0.20:
-                # Quantize to 0.254 mm (0.01 in) tipping-bucket increments and attribute
-                # to the current observation hour rather than smearing across prior hours.
                 clicks = max(1, int(round(shortfall_today_mm / 0.254)))
                 quantized_mm = round(clicks * 0.254, 3)
-                conn.execute(
+                live_rate_mm = clean_num(tass_obs.get("precip_rate_mm_hr"), 0.0) or 0.0
+                prior_wet_rows = conn.execute(
                     """
-                    UPDATE local_observations
-                    SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
-                    WHERE valid_time_utc = ?
+                    SELECT valid_time_utc, COALESCE(rh_pct, 50.0) AS rh
+                    FROM local_observations
+                    WHERE valid_time_utc >= ? AND valid_time_utc < ?
+                      AND COALESCE(rh_pct, 0.0) >= 88.0
+                    ORDER BY COALESCE(rh_pct, 0.0) DESC, valid_time_utc ASC
+                    LIMIT 8
                     """,
-                    (quantized_mm, obs_hour_iso),
-                )
-                logger.info(
-                    f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of today's console rain "
-                    f"(rain_day_in={console_day_mm/25.4:.2f} in) into {obs_hour_iso}."
-                )
+                    (today_mid_iso, obs_hour_iso),
+                ).fetchall()
+
+                if live_rate_mm > 0.0 or clicks <= 2 or not prior_wet_rows:
+                    conn.execute(
+                        """
+                        UPDATE local_observations
+                        SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                        WHERE valid_time_utc = ?
+                        """,
+                        (quantized_mm, obs_hour_iso),
+                    )
+                    logger.info(
+                        f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of active console rain "
+                        f"(rain_day_in={console_day_mm/25.4:.2f} in) into current hour {obs_hour_iso}."
+                    )
+                else:
+                    # Catch-up backlog while current hour is dry (rain_rate_mm == 0):
+                    # distribute integer 0.254 mm clicks across today's prior saturated hours.
+                    n_targets = min(len(prior_wet_rows), clicks)
+                    base_c = clicks // n_targets
+                    rem_c = clicks % n_targets
+                    for idx_r, (r_ts, _) in enumerate(prior_wet_rows[:n_targets]):
+                        c_hr = base_c + (1 if idx_r < rem_c else 0)
+                        if c_hr > 0:
+                            conn.execute(
+                                """
+                                UPDATE local_observations
+                                SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                                WHERE valid_time_utc = ?
+                                """,
+                                (round(c_hr * 0.254, 3), r_ts),
+                            )
+                    logger.info(
+                        f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of catch-up console rain "
+                        f"across {n_targets} prior wet hour(s) today."
+                    )
 
         pre_midnight_storm_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
         if 0.20 <= pre_midnight_storm_mm <= 60.0 and storm_start_iso >= yesterday_mid_iso:
