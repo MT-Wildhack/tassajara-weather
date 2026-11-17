@@ -2360,28 +2360,28 @@ def render_hydro_risk_section(
         matrix_rows = [
             {
                 "Alert Tier": "🟢 Tier 0 — GREEN (Normal)",
-                "Soil Saturation & Rain Triggers": "API < 1.00 in AND 24h Rain < 1.00 in AND 1h Rate < 0.50 in/hr",
+                "Soil Saturation & Rain Triggers": "API < 1.00 in AND 24h Rain < 1.00 in AND 72h Rain < 1.50 in AND 1h Rate < 0.50 in/hr",
                 "Tassajara Creek Response": TIER_METADATA["GREEN"]["creek_status"],
                 "Tassajara Road Passability": TIER_METADATA["GREEN"]["road_status"],
                 "Operational Protocol": TIER_METADATA["GREEN"]["recommended_action"],
             },
             {
                 "Alert Tier": "🟡 Tier 1 — YELLOW (Advisory)",
-                "Soil Saturation & Rain Triggers": "API >= 1.00 in (25.4 mm) OR 24h Rain >= 1.00 in OR 72h Rain >= 1.50 in",
+                "Soil Saturation & Rain Triggers": "API >= 1.00 in (25.4 mm) OR 24h Rain >= 1.00 in OR 72h Rain >= 1.50 in (Advance Storm Prep)",
                 "Tassajara Creek Response": TIER_METADATA["YELLOW"]["creek_status"],
                 "Tassajara Road Passability": TIER_METADATA["YELLOW"]["road_status"],
                 "Operational Protocol": TIER_METADATA["YELLOW"]["recommended_action"],
             },
             {
                 "Alert Tier": "🟠 Tier 2 — ORANGE (Watch / Road Risk)",
-                "Soil Saturation & Rain Triggers": "1h Rain >= 0.50 in/hr (or P90 >= 0.75 in/hr) on primed soil OR 24h Rain >= 2.00 in",
+                "Soil Saturation & Rain Triggers": "Imminent (<=6h) 1h Rain >= 0.50 in/hr (or P90 >= 0.75 in/hr) on primed soil (API >= 0.80 in) OR Active 24h Rain >= 2.00 in",
                 "Tassajara Creek Response": TIER_METADATA["ORANGE"]["creek_status"],
                 "Tassajara Road Passability": TIER_METADATA["ORANGE"]["road_status"],
                 "Operational Protocol": TIER_METADATA["ORANGE"]["recommended_action"],
             },
             {
                 "Alert Tier": "🔴 Tier 3 — RED (Warning / Road Closure)",
-                "Soil Saturation & Rain Triggers": "1h Rain >= 1.00 in/hr (or P90 >= 1.25 in/hr) OR 72h Rain >= 3.50-4.00 in",
+                "Soil Saturation & Rain Triggers": "Imminent (<=6h) 1h Rain >= 1.00 in/hr (or P90 >= 1.25 in/hr on primed soil) OR 24h Rain >= 3.25 in / 72h >= 4.00 in on saturated soil (API >= 1.75 in)",
                 "Tassajara Creek Response": TIER_METADATA["RED"]["creek_status"],
                 "Tassajara Road Passability": TIER_METADATA["RED"]["road_status"],
                 "Operational Protocol": TIER_METADATA["RED"]["recommended_action"],
