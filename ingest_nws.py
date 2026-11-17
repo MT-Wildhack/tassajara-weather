@@ -550,18 +550,22 @@ def fetch_nws_gridpoints_dataframe(
             hp.get("short_fc")
             or ("Live NWP Grid" if prefer_open_meteo_primary else "NWS Gridpoint MTR")
         )
+        has_nws_qpf_slot = v_iso in grid_qpf_map
         nws_grid_qpf = float(grid_qpf_map.get(v_iso, 0.0))
         om_qpf = float(om.get("qpf_mm", 0.0)) if pd.notna(om.get("qpf_mm")) else 0.0
-        synth_qpf = synthesize_qpf_from_pop_and_text(pop_pct, rh_pct, short_fc)
 
-        if nws_grid_qpf > 0.0:
-            qpf_1hr_mm = round(nws_grid_qpf, 3)
-        elif not grid_qpf_map and om_qpf > 0.0:
+        if prefer_open_meteo_primary and not has_nws_qpf_slot and om_qpf > 0.0:
             qpf_1hr_mm = round(om_qpf, 3)
-        elif pop_pct >= 25.0 and om_qpf > 0.0:
-            qpf_1hr_mm = round(min(om_qpf, synth_qpf * 1.5 if synth_qpf > 0 else om_qpf), 3)
-        elif not grid_qpf_map:
-            qpf_1hr_mm = round(synth_qpf, 3)
+        elif has_nws_qpf_slot:
+            # Strictly preserve official NWS /gridpoints/MTR QPF (including true 0.0 mm hours)
+            qpf_1hr_mm = round(nws_grid_qpf, 3)
+        elif om_qpf > 0.0:
+            # Beyond NWS NDFD QPF horizon (or if NDFD QPF array is empty), use Open-Meteo NWP QPF
+            qpf_1hr_mm = round(om_qpf, 3)
+        elif not grid_qpf_map and not om_map:
+            qpf_1hr_mm = round(
+                synthesize_qpf_from_pop_and_text(pop_pct, rh_pct, short_fc), 3
+            )
         else:
             qpf_1hr_mm = 0.0
 
@@ -632,12 +636,6 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
         for _, r in df_future.iterrows()
     ]
 
-    qpf_repair_rows = [
-        (float(r["nws_qpf_1hr_mm"]), float(r["nws_wind_gust_ms"]), str(r["valid_time_utc"]))
-        for _, r in df_fc.iterrows()
-        if float(r["nws_qpf_1hr_mm"]) > 0.0
-    ]
-
     with sqlite3.connect(db_path) as conn:
         conn.executemany(
             """
@@ -649,28 +647,6 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows_to_insert,
-        )
-
-        if qpf_repair_rows:
-            conn.executemany(
-                """
-                UPDATE nws_forecasts
-                SET nws_qpf_1hr_mm = ?,
-                    nws_wind_gust_ms = MAX(COALESCE(nws_wind_gust_ms, 0.0), ?)
-                WHERE valid_time_utc = ?
-                  AND COALESCE(nws_qpf_1hr_mm, 0.0) <= 0.0
-                """,
-                qpf_repair_rows,
-            )
-
-        # Clean any low-PoP (<20%) forecast rows that have spurious QPF
-        conn.execute(
-            """
-            UPDATE nws_forecasts
-            SET nws_qpf_1hr_mm = 0.0
-            WHERE COALESCE(nws_pop_pct, 0.0) < 20.0
-              AND COALESCE(nws_qpf_1hr_mm, 0.0) > 0.0
-            """
         )
         conn.commit()
 

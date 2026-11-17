@@ -276,17 +276,37 @@ def evaluate_flood_and_road_tier(
     combining antecedent wetness (API), observed rainfall, forward MOS QPF & P90 rates,
     cumulative 3-day storm totals, and optional physical stream-gauge telemetry.
     """
-    eff_api_mm = max(float(api_mm or 0.0), float(projected_max_api_24h_mm or 0.0))
+    cur_api_mm = float(api_mm or 0.0)
+    eff_api_mm = max(cur_api_mm, float(projected_max_api_24h_mm or 0.0))
     max_1hr_rate_mm = max(float(precip_1hr_mm or 0.0), float(peak_qpf_1hr_24h_mm or 0.0))
     max_p90_rate_mm = max(max_1hr_rate_mm, float(peak_p90_1hr_24h_mm or 0.0))
-    rolling_24h_mm = max(float(precip_24hr_mm or 0.0), float(forecast_qpf_24hr_mm or 0.0))
-    active_48h_Bridge_mm = float(precip_24hr_mm or 0.0) + float(forecast_qpf_24hr_mm or 0.0)
+
+    obs_24h_mm = float(precip_24hr_mm or 0.0)
+    obs_72h_mm = float(precip_72hr_mm or 0.0)
+    fc_24h_mm = float(forecast_qpf_24hr_mm or 0.0)
+    fc_72h_mm = float(forecast_qpf_72hr_mm or 0.0)
+
+    # Past rainfall remains an active flood/road trigger only while rain is ongoing/imminent
+    # or while catchment soil wetness (API_t) remains above advisory/primed thresholds.
+    active_or_imminent_rain = (max_1hr_rate_mm >= 0.254) or (fc_24h_mm >= 2.54)
+    soil_primed = (cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
+
+    rolling_24h_mm = max(
+        fc_24h_mm,
+        obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= YELLOW_API_MM) else 0.0,
+    )
+    active_48h_Bridge_mm = (
+        (obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) else 0.0)
+        + fc_24h_mm
+    )
     total_72h_window_mm = max(
         active_48h_Bridge_mm,
-        float(forecast_qpf_72hr_mm or 0.0),
+        fc_72h_mm,
+        obs_72h_mm if (active_or_imminent_rain or eff_api_mm >= YELLOW_API_MM) else 0.0,
     )
-    soil_primed = (api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
-    imminent_24h_wet = (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
+    imminent_24h_wet = (
+        (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
+    )
 
     red_reasons: List[str] = []
     orange_reasons: List[str] = []
@@ -303,15 +323,17 @@ def evaluate_flood_and_road_tier(
             f"Extreme MOS P90 downpour rate {max_p90_rate_mm / MM_PER_INCH:.2f} in/hr "
             f"on primed catchment (API {eff_api_mm / MM_PER_INCH:.2f} in)"
         )
-    if active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed:
+    if (active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed) or (
+        fc_72h_mm >= RED_RAIN_72H_ABSOLUTE_MM
+    ):
+        storm_tot_mm = max(active_48h_Bridge_mm, fc_72h_mm)
         red_reasons.append(
-            f"Active 48h storm total {active_48h_Bridge_mm / MM_PER_INCH:.2f} in "
+            f"Cumulative storm total {storm_tot_mm / MM_PER_INCH:.2f} in "
             f"exceeds critical 4.00 in road washout threshold"
         )
-    elif (
-        total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM
-        and eff_api_mm >= ORANGE_API_MM
-        and imminent_24h_wet
+    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and (
+        (eff_api_mm >= ORANGE_API_MM and imminent_24h_wet)
+        or (fc_72h_mm >= RED_RAIN_72H_CRITICAL_MM and soil_primed)
     ):
         red_reasons.append(
             f"3-day rainfall {total_72h_window_mm / MM_PER_INCH:.2f} in combined with "
@@ -350,6 +372,11 @@ def evaluate_flood_and_road_tier(
     if rolling_24h_mm >= ORANGE_RAIN_24H_MM:
         orange_reasons.append(
             f"24-hour rainfall accumulation {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 2.00 in)"
+        )
+    elif fc_72h_mm >= 69.85 or (total_72h_window_mm >= 63.50 and soil_primed and active_or_imminent_rain):
+        orange_reasons.append(
+            f"72-hour storm accumulation {max(fc_72h_mm, total_72h_window_mm) / MM_PER_INCH:.2f} in "
+            f"elevates canyon slipout and creek rise risk"
         )
     if eff_api_mm >= ORANGE_API_MM and max_1hr_rate_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(
@@ -436,6 +463,34 @@ def spinup_historical_api_series(
     )
     if df.empty:
         return pd.DataFrame()
+
+    # Reindex onto a continuous 1-hour UTC grid so API_t and C_t decay every clock hour
+    # and 24h/72h rolling windows span exact 24- and 72-hour time intervals.
+    full_hr_idx = pd.date_range(
+        start=df["_dt_utc"].min(), end=df["_dt_utc"].max(), freq="1h", tz="UTC"
+    )
+    df = (
+        df.set_index("_dt_utc")
+        .reindex(full_hr_idx)
+        .reset_index()
+        .rename(columns={"index": "_dt_utc"})
+    )
+    df["valid_time_utc"] = df["_dt_utc"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    if "station_id" in df.columns:
+        df["station_id"] = df["station_id"].ffill().bfill().fillna("TASS_VP2")
+    df["temp_c"] = (
+        pd.to_numeric(df.get("temp_c"), errors="coerce")
+        .interpolate(method="linear", limit_direction="both")
+        .fillna(15.0)
+    )
+    df["rh_pct"] = (
+        pd.to_numeric(df.get("rh_pct"), errors="coerce")
+        .interpolate(method="linear", limit_direction="both")
+        .fillna(60.0)
+    )
+    df["precip_1hr_mm"] = (
+        pd.to_numeric(df.get("precip_1hr_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    )
 
     # Optional join of upstream crest precipitation (CHWC1, VTCC1, PPSC1)
     chews_map: Dict[pd.Timestamp, float] = {}
@@ -550,14 +605,19 @@ def project_forward_hydro_series(
     proj_r_p90_mm: List[float] = []
     proj_tiers: List[str] = []
 
-    cum_qpf_series = mos_qpf.rolling(window=24, min_periods=1).sum().values
     if recent_precip_history_mm:
+        hist_tail_23 = [max(0.0, float(x)) for x in recent_precip_history_mm[-23:]]
+        combined_24 = pd.Series(hist_tail_23 + mos_qpf.tolist(), dtype="float64")
+        cum_qpf_series = (
+            combined_24.rolling(window=24, min_periods=1).sum().iloc[len(hist_tail_23):].values
+        )
         hist_tail = [max(0.0, float(x)) for x in recent_precip_history_mm[-71:]]
         combined_p = pd.Series(hist_tail + mos_qpf.tolist(), dtype="float64")
         cum_qpf_72_series = (
             combined_p.rolling(window=72, min_periods=1).sum().iloc[len(hist_tail):].values
         )
     else:
+        cum_qpf_series = mos_qpf.rolling(window=24, min_periods=1).sum().values
         cum_qpf_72_series = (
             mos_qpf.rolling(window=72, min_periods=1).sum() + float(recent_precip_48h_mm * 0.5)
         ).values
@@ -583,6 +643,7 @@ def project_forward_hydro_series(
             precip_72hr_mm=float(cum_qpf_72_series[idx]),
             peak_qpf_1hr_24h_mm=q_exp,
             peak_p90_1hr_24h_mm=q_p90,
+            forecast_qpf_24hr_mm=float(cum_qpf_series[idx]),
             peak_runoff_24hr_mm_hr=r_exp,
         )
 
@@ -779,7 +840,19 @@ def compute_dashboard_hydro_state(
         )
         runoff_coeff_c = compute_runoff_coefficient(api_mm, precip_72hr_mm=precip_72hr_mm)
         current_runoff_mm_hr = round(runoff_coeff_c * eff_p_now, 3)
-        discharge_cfs = float(latest_row.get("discharge_index_cfs") or BASEFLOW_CFS)
+
+        last_idx = hist_hydro_df.index[-1]
+        hist_hydro_df.loc[last_idx, "effective_precip_1hr_mm"] = eff_p_now
+        hist_hydro_df.loc[last_idx, "upstream_spillover_mm"] = spill_now
+        hist_hydro_df.loc[last_idx, "api_mm"] = api_mm
+        hist_hydro_df.loc[last_idx, "api_in"] = round(api_mm / MM_PER_INCH, 3)
+        hist_hydro_df.loc[last_idx, "runoff_coeff_c"] = runoff_coeff_c
+        hist_hydro_df.loc[last_idx, "runoff_mm_hr"] = current_runoff_mm_hr
+        routed_hist_cfs = route_runoff_to_discharge_cfs(
+            hist_hydro_df["runoff_mm_hr"].tolist()
+        )
+        hist_hydro_df["discharge_index_cfs"] = routed_hist_cfs
+        discharge_cfs = float(routed_hist_cfs[-1])
         recent_runoff_list = hist_hydro_df["runoff_mm_hr"].tail(3).tolist()
     else:
         valid_time_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()

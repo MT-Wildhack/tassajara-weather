@@ -1,0 +1,726 @@
+--- a/ingest_weather.py
++++ b/ingest_weather.py
+@@ -83,6 +83,19 @@ def first_not_none(*vals):
+     return None
+ 
+ 
++def first_non_negative(*vals) -> Optional[float]:
++    """Returns the first numeric argument that is not None and >= 0.0 (filtering out -1 sentinels)."""
++    for v in vals:
++        if v is not None:
++            try:
++                fv = float(v)
++                if not math.isnan(fv) and fv >= 0.0:
++                    return fv
++            except (ValueError, TypeError):
++                continue
++    return None
++
++
+ def f_to_c(temp_f: Optional[float]) -> Optional[float]:
+     return round((float(temp_f) - 32.0) * 5.0 / 9.0, 2) if temp_f is not None else None
+ 
+@@ -126,7 +139,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
+     Extracts (wind_speed_ms, wind_gust_ms, wind_dir_deg) from any WeatherLink v2
+     current or archive record across all data_structure_type schemas.
+     """
+-    w_spd_mph = first_not_none(
++    w_spd_mph = first_non_negative(
+         rec.get("wind_speed_avg_last_10_min"),
+         rec.get("wind_speed_10_min_avg"),
+         rec.get("wind_speed_avg_last_2_min"),
+@@ -135,7 +148,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
+         rec.get("wind_speed_last"),
+         rec.get("wind_speed"),
+     )
+-    w_gst_mph = first_not_none(
++    w_gst_mph = first_non_negative(
+         rec.get("wind_speed_hi_last_10_min"),
+         rec.get("wind_gust_10_min"),
+         rec.get("wind_speed_hi_last_2_min"),
+@@ -144,7 +157,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
+         rec.get("wind_gust"),
+         w_spd_mph,
+     )
+-    w_dir = first_not_none(
++    w_dir = first_non_negative(
+         rec.get("wind_dir_scalar_avg_last_10_min"),
+         rec.get("wind_dir_scalar_avg_last_2_min"),
+         rec.get("wind_dir_scalar_avg_last_1_min"),
+@@ -159,6 +172,8 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
+ 
+     spd_ms = mph_to_ms(w_spd_mph) if w_spd_mph is not None else None
+     gst_ms = mph_to_ms(w_gst_mph) if w_gst_mph is not None else None
++    if spd_ms is not None and gst_ms is not None:
++        gst_ms = max(gst_ms, spd_ms)
+     dir_deg = float(w_dir) if w_dir is not None else None
+     return spd_ms, gst_ms, dir_deg
+ 
+@@ -220,6 +235,7 @@ class WeatherLinkV2Client:
+             "precip_day_mm": 0.0,
+             "precip_24hr_mm": 0.0,
+             "precip_storm_mm": 0.0,
++            "rain_storm_start_utc": None,
+             "precip_month_mm": 0.0,
+             "precip_year_mm": 0.0,
+             "precip_rate_mm_hr": 0.0,
+@@ -266,7 +282,8 @@ class WeatherLinkV2Client:
+             if spd_ms is not None and spd_ms > parsed["wind_speed_ms"]:
+                 parsed["wind_speed_ms"] = spd_ms
+             if gst_ms is not None and gst_ms > parsed["wind_gust_ms"]:
+-                parsed["wind_gust_ms"] = max(gst_ms, parsed["wind_speed_ms"])
++                parsed["wind_gust_ms"] = gst_ms
++            parsed["wind_gust_ms"] = max(parsed["wind_gust_ms"], parsed["wind_speed_ms"])
+             if dir_deg is not None and dir_deg > 0.0:
+                 parsed["wind_dir_deg"] = dir_deg
+ 
+@@ -361,6 +378,18 @@ class WeatherLinkV2Client:
+                     rain_storm_mm = float(clicks_storm) * 0.254
+             if rain_storm_mm is not None:
+                 parsed["precip_storm_mm"] = max(parsed["precip_storm_mm"], round(float(rain_storm_mm), 3))
++
++            storm_start_raw = first_non_negative(
++                latest.get("rain_storm_start_date"),
++                latest.get("rain_storm_start_time"),
++                latest.get("rain_storm_last_start_at"),
++            )
++            if storm_start_raw is not None and storm_start_raw > 946684800:
++                parsed["rain_storm_start_utc"] = (
++                    datetime.fromtimestamp(int(storm_start_raw), tz=timezone.utc)
++                    .replace(minute=0, second=0, microsecond=0)
++                    .isoformat()
++                )
+ 
+             rain_rate_mm = first_not_none(
+                 latest.get("rain_rate_hi_mm"),
+--- a/ingest_nws.py
++++ b/ingest_nws.py
+@@ -399,18 +399,22 @@ def fetch_nws_gridpoints_dataframe(
+             hp.get("short_fc")
+             or ("Live NWP Grid" if prefer_open_meteo_primary else "NWS Gridpoint MTR")
+         )
++        has_nws_qpf_slot = v_iso in grid_qpf_map
+         nws_grid_qpf = float(grid_qpf_map.get(v_iso, 0.0))
+         om_qpf = float(om.get("qpf_mm", 0.0)) if pd.notna(om.get("qpf_mm")) else 0.0
+-        synth_qpf = synthesize_qpf_from_pop_and_text(pop_pct, rh_pct, short_fc)
+-
+-        if nws_grid_qpf > 0.0:
++
++        if prefer_open_meteo_primary and not has_nws_qpf_slot and om_qpf > 0.0:
++            qpf_1hr_mm = round(om_qpf, 3)
++        elif has_nws_qpf_slot:
++            # Strictly preserve official NWS /gridpoints/MTR QPF (including true 0.0 mm hours)
+             qpf_1hr_mm = round(nws_grid_qpf, 3)
+-        elif not grid_qpf_map and om_qpf > 0.0:
++        elif om_qpf > 0.0:
++            # Beyond NWS NDFD QPF horizon (or if NDFD QPF array is empty), use Open-Meteo NWP QPF
+             qpf_1hr_mm = round(om_qpf, 3)
+-        elif pop_pct >= 25.0 and om_qpf > 0.0:
+-            qpf_1hr_mm = round(min(om_qpf, synth_qpf * 1.5 if synth_qpf > 0 else om_qpf), 3)
+-        elif not grid_qpf_map:
+-            qpf_1hr_mm = round(synth_qpf, 3)
++        elif not grid_qpf_map and not om_map:
++            qpf_1hr_mm = round(
++                synthesize_qpf_from_pop_and_text(pop_pct, rh_pct, short_fc), 3
++            )
+         else:
+             qpf_1hr_mm = 0.0
+ 
+@@ -461,12 +465,6 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
+         for _, r in df_future.iterrows()
+     ]
+ 
+-    qpf_repair_rows = [
+-        (float(r["nws_qpf_1hr_mm"]), float(r["nws_wind_gust_ms"]), str(r["valid_time_utc"]))
+-        for _, r in df_fc.iterrows()
+-        if float(r["nws_qpf_1hr_mm"]) > 0.0
+-    ]
+-
+     with sqlite3.connect(db_path) as conn:
+         conn.executemany(
+             """
+@@ -479,25 +477,6 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
+             rows_to_insert,
+         )
+ 
+-        if qpf_repair_rows:
+-            conn.executemany(
+-                """
+-                UPDATE nws_forecasts
+-                SET nws_qpf_1hr_mm = ?,
+-                    nws_wind_gust_ms = MAX(COALESCE(nws_wind_gust_ms, 0.0), ?)
+-                WHERE valid_time_utc = ?
+-                  AND COALESCE(nws_qpf_1hr_mm, 0.0) <= 0.0
+-                """,
+-                qpf_repair_rows,
+-            )
+-
+-        # Clean any low-PoP (<20%) forecast rows that have spurious QPF
+-        conn.execute(
+-            """
+-            UPDATE nws_forecasts
+-            SET nws_qpf_1hr_mm = 0.0
+-            WHERE COALESCE(nws_pop_pct, 0.0) < 20.0
+-              AND COALESCE(nws_qpf_1hr_mm, 0.0) > 0.0
+-            """
+-        )
+         conn.commit()
+ 
+     wet_fc_hrs = sum(1 for r in rows_to_insert if r[10] > 0.0)
+--- a/mos_model.py
++++ b/mos_model.py
+@@ -104,19 +104,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
+     raw_qpf_mm = _num_series(df, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0)
+     sky_pct = _num_series(df, "nws_sky_cover_pct", 20.0).clip(0.0, 100.0)
+ 
+-    pop_frac = pop_pct / 100.0
+-    rh_frac = np.clip(rh_pct / 100.0, 0.30, 1.0)
+-    batch_has_qpf = bool((raw_qpf_mm > 0.0).any())
+-    synth_qpf_prior = np.where(
+-        (not batch_has_qpf) & (pop_pct >= 35.0),
+-        np.where(
+-            pop_pct >= 65.0,
+-            1.15 * (pop_frac ** 1.25) * rh_frac,
+-            0.45 * (pop_frac ** 1.45) * rh_frac,
+-        ),
+-        0.0,
+-    )
+-    qpf_mm = np.where(raw_qpf_mm > 0.0, raw_qpf_mm, synth_qpf_prior)
++    qpf_mm = raw_qpf_mm
+ 
+     out["lead_time_hours"] = lead_hrs
+     out["nws_temp_c"] = t_c
+@@ -267,22 +255,11 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
+     )
+ 
+     pop_frac = mos_pop / 100.0
+-    rh_factor = np.clip((rh - 35.0) / 65.0, 0.25, 1.0)
+-    batch_has_raw_qpf = bool((raw_qpf > 0.0).any())
+-    conditional_qpf_prior = np.where(
+-        (not batch_has_raw_qpf) & (mos_pop >= 35.0),
+-        np.where(
+-            mos_pop >= 65.0,
+-            1.10 * (pop_frac ** 1.25) * rh_factor,
+-            0.40 * (pop_frac ** 1.45) * rh_factor,
+-        ),
+-        0.0,
+-    )
+-    effective_base_qpf = np.where(raw_qpf > 0.0, raw_qpf, conditional_qpf_prior)
+-
+-    mos_qpf = effective_base_qpf * net_multiplier
+-    mos_qpf = np.where(mos_pop < 15.0, 0.0, mos_qpf)
++    mos_qpf = raw_qpf * net_multiplier
++    # Never zero out active storm QPF (>= 0.254 mm) even if raw PoP was under-reported
++    mos_qpf = np.where((mos_pop < 15.0) & (raw_qpf < TIPPING_BUCKET_MM), 0.0, mos_qpf)
+ 
+     mos_qpf_p90 = np.where(
+-        mos_pop >= 12.0,
++        mos_qpf > 0.0,
+         np.maximum(mos_qpf * 1.65, mos_qpf + 0.45 * pop_frac * orographic_factor),
+         0.0,
+     )
+@@ -470,19 +447,36 @@ class TassajaraMOSCorrector:
+             cond_qpf = np.clip(self.model_qpf_mean.predict(X_aligned), 0.0, None)
+             cond_p90 = np.clip(self.model_qpf_p90.predict(X_aligned), 0.0, None)
+ 
+-            hurdle_gate = np.where(mos_pop_pct < 15.0, 0.0, np.clip(mos_pop_pct / 45.0, 0.20, 1.0))
+-            ml_qpf_mm = cond_qpf * hurdle_gate
++            raw_qpf_arr = (
++                X_fut["nws_qpf_1hr_mm"].values
++                if "nws_qpf_1hr_mm" in X_fut.columns
++                else np.zeros(len(X_fut))
++            )
++            active_qpf_mask = (mos_pop_pct >= 15.0) | (raw_qpf_arr >= TIPPING_BUCKET_MM)
++            eff_pop_for_gate = np.maximum(
++                mos_pop_pct, np.where(raw_qpf_arr >= TIPPING_BUCKET_MM, 35.0, 0.0)
++            )
++            hurdle_gate = np.where(
++                ~active_qpf_mask, 0.0, np.clip(eff_pop_for_gate / 45.0, 0.20, 1.0)
++            )
++            ml_qpf_mm = np.where(
++                (raw_qpf_arr > 0.0) | (mos_pop_pct >= 60.0),
++                cond_qpf * hurdle_gate,
++                0.0,
++            )
+ 
+             mos_qpf_mm = np.maximum(
+                 0.65 * ml_qpf_mm + 0.35 * phys_df["mos_qpf_mm"].values,
+                 0.70 * phys_df["mos_qpf_mm"].values,
+             )
+-            mos_qpf_mm = np.where(mos_pop_pct < 15.0, 0.0, mos_qpf_mm)
++            mos_qpf_mm = np.where(~active_qpf_mask, 0.0, mos_qpf_mm)
+ 
+-            mos_qpf_p90_mm = np.maximum(
+-                mos_qpf_mm * 1.35,
+-                0.65 * (cond_p90 * hurdle_gate) + 0.35 * phys_df["mos_qpf_p90_mm"].values,
++            mos_qpf_p90_mm = np.where(
++                mos_qpf_mm > 0.0,
++                np.maximum(
++                    mos_qpf_mm * 1.35,
++                    0.65 * (cond_p90 * hurdle_gate) + 0.35 * phys_df["mos_qpf_p90_mm"].values,
++                ),
++                0.0,
+             )
+ 
+             return pd.DataFrame({
+@@ -513,7 +507,9 @@ class TassajaraMOSCorrector:
+ 
+         res["raw_nws_pop_pct"] = np.round(X_full["nws_pop_pct"].values, 1)
+         res["mos_pop_pct"] = hydro_df["mos_pop_pct"].values
+-        res["raw_nws_qpf_mm"] = np.round(X_full["nws_qpf_1hr_mm"].values, 3)
++        res["raw_nws_qpf_mm"] = np.round(
++            _num_series(df_future, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0).values, 3
++        )
+         res["mos_qpf_mm"] = hydro_df["mos_qpf_mm"].values
+         res["mos_qpf_p90_mm"] = hydro_df["mos_qpf_p90_mm"].values
+         return res
+--- a/hydro_risk_engine.py
++++ b/hydro_risk_engine.py
+@@ -201,16 +201,37 @@ def evaluate_flood_and_road_tier(
+     combining antecedent wetness (API), observed rainfall, forward MOS QPF & P90 rates,
+     cumulative 3-day storm totals, and optional physical stream-gauge telemetry.
+     """
+-    eff_api_mm = max(float(api_mm or 0.0), float(projected_max_api_24h_mm or 0.0))
++    cur_api_mm = float(api_mm or 0.0)
++    eff_api_mm = max(cur_api_mm, float(projected_max_api_24h_mm or 0.0))
+     max_1hr_rate_mm = max(float(precip_1hr_mm or 0.0), float(peak_qpf_1hr_24h_mm or 0.0))
+     max_p90_rate_mm = max(max_1hr_rate_mm, float(peak_p90_1hr_24h_mm or 0.0))
+-    rolling_24h_mm = max(float(precip_24hr_mm or 0.0), float(forecast_qpf_24hr_mm or 0.0))
+-    active_48h_Bridge_mm = float(precip_24hr_mm or 0.0) + float(forecast_qpf_24hr_mm or 0.0)
+-    total_72h_window_mm = max(
+-        active_48h_Bridge_mm,
+-        float(forecast_qpf_72hr_mm or 0.0),
++
++    obs_24h_mm = float(precip_24hr_mm or 0.0)
++    obs_72h_mm = float(precip_72hr_mm or 0.0)
++    fc_24h_mm = float(forecast_qpf_24hr_mm or 0.0)
++    fc_72h_mm = float(forecast_qpf_72hr_mm or 0.0)
++
++    # Past rainfall remains an active flood/road trigger only while rain is ongoing/imminent
++    # or while catchment soil wetness (API_t) remains above advisory/primed thresholds.
++    active_or_imminent_rain = (max_1hr_rate_mm >= 0.254) or (fc_24h_mm >= 2.54)
++    soil_primed = (cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
++
++    rolling_24h_mm = max(
++        fc_24h_mm,
++        obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= YELLOW_API_MM) else 0.0,
++    )
++    active_48h_Bridge_mm = (
++        (obs_24h_mm if (active_or_imminent_rain or cur_api_mm >= ORANGE_SATURATED_FLOOR_MM) else 0.0)
++        + fc_24h_mm
++    )
++    total_72h_window_mm = max(
++        active_48h_Bridge_mm,
++        fc_72h_mm,
++        obs_72h_mm if (active_or_imminent_rain or eff_api_mm >= YELLOW_API_MM) else 0.0,
++    )
++    imminent_24h_wet = (
++        (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
+     )
+-    soil_primed = (api_mm >= ORANGE_SATURATED_FLOOR_MM) or (eff_api_mm >= YELLOW_API_MM)
+-    imminent_24h_wet = (rolling_24h_mm >= YELLOW_RAIN_24H_MM) or (max_1hr_rate_mm >= ORANGE_QPF_RATE_MM_HR)
+ 
+     red_reasons: List[str] = []
+     orange_reasons: List[str] = []
+@@ -225,14 +246,18 @@ def evaluate_flood_and_road_tier(
+             f"Extreme MOS P90 downpour rate {max_p90_rate_mm / MM_PER_INCH:.2f} in/hr "
+             f"on primed catchment (API {eff_api_mm / MM_PER_INCH:.2f} in)"
+         )
+-    if active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed:
++    if (active_48h_Bridge_mm >= RED_RAIN_72H_ABSOLUTE_MM and soil_primed) or (
++        fc_72h_mm >= RED_RAIN_72H_ABSOLUTE_MM
++    ):
++        storm_tot_mm = max(active_48h_Bridge_mm, fc_72h_mm)
+         red_reasons.append(
+-            f"Active 48h storm total {active_48h_Bridge_mm / MM_PER_INCH:.2f} in "
++            f"Cumulative storm total {storm_tot_mm / MM_PER_INCH:.2f} in "
+             f"exceeds critical 4.00 in road washout threshold"
+         )
+-    elif (
+-        total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM
+-        and eff_api_mm >= ORANGE_API_MM
+-        and imminent_24h_wet
++    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and (
++        (eff_api_mm >= ORANGE_API_MM and imminent_24h_wet)
++        or (fc_72h_mm >= RED_RAIN_72H_CRITICAL_MM and soil_primed)
+     ):
+         red_reasons.append(
+             f"3-day rainfall {total_72h_window_mm / MM_PER_INCH:.2f} in combined with "
+@@ -266,6 +291,11 @@ def evaluate_flood_and_road_tier(
+     if rolling_24h_mm >= ORANGE_RAIN_24H_MM:
+         orange_reasons.append(
+             f"24-hour rainfall accumulation {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 2.00 in)"
++        )
++    elif fc_72h_mm >= 69.85 or (total_72h_window_mm >= 63.50 and soil_primed and active_or_imminent_rain):
++        orange_reasons.append(
++            f"72-hour storm accumulation {max(fc_72h_mm, total_72h_window_mm) / MM_PER_INCH:.2f} in "
++            f"elevates canyon slipout and creek rise risk"
+         )
+     if eff_api_mm >= ORANGE_API_MM and max_1hr_rate_mm >= YELLOW_QPF_RATE_MM_HR:
+         orange_reasons.append(
+@@ -338,6 +368,26 @@ def spinup_historical_api_series(
+     if df.empty:
+         return pd.DataFrame()
+ 
++    # Reindex onto a continuous 1-hour UTC grid so API_t and C_t decay every clock hour
++    # and 24h/72h rolling windows span exact 24- and 72-hour time intervals.
++    full_hr_idx = pd.date_range(
++        start=df["_dt_utc"].min(), end=df["_dt_utc"].max(), freq="1h", tz="UTC"
++    )
++    df = (
++        df.set_index("_dt_utc")
++        .reindex(full_hr_idx)
++        .reset_index()
++        .rename(columns={"index": "_dt_utc"})
++    )
++    df["valid_time_utc"] = df["_dt_utc"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
++    if "station_id" in df.columns:
++        df["station_id"] = df["station_id"].ffill().bfill().fillna("TASS_VP2")
++    df["temp_c"] = (
++        pd.to_numeric(df.get("temp_c"), errors="coerce")
++        .interpolate(method="linear", limit_direction="both")
++        .fillna(15.0)
++    )
++    df["rh_pct"] = (
++        pd.to_numeric(df.get("rh_pct"), errors="coerce")
++        .interpolate(method="linear", limit_direction="both")
++        .fillna(60.0)
++    )
++    df["precip_1hr_mm"] = (
++        pd.to_numeric(df.get("precip_1hr_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
++    )
++
+     # Optional join of upstream crest precipitation (CHWC1, VTCC1, PPSC1)
+     chews_map: Dict[pd.Timestamp, float] = {}
+     vent_map: Dict[pd.Timestamp, float] = {}
+@@ -442,10 +492,16 @@ def project_forward_hydro_series(
+     proj_r_p90_mm: List[float] = []
+     proj_tiers: List[str] = []
+ 
+-    cum_qpf_series = mos_qpf.rolling(window=24, min_periods=1).sum().values
+     if recent_precip_history_mm:
++        hist_tail_23 = [max(0.0, float(x)) for x in recent_precip_history_mm[-23:]]
++        combined_24 = pd.Series(hist_tail_23 + mos_qpf.tolist(), dtype="float64")
++        cum_qpf_series = (
++            combined_24.rolling(window=24, min_periods=1).sum().iloc[len(hist_tail_23):].values
++        )
+         hist_tail = [max(0.0, float(x)) for x in recent_precip_history_mm[-71:]]
+         combined_p = pd.Series(hist_tail + mos_qpf.tolist(), dtype="float64")
+         cum_qpf_72_series = (
+             combined_p.rolling(window=72, min_periods=1).sum().iloc[len(hist_tail):].values
+         )
+     else:
++        cum_qpf_series = mos_qpf.rolling(window=24, min_periods=1).sum().values
+         cum_qpf_72_series = (
+             mos_qpf.rolling(window=72, min_periods=1).sum() + float(recent_precip_48h_mm * 0.5)
+         ).values
+@@ -470,6 +526,7 @@ def project_forward_hydro_series(
+             precip_72hr_mm=float(cum_qpf_72_series[idx]),
+             peak_qpf_1hr_24h_mm=q_exp,
+             peak_p90_1hr_24h_mm=q_p90,
++            forecast_qpf_24hr_mm=float(cum_qpf_series[idx]),
+             peak_runoff_24hr_mm_hr=r_exp,
+         )
+ 
+@@ -544,8 +601,20 @@ def compute_dashboard_hydro_state(
+         )
+         runoff_coeff_c = compute_runoff_coefficient(api_mm, precip_72hr_mm=precip_72hr_mm)
+         current_runoff_mm_hr = round(runoff_coeff_c * eff_p_now, 3)
+-        discharge_cfs = float(latest_row.get("discharge_index_cfs") or BASEFLOW_CFS)
+-        recent_runoff_list = hist_hydro_df["runoff_mm_hr"].tail(3).tolist()
++
++        last_idx = hist_hydro_df.index[-1]
++        hist_hydro_df.loc[last_idx, "effective_precip_1hr_mm"] = eff_p_now
++        hist_hydro_df.loc[last_idx, "upstream_spillover_mm"] = spill_now
++        hist_hydro_df.loc[last_idx, "api_mm"] = api_mm
++        hist_hydro_df.loc[last_idx, "api_in"] = round(api_mm / MM_PER_INCH, 3)
++        hist_hydro_df.loc[last_idx, "runoff_coeff_c"] = runoff_coeff_c
++        hist_hydro_df.loc[last_idx, "runoff_mm_hr"] = current_runoff_mm_hr
++        routed_hist_cfs = route_runoff_to_discharge_cfs(
++            hist_hydro_df["runoff_mm_hr"].tolist()
++        )
++        hist_hydro_df["discharge_index_cfs"] = routed_hist_cfs
++        discharge_cfs = float(routed_hist_cfs[-1])
++        recent_runoff_list = hist_hydro_df["runoff_mm_hr"].tail(3).tolist()
+     else:
+         valid_time_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+         eff_p_now, spill_now = compute_effective_catchment_precip_mm(
+--- a/run_hourly_mos_pipeline.py
++++ b/run_hourly_mos_pipeline.py
+@@ -190,13 +190,14 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
+         yesterday_mid_iso, today_mid_iso, _ = get_local_day_boundaries_utc(
+             pd.to_datetime(obs_hour_iso, utc=True).to_pydatetime()
+         )
+-        console_day_mm = max(
+-            clean_num(tass_obs.get("precip_day_mm"), 0.0) or 0.0,
+-            clean_num(tass_obs.get("precip_24hr_mm"), 0.0) or 0.0,
+-        )
++        console_day_mm = clean_num(tass_obs.get("precip_day_mm"), 0.0) or 0.0
+         console_storm_mm = clean_num(tass_obs.get("precip_storm_mm"), 0.0) or 0.0
+-        reported_24h_mm = max(console_day_mm, console_storm_mm)
++        storm_start_iso = tass_obs.get("rain_storm_start_utc") or yesterday_mid_iso
++        reported_24h_mm = max(
++            console_day_mm,
++            clean_num(tass_obs.get("precip_24hr_mm"), 0.0) or 0.0,
++        )
+ 
+         if console_day_mm > 0.0:
+             db_today_sum = float(
+                 conn.execute(
+@@ -209,50 +210,36 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
+                 or 0.0
+             )
+             shortfall_today_mm = round(console_day_mm - db_today_sum, 3)
+             if shortfall_today_mm >= 0.20:
+-                cand_rows = conn.execute(
+-                    """
+-                    SELECT o.valid_time_utc, COALESCE(m.mqpf, 0.0) AS mqpf, COALESCE(o.rh_pct, 50.0) AS rh
+-                    FROM local_observations o
+-                    LEFT JOIN (
+-                        SELECT valid_time_utc, MAX(COALESCE(mos_qpf_mm, raw_nws_qpf_mm, 0.0)) AS mqpf
+-                        FROM mos_corrected_forecasts
+-                        GROUP BY valid_time_utc
+-                    ) m ON o.valid_time_utc = m.valid_time_utc
+-                    WHERE o.valid_time_utc >= ? AND o.valid_time_utc <= ?
+-                    ORDER BY COALESCE(m.mqpf, 0.0) DESC, COALESCE(o.rh_pct, 0.0) DESC, o.valid_time_utc DESC
+-                    LIMIT 6
+-                    """,
+-                    (today_mid_iso, obs_hour_iso),
+-                ).fetchall()
+-                if not cand_rows or shortfall_today_mm <= 2.5:
+-                    target_hr = cand_rows[0][0] if cand_rows else obs_hour_iso
+-                    conn.execute(
+-                        """
+-                        UPDATE local_observations
+-                        SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+-                        WHERE valid_time_utc = ?
+-                        """,
+-                        (shortfall_today_mm, target_hr),
+-                    )
+-                else:
+-                    weights = [max(0.1, float(r[1]) * 2.0 + max(0.0, (float(r[2]) - 70.0) / 10.0)) for r in cand_rows]
+-                    w_sum = sum(weights)
+-                    for (r_ts, _, _), w_val in zip(cand_rows, weights):
+-                        share_mm = round(shortfall_today_mm * (w_val / w_sum), 3)
+-                        if share_mm > 0.0:
+-                            conn.execute(
+-                                """
+-                                UPDATE local_observations
+-                                SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+-                                WHERE valid_time_utc = ?
+-                                """,
+-                                (share_mm, r_ts),
+-                            )
++                # Quantize to 0.254 mm (0.01 in) tipping-bucket increments and attribute
++                # to the current observation hour rather than smearing across prior hours.
++                clicks = max(1, int(round(shortfall_today_mm / 0.254)))
++                quantized_mm = round(clicks * 0.254, 3)
++                conn.execute(
++                    """
++                    UPDATE local_observations
++                    SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
++                    WHERE valid_time_utc = ?
++                    """,
++                    (quantized_mm, obs_hour_iso),
++                )
+                 logger.info(
+-                    f"Reconciled {shortfall_today_mm:.2f} mm ({shortfall_today_mm/25.4:.2f} in) of today's console rain "
++                    f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of today's console rain "
+                     f"(rain_day_in={console_day_mm/25.4:.2f} in) into {obs_hour_iso}."
+                 )
+ 
+         pre_midnight_storm_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
+-        if 0.20 <= pre_midnight_storm_mm <= 60.0:
+-            db_yest_sum = float(
++        if 0.20 <= pre_midnight_storm_mm <= 60.0 and storm_start_iso >= yesterday_mid_iso:
++            db_pre_mid_sum = float(
+                 conn.execute(
+                     """
+                     SELECT COALESCE(SUM(precip_1hr_mm), 0.0)
+                     FROM local_observations
+                     WHERE valid_time_utc >= ? AND valid_time_utc < ?
+                     """,
+-                    (yesterday_mid_iso, today_mid_iso),
++                    (storm_start_iso, today_mid_iso),
+                 ).fetchone()[0]
+                 or 0.0
+             )
+-            shortfall_yest_mm = round(pre_midnight_storm_mm - db_yest_sum, 3)
++            shortfall_yest_mm = round(pre_midnight_storm_mm - db_pre_mid_sum, 3)
+             if shortfall_yest_mm >= 0.20:
++                clicks_yest = max(1, int(round(shortfall_yest_mm / 0.254)))
++                quantized_yest_mm = round(clicks_yest * 0.254, 3)
+                 yest_row = conn.execute(
+                     """
+                     SELECT valid_time_utc
+                     FROM local_observations
+-                    WHERE valid_time_utc >= strftime('%Y-%m-%dT%H:%M:%S+00:00', ?, '-8 hours')
++                    WHERE valid_time_utc >= strftime('%Y-%m-%dT%H:%M:%S+00:00', ?, '-3 hours')
+                       AND valid_time_utc < ?
+                     ORDER BY COALESCE(rh_pct, 0.0) DESC, valid_time_utc DESC
+                     LIMIT 1
+                     """,
+                     (today_mid_iso, today_mid_iso),
+                 ).fetchone()
+                 if yest_row:
+                     conn.execute(
+                         """
+                         UPDATE local_observations
+                         SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                         WHERE valid_time_utc = ?
+                         """,
+-                        (shortfall_yest_mm, yest_row[0]),
++                        (quantized_yest_mm, yest_row[0]),
+                     )
+                     logger.info(
+-                        f"Reconciled {shortfall_yest_mm:.2f} mm ({shortfall_yest_mm/25.4:.2f} in) of pre-midnight storm rain "
++                        f"Reconciled {quantized_yest_mm:.3f} mm ({quantized_yest_mm/25.4:.2f} in) of pre-midnight storm rain "
+                         f"into {yest_row[0]}."
+                     )
+--- a/app.py
++++ b/app.py
+@@ -334,7 +334,7 @@ def fetch_live_nwp_topup(now_hour_utc: datetime) -> pd.DataFrame:
+         df_live = fetch_nws_gridpoints_dataframe(
+             now_hour_utc=now_hour_utc,
+             include_past_hours=0,
+-            prefer_open_meteo_primary=True,
++            prefer_open_meteo_primary=False,
+         )
+         if not df_live.empty:
+             df_live = filter_future_horizon(df_live, now_hour_utc).head(168).copy()
+@@ -392,8 +392,6 @@ def apply_mos_inference_if_needed(
+             | mos_qpf_s.isna()
+             | mos_pop_s.isna()
+             | ((raw_pop_s >= 15.0) & (mos_pop_s <= 0.0))
+-            | ((raw_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+-            | ((mos_pop_s >= 20.0) & (mos_qpf_s <= 0.0))
+             | ((raw_qpf_s > 0.0) & (mos_qpf_s <= 0.0))
+         )
+     if not missing_mask.any():
+@@ -446,16 +444,6 @@ def apply_mos_inference_if_needed(
+                 else:
+                     out.loc[missing_mask, c] = fb[c].values
+ 
+-            sub_mos_pop = get_col(out.loc[missing_mask], "mos_pop_pct", 0.0)
+-            sub_mos_qpf = get_col(out.loc[missing_mask], "mos_qpf_mm", 0.0)
+-            zero_trapped = (sub_mos_pop >= 20.0) & (sub_mos_qpf <= 0.0)
+-            if zero_trapped.any():
+-                trap_idx = out.loc[missing_mask].index[zero_trapped]
+-                out.loc[trap_idx, "mos_qpf_mm"] = fb.loc[trap_idx, "mos_qpf_mm"].values
+-                out.loc[trap_idx, "mos_qpf_p90_mm"] = np.maximum(
+-                    get_col(out.loc[trap_idx], "mos_qpf_p90_mm", 0.0).values,
+-                    fb.loc[trap_idx, "mos_qpf_p90_mm"].values,
+-                )
+             return out
+         except Exception:
+             pass
+@@ -473,13 +461,9 @@ def backfill_missing_hindcast_verification(
+ 
+     existing_v_hrs = set()
+     if verify_df is not None and not verify_df.empty and "valid_time_utc" in verify_df.columns:
+-        v_pop = get_col(verify_df, "nws_pop_pct", 0.0)
+-        v_qpf = get_col(verify_df, "nws_qpf_1hr_mm", 0.0)
+-        v_act_p = get_col(verify_df, "actual_precip_mm", 0.0)
+-        qpf_valid_mask = ~(((v_pop >= 25.0) | (v_act_p > 0.0)) & (v_qpf <= 0.0))
+         v_valid = verify_df[
+             verify_df["raw_nws_temp_c"].notna()
+             & verify_df["corrected_temp_c"].notna()
+-            & qpf_valid_mask
+         ]
+         existing_v_hrs = set(
+             pd.to_datetime(v_valid["valid_time_utc"], utc=True, errors="coerce").dt.floor("h").dropna()
+@@ -698,7 +682,7 @@ def load_all_dashboard_data():
+                             nws_wind_gust_ms,
+                             nws_wind_dir_deg,
+                             nws_pop_pct,
+-                            MAX(COALESCE(nws_qpf_1hr_mm, 0.0)) OVER (PARTITION BY valid_time_utc) AS nws_qpf_1hr_mm,
++                            COALESCE(nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
+                             nws_sky_cover_pct,
+                             short_forecast,
+                             ROW_NUMBER() OVER (
+@@ -750,8 +734,9 @@ def load_all_dashboard_data():
+                 "dewpoint_c": round(float(dew_live), 2),
+                 "wetbulb_c": round(float(wb_live), 2),
+                 "rh_pct": round(rh_live, 1),
+-                "wind_speed_ms": safe_float(live_obs.get("wind_speed_ms"), 0.0),
+-                "wind_gust_ms": safe_float(live_obs.get("wind_gust_ms"), 0.0),
++                "wind_speed_ms": safe_float(live_obs.get("wind_speed_ms"), 0.0),
++                "wind_gust_ms": max(
++                    safe_float(live_obs.get("wind_speed_ms"), 0.0),
++                    safe_float(live_obs.get("wind_gust_ms"), 0.0),
++                ),
+                 "wind_dir_deg": safe_float(live_obs.get("wind_dir_deg"), 0.0),
+                 "mslp_hpa": safe_float(
+                     live_obs.get("mslp_hpa"),
+@@ -775,40 +760,36 @@ def load_all_dashboard_data():
+             # Reconcile Davis console rain_day_in (today since 00:00 PST/PDT) and rain_storm_in
+             # into in-memory obs_df so Streamlit always reflects exact WeatherLink rainfall
+             yesterday_mid_iso, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
+-            console_day_mm = max(
+-                safe_float(live_obs.get("precip_day_mm"), 0.0),
+-                safe_float(live_obs.get("precip_24hr_mm"), 0.0),
+-            )
++            console_day_mm = safe_float(live_obs.get("precip_day_mm"), 0.0)
+             console_storm_mm = safe_float(live_obs.get("precip_storm_mm"), 0.0)
++            storm_start_iso = live_obs.get("rain_storm_start_utc") or yesterday_mid_iso
+             obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+             today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
+             db_today_mm = float(get_col(obs_df.loc[today_mask], "precip_1hr_mm", 0.0).sum()) if today_mask.any() else 0.0
+             shortfall_today_mm = round(console_day_mm - db_today_mm, 3)
+ 
+             if shortfall_today_mm >= 0.20 and today_mask.any():
+-                today_indices = obs_df.index[today_mask].tolist()
+-                rh_today = get_col(obs_df.loc[today_indices], "rh_pct", 50.0)
+-                wet_cand = [i for i in today_indices if float(rh_today.loc[i]) >= 75.0] or today_indices[:4]
+-                wet_cand = wet_cand[:6]
+-                weights = [max(0.2, float(rh_today.loc[i]) - 65.0) for i in wet_cand]
+-                w_sum = sum(weights)
+-                for idx_w, w_val in zip(wet_cand, weights):
+-                    add_mm = round(shortfall_today_mm * (w_val / w_sum), 3)
+-                    obs_df.loc[idx_w, "precip_1hr_mm"] = round(
+-                        safe_float(obs_df.loc[idx_w, "precip_1hr_mm"], 0.0) + add_mm, 3
+-                    )
++                clicks = max(1, int(round(shortfall_today_mm / 0.254)))
++                add_mm = round(clicks * 0.254, 3)
++                top_idx = obs_df.index[today_mask][0]
++                obs_df.loc[top_idx, "precip_1hr_mm"] = round(
++                    safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + add_mm, 3
++                )
+ 
+             pre_midnight_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
+-            if 0.20 <= pre_midnight_mm <= 60.0:
+-                yest_mask = (obs_dt_s >= pd.Timestamp(yesterday_mid_iso)) & (obs_dt_s < pd.Timestamp(today_mid_iso))
++            if 0.20 <= pre_midnight_mm <= 60.0 and str(storm_start_iso) >= str(yesterday_mid_iso):
++                yest_mask = (obs_dt_s >= pd.Timestamp(storm_start_iso)) & (obs_dt_s < pd.Timestamp(today_mid_iso))
+                 db_yest_mm = float(get_col(obs_df.loc[yest_mask], "precip_1hr_mm", 0.0).sum()) if yest_mask.any() else 0.0
+                 shortfall_yest_mm = round(pre_midnight_mm - db_yest_mm, 3)
+                 if shortfall_yest_mm >= 0.20 and yest_mask.any():
++                    clicks_y = max(1, int(round(shortfall_yest_mm / 0.254)))
++                    add_y_mm = round(clicks_y * 0.254, 3)
+                     yest_idx = obs_df.index[yest_mask][0]
+                     obs_df.loc[yest_idx, "precip_1hr_mm"] = round(
+-                        safe_float(obs_df.loc[yest_idx, "precip_1hr_mm"], 0.0) + shortfall_yest_mm, 3
++                        safe_float(obs_df.loc[yest_idx, "precip_1hr_mm"], 0.0) + add_y_mm, 3
+                     )
+ 
+             # In-memory live update only (prevents dirtying tassajara_weather.db in Git)
+@@ -850,7 +831,7 @@ def load_all_dashboard_data():
+ 
+     db_qpf_dropout = (
+         not future_fc_df.empty
+-        and float(get_col(future_fc_df, "nws_pop_pct", 0.0).max()) >= 20.0
++        and float(get_col(future_fc_df, "nws_pop_pct", 0.0).max()) >= 65.0
+         and float(get_col(future_fc_df, "nws_qpf_1hr_mm", 0.0).sum()) <= 0.01
+     )
+ 
+--- a/.github/workflows/weekly_retrain.yml
++++ b/.github/workflows/weekly_retrain.yml
+@@ -17,7 +17,7 @@ permissions:
+   contents: write
+ 
+ concurrency:
+-  group: tzmc-weather-pipeline
++  group: tassajara-mos-sqlite-pipeline
+   cancel-in-progress: false
+ 
+ jobs:

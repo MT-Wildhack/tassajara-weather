@@ -97,6 +97,19 @@ def first_not_none(*vals):
     return None
 
 
+def first_non_negative(*vals) -> Optional[float]:
+    """Returns the first numeric argument that is not None and >= 0.0 (filtering out -1 sentinels)."""
+    for v in vals:
+        if v is not None:
+            try:
+                fv = float(v)
+                if not math.isnan(fv) and fv >= 0.0:
+                    return fv
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
 def f_to_c(temp_f: Optional[float]) -> Optional[float]:
     return round((float(temp_f) - 32.0) * 5.0 / 9.0, 2) if temp_f is not None else None
 
@@ -159,7 +172,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
     Extracts (wind_speed_ms, wind_gust_ms, wind_dir_deg) from any WeatherLink v2
     current or archive record across all data_structure_type schemas.
     """
-    w_spd_mph = first_not_none(
+    w_spd_mph = first_non_negative(
         rec.get("wind_speed_avg_last_10_min"),
         rec.get("wind_speed_10_min_avg"),
         rec.get("wind_speed_avg_last_2_min"),
@@ -168,7 +181,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
         rec.get("wind_speed_last"),
         rec.get("wind_speed"),
     )
-    w_gst_mph = first_not_none(
+    w_gst_mph = first_non_negative(
         rec.get("wind_speed_hi_last_10_min"),
         rec.get("wind_gust_10_min"),
         rec.get("wind_speed_hi_last_2_min"),
@@ -177,7 +190,7 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
         rec.get("wind_gust"),
         w_spd_mph,
     )
-    w_dir = first_not_none(
+    w_dir = first_non_negative(
         rec.get("wind_dir_scalar_avg_last_10_min"),
         rec.get("wind_dir_scalar_avg_last_2_min"),
         rec.get("wind_dir_scalar_avg_last_1_min"),
@@ -193,6 +206,8 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
 
     spd_ms = mph_to_ms(w_spd_mph) if w_spd_mph is not None else None
     gst_ms = mph_to_ms(w_gst_mph) if w_gst_mph is not None else None
+    if spd_ms is not None and gst_ms is not None:
+        gst_ms = max(gst_ms, spd_ms)
     dir_deg = float(w_dir) if w_dir is not None else None
     return spd_ms, gst_ms, dir_deg
 
@@ -265,6 +280,7 @@ class WeatherLinkV2Client:
             "precip_day_mm": 0.0,
             "precip_24hr_mm": 0.0,
             "precip_storm_mm": 0.0,
+            "rain_storm_start_utc": None,
             "precip_month_mm": 0.0,
             "precip_year_mm": 0.0,
             "precip_rate_mm_hr": 0.0,
@@ -347,7 +363,8 @@ class WeatherLinkV2Client:
             if spd_ms is not None and spd_ms > parsed["wind_speed_ms"]:
                 parsed["wind_speed_ms"] = spd_ms
             if gst_ms is not None and gst_ms > parsed["wind_gust_ms"]:
-                parsed["wind_gust_ms"] = max(gst_ms, parsed["wind_speed_ms"])
+                parsed["wind_gust_ms"] = gst_ms
+            parsed["wind_gust_ms"] = max(parsed["wind_gust_ms"], parsed["wind_speed_ms"])
             if dir_deg is not None and dir_deg > 0.0:
                 parsed["wind_dir_deg"] = dir_deg
 
@@ -458,6 +475,18 @@ class WeatherLinkV2Client:
                     rain_storm_mm = float(clicks_storm) * 0.254
             if rain_storm_mm is not None:
                 parsed["precip_storm_mm"] = max(parsed["precip_storm_mm"], round(float(rain_storm_mm), 3))
+
+            storm_start_raw = first_non_negative(
+                latest.get("rain_storm_start_date"),
+                latest.get("rain_storm_start_time"),
+                latest.get("rain_storm_last_start_at"),
+            )
+            if storm_start_raw is not None and storm_start_raw > 946684800:
+                parsed["rain_storm_start_utc"] = (
+                    datetime.fromtimestamp(int(storm_start_raw), tz=timezone.utc)
+                    .replace(minute=0, second=0, microsecond=0)
+                    .isoformat()
+                )
 
             rain_rate_mm = first_not_none(
                 latest.get("rain_rate_hi_mm"),

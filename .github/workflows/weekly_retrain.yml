@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: tzmc-weather-pipeline
+  group: tassajara-mos-sqlite-pipeline
   cancel-in-progress: false
 
 jobs:

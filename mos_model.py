@@ -126,19 +126,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     raw_qpf_mm = _num_series(df, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0)
     sky_pct = _num_series(df, "nws_sky_cover_pct", 20.0).clip(0.0, 100.0)
 
-    pop_frac = pop_pct / 100.0
-    rh_frac = np.clip(rh_pct / 100.0, 0.30, 1.0)
-    batch_has_qpf = bool((raw_qpf_mm > 0.0).any())
-    synth_qpf_prior = np.where(
-        (not batch_has_qpf) & (pop_pct >= 35.0),
-        np.where(
-            pop_pct >= 65.0,
-            1.15 * (pop_frac ** 1.25) * rh_frac,
-            0.45 * (pop_frac ** 1.45) * rh_frac,
-        ),
-        0.0,
-    )
-    qpf_mm = np.where(raw_qpf_mm > 0.0, raw_qpf_mm, synth_qpf_prior)
+    qpf_mm = raw_qpf_mm
 
     out["lead_time_hours"] = lead_hrs
     out["nws_temp_c"] = t_c
@@ -316,24 +304,12 @@ def analytical_hydro_hurdle_fallback(X: pd.DataFrame) -> pd.DataFrame:
     )
 
     pop_frac = mos_pop / 100.0
-    rh_factor = np.clip((rh - 35.0) / 65.0, 0.25, 1.0)
-    batch_has_raw_qpf = bool((raw_qpf > 0.0).any())
-    conditional_qpf_prior = np.where(
-        (not batch_has_raw_qpf) & (mos_pop >= 35.0),
-        np.where(
-            mos_pop >= 65.0,
-            1.10 * (pop_frac ** 1.25) * rh_factor,
-            0.40 * (pop_frac ** 1.45) * rh_factor,
-        ),
-        0.0,
-    )
-    effective_base_qpf = np.where(raw_qpf > 0.0, raw_qpf, conditional_qpf_prior)
-
-    mos_qpf = effective_base_qpf * net_multiplier
-    mos_qpf = np.where(mos_pop < 15.0, 0.0, mos_qpf)
+    mos_qpf = raw_qpf * net_multiplier
+    # Never zero out active storm QPF (>= 0.254 mm) even if raw PoP was under-reported
+    mos_qpf = np.where((mos_pop < 15.0) & (raw_qpf < TIPPING_BUCKET_MM), 0.0, mos_qpf)
 
     mos_qpf_p90 = np.where(
-        mos_pop >= 12.0,
+        mos_qpf > 0.0,
         np.maximum(mos_qpf * 1.65, mos_qpf + 0.45 * pop_frac * orographic_factor),
         0.0,
     )
@@ -608,18 +584,37 @@ class TassajaraMOSCorrector:
             cond_qpf = np.clip(self.model_qpf_mean.predict(X_aligned), 0.0, None)
             cond_p90 = np.clip(self.model_qpf_p90.predict(X_aligned), 0.0, None)
 
-            hurdle_gate = np.where(mos_pop_pct < 15.0, 0.0, np.clip(mos_pop_pct / 45.0, 0.20, 1.0))
-            ml_qpf_mm = cond_qpf * hurdle_gate
+            raw_qpf_arr = (
+                X_fut["nws_qpf_1hr_mm"].values
+                if "nws_qpf_1hr_mm" in X_fut.columns
+                else np.zeros(len(X_fut))
+            )
+            active_qpf_mask = (mos_pop_pct >= 15.0) | (raw_qpf_arr >= TIPPING_BUCKET_MM)
+            eff_pop_for_gate = np.maximum(
+                mos_pop_pct, np.where(raw_qpf_arr >= TIPPING_BUCKET_MM, 35.0, 0.0)
+            )
+            hurdle_gate = np.where(
+                ~active_qpf_mask, 0.0, np.clip(eff_pop_for_gate / 45.0, 0.20, 1.0)
+            )
+            ml_qpf_mm = np.where(
+                (raw_qpf_arr > 0.0) | (mos_pop_pct >= 60.0),
+                cond_qpf * hurdle_gate,
+                0.0,
+            )
 
             mos_qpf_mm = np.maximum(
                 0.65 * ml_qpf_mm + 0.35 * phys_df["mos_qpf_mm"].values,
                 0.70 * phys_df["mos_qpf_mm"].values,
             )
-            mos_qpf_mm = np.where(mos_pop_pct < 15.0, 0.0, mos_qpf_mm)
+            mos_qpf_mm = np.where(~active_qpf_mask, 0.0, mos_qpf_mm)
 
-            mos_qpf_p90_mm = np.maximum(
-                mos_qpf_mm * 1.35,
-                0.65 * (cond_p90 * hurdle_gate) + 0.35 * phys_df["mos_qpf_p90_mm"].values,
+            mos_qpf_p90_mm = np.where(
+                mos_qpf_mm > 0.0,
+                np.maximum(
+                    mos_qpf_mm * 1.35,
+                    0.65 * (cond_p90 * hurdle_gate) + 0.35 * phys_df["mos_qpf_p90_mm"].values,
+                ),
+                0.0,
             )
 
             return pd.DataFrame({
@@ -657,7 +652,9 @@ class TassajaraMOSCorrector:
 
         res["raw_nws_pop_pct"] = np.round(X_full["nws_pop_pct"].values, 1)
         res["mos_pop_pct"] = hydro_df["mos_pop_pct"].values
-        res["raw_nws_qpf_mm"] = np.round(X_full["nws_qpf_1hr_mm"].values, 3)
+        res["raw_nws_qpf_mm"] = np.round(
+            _num_series(df_future, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0).values, 3
+        )
         res["mos_qpf_mm"] = hydro_df["mos_qpf_mm"].values
         res["mos_qpf_p90_mm"] = hydro_df["mos_qpf_p90_mm"].values
         return res
