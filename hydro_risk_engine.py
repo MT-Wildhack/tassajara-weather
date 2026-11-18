@@ -283,12 +283,16 @@ def evaluate_flood_and_road_tier(
     """
     Evaluates the 4-Tier Flood & Tassajara Road Severity Matrix (GREEN, YELLOW, ORANGE, RED).
     Best-Practice Operational Gating:
-      - RED (Tier 3 Warning / Road Closure) and ORANGE (Tier 2 Watch / Road Risk) require
-        hazardous rainfall/runoff to be ACTIVE or IMMINENT (within the next 6 hours) OR
-        the catchment soil to ALREADY be primed/saturated (cur_api_mm >= 0.80 in).
-      - When current soil is dry (cur_api_mm < 0.80 in) and the next 6 hours are dry/light,
-        incoming storms 6-72 hours out trigger YELLOW (Tier 1 Hydrological Advisory) for
-        advance preparation without false claims that the creek is currently rising.
+      - RED (Tier 3 Warning / Road Closure) requires extreme rain intensity (>= 1.00 in/hr,
+        or P90 >= 1.25 in/hr on primed soil), critical surface runoff (>= 0.55 in/hr), or
+        massive 24h/72h storm totals accompanied by ACTIVE heavy downpours (>= 0.65 in/hr).
+        Post-frontal light showers (< 0.25 in/hr) never trigger RED.
+      - ORANGE (Tier 2 Watch / Road Risk) requires active/imminent (<= 6h) heavy rain
+        (>= 0.50 in/hr, or >= 0.30 in/hr when API >= 1.00 in, or >= 0.25 in/hr when
+        API >= 1.75 in or 24h rain >= 2.00 in) or 6h runoff >= 0.25 in/hr.
+      - YELLOW (Tier 1 Advisory) triggers whenever soil is saturated (API >= 1.00 in),
+        moderate rain is falling (>= 0.15 in/hr), or 24h/72h storm totals exceed advisory
+        thresholds (24h >= 1.00 in, 72h >= 1.50 in).
     """
     cur_api_mm = float(api_mm or 0.0)
     eff_api_24h_mm = max(cur_api_mm, float(projected_max_api_24h_mm or 0.0))
@@ -327,10 +331,12 @@ def evaluate_flood_and_road_tier(
     cur_soil_saturated = cur_api_mm >= ORANGE_API_MM           # >= 1.75 in right now
     imminent_6h_primed = eff_api_6h_mm >= YELLOW_API_MM        # >= 1.00 in within 6h
     imminent_6h_wet = (
-        (p_now_mm >= 1.0)
+        (p_now_mm >= 3.81)
         or (max_1hr_6h_mm >= YELLOW_QPF_RATE_MM_HR)
-        or (fc_6h_mm >= 6.35)
+        or (fc_6h_mm >= 7.62)
     )
+    imminent_6h_heavy = max_1hr_6h_mm >= ORANGE_QPF_RATE_MM_HR  # >= 0.50 in/hr
+    imminent_6h_torrential = max_1hr_6h_mm >= 16.51             # >= 0.65 in/hr
 
     obs_active_24h_mm = obs_24h_mm if (imminent_6h_wet or cur_api_mm >= YELLOW_API_MM) else 0.0
     rolling_24h_mm = max(fc_24h_mm, obs_active_24h_mm)
@@ -356,24 +362,24 @@ def evaluate_flood_and_road_tier(
             f"Extreme P90 downpour rate {max_p90_6h_mm / MM_PER_INCH:.2f} in/hr "
             f"on primed catchment (API {eff_api_6h_mm / MM_PER_INCH:.2f} in)"
         )
-    if rolling_24h_mm >= 82.55 and cur_soil_saturated and imminent_6h_wet:
+    if rolling_24h_mm >= 88.90 and cur_soil_saturated and imminent_6h_torrential:
         red_reasons.append(
-            f"Extreme 24-hour storm total {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 3.25 in) "
-            f"on saturated catchment (API {cur_api_mm / MM_PER_INCH:.2f} in)"
+            f"Extreme 24-hour storm total {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 3.50 in) "
+            f"with intense rain ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr) on saturated catchment"
         )
     elif (
         total_72h_window_mm >= RED_RAIN_72H_ABSOLUTE_MM
         and cur_soil_saturated
-        and max_1hr_6h_mm >= ORANGE_QPF_RATE_MM_HR
+        and imminent_6h_torrential
     ):
         red_reasons.append(
             f"Cumulative 72h storm total {total_72h_window_mm / MM_PER_INCH:.2f} in (>= 4.00 in) "
-            f"with active heavy rain on saturated soil (API {cur_api_mm / MM_PER_INCH:.2f} in)"
+            f"with active torrential rain on saturated soil (API {cur_api_mm / MM_PER_INCH:.2f} in)"
         )
-    if eff_api_6h_mm >= RED_API_EXTREME_MM and max_1hr_6h_mm >= ORANGE_QPF_RATE_MM_HR:
+    if eff_api_6h_mm >= RED_API_EXTREME_MM and imminent_6h_torrential:
         red_reasons.append(
             f"Extreme catchment saturation (API {eff_api_6h_mm / MM_PER_INCH:.2f} in) "
-            f"with heavy rain ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr)"
+            f"with intense rain ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr)"
         )
     if runoff_6h_mm >= RED_RUNOFF_MM_HR:
         red_reasons.append(
@@ -386,28 +392,34 @@ def evaluate_flood_and_road_tier(
         red_reasons.append(f"Rapid creek surge +{float(rate_of_rise_m_hr):.2f} m/hr")
 
     # --- Check ORANGE (Tier 2: Flash Flood Watch / Road Risk) ---
-    if max_1hr_6h_mm >= ORANGE_QPF_RATE_MM_HR and (cur_soil_primed or imminent_6h_primed):
+    if imminent_6h_heavy and (cur_soil_primed or imminent_6h_primed):
         orange_reasons.append(
             f"Heavy rain band ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr >= 0.50 in/hr) "
             f"with catchment API {eff_api_6h_mm / MM_PER_INCH:.2f} in"
         )
-    elif max_1hr_6h_mm >= 16.5:
+    elif imminent_6h_torrential:
         orange_reasons.append(
             f"Intense hourly downpour rate {max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr within 6 hours"
         )
-    if max_p90_6h_mm >= ORANGE_P90_RATE_MM_HR and (cur_soil_primed or imminent_6h_primed):
+    elif eff_api_6h_mm >= YELLOW_API_MM and max_1hr_6h_mm >= 7.62:
+        orange_reasons.append(
+            f"Sustained heavy rain ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr >= 0.30 in/hr) "
+            f"on saturated catchment (API {eff_api_6h_mm / MM_PER_INCH:.2f} in)"
+        )
+    if max_p90_6h_mm >= ORANGE_P90_RATE_MM_HR and (cur_soil_primed or imminent_6h_primed) and max_1hr_6h_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(
             f"MOS P90 downpour rate {max_p90_6h_mm / MM_PER_INCH:.2f} in/hr "
             f"(>= 0.75 in/hr) on wetting catchment"
         )
-    if obs_active_24h_mm >= ORANGE_RAIN_24H_MM or (
-        fc_24h_mm >= ORANGE_RAIN_24H_MM and (cur_soil_primed or imminent_6h_wet)
-    ):
+    if (
+        obs_active_24h_mm >= ORANGE_RAIN_24H_MM
+        or (fc_24h_mm >= ORANGE_RAIN_24H_MM and (cur_soil_primed or imminent_6h_wet))
+    ) and max_1hr_6h_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(
             f"24-hour storm accumulation {rolling_24h_mm / MM_PER_INCH:.2f} in (>= 2.00 in) "
             f"with active/imminent canyon rain"
         )
-    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and cur_soil_primed and imminent_6h_wet:
+    elif total_72h_window_mm >= RED_RAIN_72H_CRITICAL_MM and cur_soil_primed and max_1hr_6h_mm >= YELLOW_QPF_RATE_MM_HR:
         orange_reasons.append(
             f"Multi-day storm total {total_72h_window_mm / MM_PER_INCH:.2f} in "
             f"on primed soil (API {cur_api_mm / MM_PER_INCH:.2f} in) elevates road slipout risk"
@@ -433,6 +445,10 @@ def evaluate_flood_and_road_tier(
     elif eff_api_24h_mm >= YELLOW_API_MM:
         yellow_reasons.append(
             f"24-hour projected catchment wetness API reaching {eff_api_24h_mm / MM_PER_INCH:.2f} in (>= 1.00 in)"
+        )
+    if max_1hr_6h_mm >= 3.81:
+        yellow_reasons.append(
+            f"Active/imminent moderate canyon rain ({max_1hr_6h_mm / MM_PER_INCH:.2f} in/hr >= 0.15 in/hr)"
         )
     if rolling_24h_mm >= YELLOW_RAIN_24H_MM:
         yellow_reasons.append(

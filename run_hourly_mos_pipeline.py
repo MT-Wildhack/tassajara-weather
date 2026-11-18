@@ -214,7 +214,7 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
                     (today_mid_iso, obs_hour_iso),
                 ).fetchall()
 
-                if live_rate_mm > 0.0 or clicks <= 2 or not prior_wet_rows:
+                if clicks <= 2 or not prior_wet_rows:
                     conn.execute(
                         """
                         UPDATE local_observations
@@ -228,25 +228,39 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
                         f"(rain_day_in={console_day_mm/25.4:.2f} in) into current hour {obs_hour_iso}."
                     )
                 else:
-                    # Catch-up backlog while current hour is dry (rain_rate_mm == 0):
-                    # distribute integer 0.254 mm clicks across today's prior saturated hours.
-                    n_targets = min(len(prior_wet_rows), clicks)
-                    base_c = clicks // n_targets
-                    rem_c = clicks % n_targets
-                    for idx_r, (r_ts, _) in enumerate(prior_wet_rows[:n_targets]):
-                        c_hr = base_c + (1 if idx_r < rem_c else 0)
-                        if c_hr > 0:
-                            conn.execute(
-                                """
-                                UPDATE local_observations
-                                SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
-                                WHERE valid_time_utc = ?
-                                """,
-                                (round(c_hr * 0.254, 3), r_ts),
-                            )
+                    cur_clicks = (
+                        min(clicks, max(2, int(round(min(live_rate_mm, 4.0) / 0.254))))
+                        if live_rate_mm > 0.0
+                        else 0
+                    )
+                    if cur_clicks > 0:
+                        conn.execute(
+                            """
+                            UPDATE local_observations
+                            SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                            WHERE valid_time_utc = ?
+                            """,
+                            (round(cur_clicks * 0.254, 3), obs_hour_iso),
+                        )
+                    rem_clicks = clicks - cur_clicks
+                    if rem_clicks > 0:
+                        n_targets = min(len(prior_wet_rows), rem_clicks)
+                        base_c = rem_clicks // n_targets
+                        rem_c = rem_clicks % n_targets
+                        for idx_r, (r_ts, _) in enumerate(prior_wet_rows[:n_targets]):
+                            c_hr = base_c + (1 if idx_r < rem_c else 0)
+                            if c_hr > 0:
+                                conn.execute(
+                                    """
+                                    UPDATE local_observations
+                                    SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
+                                    WHERE valid_time_utc = ?
+                                    """,
+                                    (round(c_hr * 0.254, 3), r_ts),
+                                )
                     logger.info(
-                        f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of catch-up console rain "
-                        f"across {n_targets} prior wet hour(s) today."
+                        f"Reconciled {quantized_mm:.3f} mm ({quantized_mm/25.4:.2f} in) of console rain "
+                        f"({cur_clicks} click(s) current hour, {rem_clicks} click(s) across prior wet hours)."
                     )
 
         pre_midnight_storm_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)

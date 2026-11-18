@@ -1471,29 +1471,79 @@ def load_all_dashboard_data():
             db_today_mm = float(get_col(obs_df.loc[today_mask], "precip_1hr_mm", 0.0).sum()) if today_mask.any() else 0.0
             shortfall_today_mm = round(console_day_mm - db_today_mm, 3)
 
+            # Ensure all hourly slots today between today_mid_iso and now_hour_iso exist in obs_df
+            if today_mask.any():
+                min_today_dt = max(pd.Timestamp(today_mid_iso), obs_dt_s.min())
+                expected_today_hrs = pd.date_range(
+                    start=min_today_dt, end=pd.Timestamp(now_hour_iso), freq="1h", tz="UTC"
+                )
+                existing_today_set = set(obs_dt_s.dropna().dt.floor("h"))
+                missing_today_hrs = [h for h in expected_today_hrs if h not in existing_today_set]
+                if missing_today_hrs:
+                    fill_rows = []
+                    for mh in missing_today_hrs:
+                        fill_rows.append({
+                            "valid_time_utc": mh.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            "exact_obs_time_utc": mh.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            "station_id": str(live_row_dict["station_id"]),
+                            "temp_c": live_row_dict["temp_c"],
+                            "dewpoint_c": live_row_dict["dewpoint_c"],
+                            "wetbulb_c": live_row_dict["wetbulb_c"],
+                            "rh_pct": max(88.0, live_row_dict["rh_pct"]),
+                            "wind_speed_ms": live_row_dict["wind_speed_ms"],
+                            "wind_gust_ms": live_row_dict["wind_gust_ms"],
+                            "wind_dir_deg": live_row_dict["wind_dir_deg"],
+                            "mslp_hpa": live_row_dict["mslp_hpa"],
+                            "pressure_trend_3hr_hpa": live_row_dict["pressure_trend_3hr_hpa"],
+                            "precip_1hr_mm": 0.0,
+                            "solar_rad_wm2": None,
+                            "uv_index": None,
+                            "qc_flag": "OK",
+                        })
+                    obs_df = pd.concat([obs_df, pd.DataFrame(fill_rows)], ignore_index=True)
+                    obs_df["_sort_dt"] = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+                    obs_df = obs_df.sort_values("_sort_dt", ascending=False).drop(columns=["_sort_dt"]).reset_index(drop=True)
+                    obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
+                    today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
+
             if shortfall_today_mm >= 0.20 and today_mask.any():
                 clicks = max(1, int(round(shortfall_today_mm / 0.254)))
                 live_rate_mm = safe_float(live_obs.get("precip_rate_mm_hr"), 0.0)
                 today_indices = obs_df.index[today_mask].tolist()
                 prior_wet = [
                     i for i in today_indices[1:]
-                    if safe_float(obs_df.loc[i].get("rh_pct"), 50.0) >= 88.0
-                ][:8]
-                if live_rate_mm > 0.0 or clicks <= 2 or not prior_wet:
+                    if safe_float(obs_df.loc[i].get("rh_pct"), 50.0) >= 82.0
+                ][:8] or today_indices[1:7]
+
+                if clicks <= 2 or not prior_wet:
                     top_idx = today_indices[0]
                     obs_df.loc[top_idx, "precip_1hr_mm"] = round(
                         safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + round(clicks * 0.254, 3), 3
                     )
                 else:
-                    n_t = min(len(prior_wet), clicks)
-                    b_c = clicks // n_t
-                    r_c = clicks % n_t
-                    for idx_i, row_idx in enumerate(prior_wet[:n_t]):
-                        c_i = b_c + (1 if idx_i < r_c else 0)
-                        if c_i > 0:
-                            obs_df.loc[row_idx, "precip_1hr_mm"] = round(
-                                safe_float(obs_df.loc[row_idx, "precip_1hr_mm"], 0.0) + round(c_i * 0.254, 3), 3
-                            )
+                    # Cap current hour attribution to actual rain_rate_mm (or ~2.0 mm/hr) and
+                    # distribute the earlier morning accumulation across prior wet hours today.
+                    cur_clicks = (
+                        min(clicks, max(2, int(round(min(live_rate_mm, 4.0) / 0.254))))
+                        if live_rate_mm > 0.0
+                        else 0
+                    )
+                    if cur_clicks > 0:
+                        top_idx = today_indices[0]
+                        obs_df.loc[top_idx, "precip_1hr_mm"] = round(
+                            safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + round(cur_clicks * 0.254, 3), 3
+                        )
+                    rem_clicks = clicks - cur_clicks
+                    if rem_clicks > 0:
+                        n_t = min(len(prior_wet), rem_clicks)
+                        b_c = rem_clicks // n_t
+                        r_c = rem_clicks % n_t
+                        for idx_i, row_idx in enumerate(prior_wet[:n_t]):
+                            c_i = b_c + (1 if idx_i < r_c else 0)
+                            if c_i > 0:
+                                obs_df.loc[row_idx, "precip_1hr_mm"] = round(
+                                    safe_float(obs_df.loc[row_idx, "precip_1hr_mm"], 0.0) + round(c_i * 0.254, 3), 3
+                                )
 
             pre_midnight_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
             if 0.20 <= pre_midnight_mm <= 60.0 and str(storm_start_iso) >= str(yesterday_mid_iso):
@@ -2344,12 +2394,12 @@ def render_hydro_risk_section(
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=2, col=1)
         fig_hydro.update_layout(
-            height=490,
-            margin=dict(t=95, b=30, l=50, r=55),
+            height=530,
+            margin=dict(t=128, b=30, l=50, r=55),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.12, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.16, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_hydro, use_container_width=True)
 
@@ -2502,10 +2552,26 @@ def render_layman_forecast_view(
 
     if solar_el <= 0.0:
         sun_badge = "🌙 Nighttime in the Canyon — Cool air gently drains down Tassajara Creek"
+    elif (
+        max(rain_1hr_now_in, cur_fc_qpf_in) >= 0.01
+        or cur_pop >= 55.0
+        or any(w in cur_cond for w in ("Rain", "Showers", "Snow", "Wintry"))
+    ):
+        sun_badge = (
+            "🌧️ Active Storm Overcast — Dense rain clouds blocking direct sunlight in the canyon"
+        )
+    elif cur_sky >= 75.0 or rh_pct >= 88.0 or "Cloudy" in cur_cond:
+        sun_badge = (
+            "☁️ Overcast Canyon Sky — Diffused daylight under thick cloud cover"
+        )
     elif in_shade:
         sun_badge = (
             "🏔️ Canyon Wall Shade — The sun is above the horizon "
             "but hidden behind Pine Ridge / Black Cone"
+        )
+    elif cur_sky >= 40.0:
+        sun_badge = (
+            "⛅ Filtered Canyon Sunlight — Partial cloud cover over the valley floor"
         )
     else:
         sun_badge = "☀️ Direct Sunlight on Canyon Floor — Warmest part of the day at Stone Office"
@@ -2642,11 +2708,32 @@ def render_layman_forecast_view(
                 )
 
         with adv3:
+            max_gust_48_mph = float(
+                (
+                    get_col(
+                        next_48,
+                        "corrected_wind_gust_ms",
+                        get_col(next_48, "nws_wind_speed_ms", 1.0) * 1.35,
+                    )
+                    * 2.23694
+                ).max()
+            )
             if max_high_48_f >= 92.0:
                 st.warning(
                     f"☀️ **Warm Canyon Afternoons:** Daytime highs reaching "
                     f"**{max_high_48_f:.0f}°F**. Plan steep hikes (Black Cone / Pine Ridge) "
                     f"for the cool morning hours and carry extra water."
+                )
+            elif rain_72_in >= 0.50 or max_gust_48_mph >= 24.0:
+                st.warning(
+                    f"🌬️ **Wet & Gusty Trail Conditions:** Daytime highs near "
+                    f"**{max_high_48_f:.0f}°F** with ridge gusts up to **{max_gust_48_mph:.0f} mph** "
+                    f"and slick, muddy trails. Avoid exposed ridge hikes during storm bands."
+                )
+            elif rain_72_in >= 0.10 or max_pop_72 >= 40.0:
+                st.info(
+                    f"🌂 **Cool & Overcast Canyon Weather:** Daytime highs near "
+                    f"**{max_high_48_f:.0f}°F** under cloudy skies with damp trails along Tassajara Creek."
                 )
             else:
                 st.info(
