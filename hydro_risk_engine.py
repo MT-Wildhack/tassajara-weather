@@ -177,7 +177,7 @@ def get_severity_matrix_rows() -> List[Dict[str, str]]:
                 f"Within 24h (coincident hour): 1h Rate >= {ORANGE_QPF_RATE_MM_HR/MM_PER_INCH:.2f} in/hr on primed soil "
                 f"(API >= {ORANGE_PRIMED_FLOOR_MM/MM_PER_INCH:.2f} in), OR >= {ORANGE_SUSTAINED_RATE_MM_HR/MM_PER_INCH:.2f} in/hr "
                 f"on saturated soil (API >= {ORANGE_API_MM/MM_PER_INCH:.2f} in), OR 24h >= {ORANGE_RAIN_24H_MM/MM_PER_INCH:.2f} in "
-                f"with active rain, OR Runoff >= {ORANGE_RUNOFF_MM_HR/MM_PER_INCH:.2f} in/hr"
+                f"with active rain, OR Runoff >= {ORANGE_RUNOFF_MM_HR/MM_PER_INCH:.2f} in/hr, OR Routed Creek Q >= 250 CFS"
             ),
             "Tassajara Creek Response": TIER_METADATA["ORANGE"]["creek_status"],
             "Tassajara Road Passability": TIER_METADATA["ORANGE"]["road_status"],
@@ -190,7 +190,7 @@ def get_severity_matrix_rows() -> List[Dict[str, str]]:
                 f"OR P90 >= {RED_P90_RATE_MM_HR/MM_PER_INCH:.2f} in/hr on saturated soil (API >= {ORANGE_API_MM/MM_PER_INCH:.2f} in), "
                 f"OR Rate >= {RED_TORRENTIAL_RATE_MM_HR/MM_PER_INCH:.2f} in/hr with API >= {RED_API_EXTREME_MM/MM_PER_INCH:.2f} in "
                 f"(or 24h >= {RED_RAIN_24H_MM/MM_PER_INCH:.2f} in / 72h >= {RED_RAIN_72H_MM/MM_PER_INCH:.2f} in on saturated soil), "
-                f"OR Runoff >= {RED_RUNOFF_MM_HR/MM_PER_INCH:.2f} in/hr"
+                f"OR Runoff >= {RED_RUNOFF_MM_HR/MM_PER_INCH:.2f} in/hr, OR Routed Creek Q >= 500 CFS"
             ),
             "Tassajara Creek Response": TIER_METADATA["RED"]["creek_status"],
             "Tassajara Road Passability": TIER_METADATA["RED"]["road_status"],

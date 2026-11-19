@@ -1893,7 +1893,7 @@ def get_weather_icon_and_label(
             return "🌨️", "Wintry Mix / Snow"
         return "🌧️", "Rain Likely"
     if qpf_in >= 0.01 or pop_pct >= 45:
-        return "🌦️", "Chance of Showers"
+        return ("🌦️" if is_daytime else "🌧️"), "Chance of Showers"
     if pop_pct >= 20:
         return "☁️", "Mostly Cloudy"
     if not is_daytime:
@@ -2729,7 +2729,13 @@ def render_layman_forecast_view(
             time_lbl = t_loc.strftime("%-I %p") if hasattr(t_loc, "strftime") else str(t_loc.hour)
             day_tag = t_loc.strftime("%a")
             pop_int = int(r["pop_val"])
-            pop_badge = f"💧 {pop_int}%" if pop_int >= 15 else "Dry"
+            qpf_hr_in = float(r["qpf_in"])
+            if pop_int >= 15:
+                pop_badge = f"💧 {pop_int}%"
+            elif qpf_hr_in >= 0.01:
+                pop_badge = f"💧 {qpf_hr_in:.2f}\""
+            else:
+                pop_badge = "Dry"
 
             with cols_24[idx_col]:
                 st.markdown(
