@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-backfill_and_train.py (v5.2 — 5-Station Santa Lucia Reference Array & Multi-Year MOS Backfill)
+backfill_and_train.py (v5.3 — Provenance-Tagged, Leak-Free 5-Station Santa Lucia MOS Backfill)
 Backfills up to 730 days of historical observations from the Stone Office Davis
 Vantage Pro2 using the WeatherLink v2 Historic API (Pro Tier, 24-hour chunking),
-merges observations non-destructively into SQLite (never overwriting non-zero rain
-or wind gusts with zeros), pairs with Open-Meteo 5-station reference series,
-trains TassajaraMOSCorrector, and populates mos_corrected_forecasts.
+merges observations with source provenance into SQLite (allowing authentic WL_HISTORIC
+records to supersede smeared live estimates while protecting real RAWS archives),
+builds a deduplicated leak-free vw_mos_training_dataset view, trains TassajaraMOSCorrector,
+and populates mos_corrected_forecasts.
 """
 
 import time
@@ -71,8 +72,8 @@ def clean_num(val: Any, default: Optional[float] = None) -> Optional[float]:
 
 def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
     """
-    Ensures all tables, hydrological columns, and the leak-free
-    5-station vw_mos_training_dataset view exist in SQLite.
+    Ensures all tables, provenance columns, hydrological columns, and the
+    deduplicated, leak-free 5-station vw_mos_training_dataset view exist in SQLite.
     """
     Path("models").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
@@ -92,13 +93,14 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 rh_pct REAL,
                 wind_speed_ms REAL DEFAULT 0.0,
                 wind_gust_ms REAL DEFAULT 0.0,
-                wind_dir_deg REAL DEFAULT 0.0,
+                wind_dir_deg REAL,
                 mslp_hpa REAL,
                 pressure_trend_3hr_hpa REAL DEFAULT 0.0,
                 precip_1hr_mm REAL DEFAULT 0.0,
                 solar_rad_wm2 REAL,
                 uv_index REAL,
-                qc_flag TEXT DEFAULT 'OK'
+                qc_flag TEXT DEFAULT 'OK',
+                source TEXT DEFAULT 'WL_LIVE'
             );
 
             CREATE TABLE IF NOT EXISTS reference_observations (
@@ -108,8 +110,9 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 rh_pct REAL,
                 wind_speed_ms REAL DEFAULT 0.0,
                 wind_gust_ms REAL DEFAULT 0.0,
-                wind_dir_deg REAL DEFAULT 0.0,
+                wind_dir_deg REAL,
                 precip_1hr_mm REAL DEFAULT 0.0,
+                source TEXT DEFAULT 'RAWS_SYNOPTIC',
                 PRIMARY KEY (valid_time_utc, station_id)
             );
 
@@ -180,10 +183,33 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                     f"ALTER TABLE nws_forecasts ADD COLUMN {col_name} REAL DEFAULT {dflt};"
                 )
 
+        # Idempotent provenance column migrations for existing databases
+        for tbl, default_src in (
+            ("local_observations", "'WL_LIVE'"),
+            ("reference_observations", "'RAWS_SYNOPTIC'"),
+        ):
+            t_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
+            if "source" not in t_cols:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN source TEXT DEFAULT {default_src};")
+
         conn.executescript(
             """
             DROP VIEW IF EXISTS vw_mos_training_dataset;
             CREATE VIEW vw_mos_training_dataset AS
+            WITH canonical_fc AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY valid_time_utc
+                        ORDER BY
+                            CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                            ABS(lead_time_hours - 6) ASC,
+                            issue_time_utc DESC
+                    ) AS rn
+                FROM nws_forecasts
+                WHERE nws_temp_c IS NOT NULL
+                  AND lead_time_hours >= 1
+            )
             SELECT
                 f.issue_time_utc,
                 f.valid_time_utc,
@@ -203,7 +229,8 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 o.wind_gust_ms AS actual_wind_gust_ms,
                 o.wind_dir_deg AS actual_wind_dir_deg,
                 o.mslp_hpa AS actual_mslp_hpa,
-                COALESCE(o.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
+                -- LEAK-FREE: barometric tendency at forecast ISSUE time, never target valid_time_utc
+                COALESCE(o_issue.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
                 COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
                 (o.temp_c - f.nws_temp_c) AS temp_error_c,
                 (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
@@ -223,20 +250,22 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 -- VTCC1: Ventana Cone (1,453m Windward Crest)
                 COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
                 COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
-                -- Local Stone Office Initialization State
+                -- Local Stone Office Initialization State (strictly causal forecast at issue_time_utc)
                 COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
-                COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c
-            FROM nws_forecasts f
+                COALESCE(
+                    o_issue.temp_c - (
+                        SELECT fi.nws_temp_c FROM nws_forecasts fi
+                        WHERE fi.valid_time_utc = f.issue_time_utc
+                          AND fi.issue_time_utc <= f.issue_time_utc
+                        ORDER BY fi.issue_time_utc DESC LIMIT 1
+                    ),
+                    0.0
+                ) AS issue_persistence_bias_c
+            FROM canonical_fc f
             INNER JOIN local_observations o
                 ON f.valid_time_utc = o.valid_time_utc
             LEFT JOIN local_observations o_issue
                 ON f.issue_time_utc = o_issue.valid_time_utc
-            LEFT JOIN (
-                SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
-                FROM nws_forecasts
-                GROUP BY valid_time_utc
-            ) f_issue
-                ON f.issue_time_utc = f_issue.valid_time_utc
             LEFT JOIN reference_observations r_chews
                 ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
             LEFT JOIN reference_observations r_hast
@@ -247,10 +276,10 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
             LEFT JOIN reference_observations r_vent
                 ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
-            WHERE o.qc_flag = 'OK'
-              AND o.temp_c IS NOT NULL
-              AND f.nws_temp_c IS NOT NULL
-              AND f.lead_time_hours >= 1;
+            WHERE f.rn = 1
+              AND o.qc_flag = 'OK'
+              AND COALESCE(o.source, 'WL_LIVE') != 'OPENMETEO_SYNTH'
+              AND o.temp_c IS NOT NULL;
             """
         )
         conn.commit()
@@ -263,8 +292,9 @@ def fetch_weatherlink_history(
 ) -> pd.DataFrame:
     """
     Pulls historical archive records from WeatherLink v2 API (/v2/historic/{station_id}).
-    Strictly filters out indoor/health sensors and aggregates sub-hourly rain and wind
-    across all outdoor ISS sensors without letting calm or non-wind packets overwrite gusts.
+    Strictly filters out indoor/health sensors, deduplicates rain tips at station-timestamp
+    scope, averages all wind speeds (including calm 0.0 m/s packets) and hourly temperatures,
+    and preserves True North (0.0 deg) wind directions.
     """
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=float(days_back))
@@ -301,10 +331,11 @@ def fetch_weatherlink_history(
             resp.raise_for_status()
             payload = resp.json()
 
+            # Station-level rain timestamp dedup prevents double-counting across multi-sensor packets
+            seen_rain_ts = set()
+
             for sensor in payload.get("sensors", []):
                 dst = int(sensor.get("data_structure_type") or 0)
-                lsid = sensor.get("lsid")
-                seen_sensor_ts = set()
 
                 for rec in sensor.get("data", []):
                     ts = rec.get("ts")
@@ -318,6 +349,7 @@ def fetch_weatherlink_history(
                     if hr_iso not in hourly_buckets:
                         hourly_buckets[hr_iso] = {
                             "valid_time_utc": hr_iso,
+                            "_temps_c": [],
                             "temp_c": None,
                             "dewpoint_c": None,
                             "wetbulb_c": None,
@@ -325,7 +357,7 @@ def fetch_weatherlink_history(
                             "_wind_speeds_ms": [],
                             "wind_speed_ms": 0.0,
                             "wind_gust_ms": 0.0,
-                            "wind_dir_deg": 0.0,
+                            "wind_dir_deg": None,
                             "mslp_hpa": None,
                             "precip_1hr_mm": 0.0,
                             "solar_rad_wm2": None,
@@ -351,16 +383,15 @@ def fetch_weatherlink_history(
                         continue
 
                     # 2. Accumulate tipping-bucket rain across sub-hourly archive intervals
-                    ts_key = (lsid, ts)
-                    if ts_key not in seen_sensor_ts:
+                    if ts not in seen_rain_ts:
                         rain_mm_val = extract_archive_rain_mm(rec)
                         if rain_mm_val > 0.0:
                             b["precip_1hr_mm"] = round(
                                 (b["precip_1hr_mm"] or 0.0) + rain_mm_val, 3
                             )
-                        seen_sensor_ts.add(ts_key)
+                            seen_rain_ts.add(ts)
 
-                    # 3. Outdoor temperature & humidity
+                    # 3. Outdoor temperature (hourly mean) & humidity
                     t_f = first_not_none(
                         rec.get("temp_out"),
                         rec.get("temp_out_last"),
@@ -370,7 +401,10 @@ def fetch_weatherlink_history(
                         rec.get("temp"),
                     )
                     if t_f is not None:
-                        b["temp_c"] = f_to_c(t_f)
+                        t_c_val = f_to_c(t_f)
+                        if t_c_val is not None:
+                            b["_temps_c"].append(t_c_val)
+                            b["temp_c"] = round(float(np.mean(b["_temps_c"])), 2)
                         dew_f = first_not_none(
                             rec.get("dew_point_out"),
                             rec.get("dew_point_last"),
@@ -397,14 +431,14 @@ def fetch_weatherlink_history(
                         if hum is not None:
                             b["rh_pct"] = float(hum)
 
-                    # 4. Wind speed, gust, and direction (never overwrite non-zero with 0)
+                    # 4. Wind speed (including calm 0.0 m/s packets), gust, and True North 0.0 deg
                     spd_ms, gst_ms, dir_deg = extract_record_wind(rec)
-                    if spd_ms is not None and spd_ms > 0.0:
+                    if spd_ms is not None and spd_ms >= 0.0:
                         b["_wind_speeds_ms"].append(spd_ms)
                         b["wind_speed_ms"] = round(float(np.mean(b["_wind_speeds_ms"])), 2)
-                    if gst_ms is not None and gst_ms > 0.0:
+                    if gst_ms is not None and gst_ms >= 0.0:
                         b["wind_gust_ms"] = max(b["wind_gust_ms"] or 0.0, gst_ms, b["wind_speed_ms"])
-                    if dir_deg is not None and dir_deg > 0.0:
+                    if dir_deg is not None and 0.0 <= dir_deg <= 360.0:
                         b["wind_dir_deg"] = dir_deg
 
                     sol = first_not_none(rec.get("solar_rad_avg"), rec.get("solar_rad"))
@@ -434,6 +468,7 @@ def fetch_weatherlink_history(
 
     for b in hourly_buckets.values():
         b.pop("_wind_speeds_ms", None)
+        b.pop("_temps_c", None)
 
     df = pd.DataFrame(list(hourly_buckets.values()))
     if df.empty:
@@ -587,11 +622,15 @@ def fetch_historical_nwp_and_references(days_back: int = 730) -> Dict[str, pd.Da
     return out_dict
 
 
-def store_observations_to_sqlite(obs_df: pd.DataFrame, db_path: str = DB_PATH) -> int:
+def store_observations_to_sqlite(
+    obs_df: pd.DataFrame,
+    db_path: str = DB_PATH,
+    source: str = "WL_HISTORIC",
+) -> int:
     """
-    Upserts WeatherLink local observations to SQLite non-destructively:
-    if a row already exists in local_observations with non-zero rain or wind gusts,
-    MAX() preserves the higher value rather than overwriting with 0.0.
+    Upserts WeatherLink local observations to SQLite with provenance tracking:
+    authentic WL_HISTORIC archive records can overwrite previously smeared live rain,
+    while preserving non-null wind directions (including True North 0.0 deg).
     """
     if obs_df is None or obs_df.empty:
         return 0
@@ -605,13 +644,14 @@ def store_observations_to_sqlite(obs_df: pd.DataFrame, db_path: str = DB_PATH) -
             clean_num(r["rh_pct"]),
             clean_num(r["wind_speed_ms"], 0.0),
             clean_num(r["wind_gust_ms"], 0.0),
-            clean_num(r["wind_dir_deg"], 0.0),
+            clean_num(r["wind_dir_deg"], None),
             clean_num(r["mslp_hpa"], 1013.25),
             clean_num(r["pressure_trend_3hr_hpa"], 0.0),
             clean_num(r["precip_1hr_mm"], 0.0),
             clean_num(r["solar_rad_wm2"]),
             clean_num(r["uv_index"]),
             "OK",
+            str(source),
         )
         for _, r in obs_df.iterrows()
         if pd.notna(r["temp_c"])
@@ -623,27 +663,37 @@ def store_observations_to_sqlite(obs_df: pd.DataFrame, db_path: str = DB_PATH) -
                 valid_time_utc, station_id, temp_c, dewpoint_c, wetbulb_c,
                 rh_pct, wind_speed_ms, wind_gust_ms, wind_dir_deg,
                 mslp_hpa, pressure_trend_3hr_hpa, precip_1hr_mm,
-                solar_rad_wm2, uv_index, qc_flag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                solar_rad_wm2, uv_index, qc_flag, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(valid_time_utc) DO UPDATE SET
                 temp_c = COALESCE(excluded.temp_c, local_observations.temp_c),
                 dewpoint_c = COALESCE(excluded.dewpoint_c, local_observations.dewpoint_c),
                 wetbulb_c = COALESCE(excluded.wetbulb_c, local_observations.wetbulb_c),
                 rh_pct = COALESCE(excluded.rh_pct, local_observations.rh_pct),
-                wind_speed_ms = MAX(COALESCE(local_observations.wind_speed_ms, 0.0), COALESCE(excluded.wind_speed_ms, 0.0)),
+                wind_speed_ms = CASE
+                    WHEN excluded.source = 'WL_HISTORIC' THEN COALESCE(excluded.wind_speed_ms, local_observations.wind_speed_ms)
+                    ELSE MAX(COALESCE(local_observations.wind_speed_ms, 0.0), COALESCE(excluded.wind_speed_ms, 0.0))
+                END,
                 wind_gust_ms = MAX(COALESCE(local_observations.wind_gust_ms, 0.0), COALESCE(excluded.wind_gust_ms, 0.0)),
-                wind_dir_deg = CASE WHEN COALESCE(excluded.wind_dir_deg, 0.0) > 0.0 THEN excluded.wind_dir_deg ELSE local_observations.wind_dir_deg END,
+                wind_dir_deg = COALESCE(excluded.wind_dir_deg, local_observations.wind_dir_deg),
                 mslp_hpa = COALESCE(excluded.mslp_hpa, local_observations.mslp_hpa),
                 pressure_trend_3hr_hpa = COALESCE(excluded.pressure_trend_3hr_hpa, local_observations.pressure_trend_3hr_hpa),
-                precip_1hr_mm = MAX(COALESCE(local_observations.precip_1hr_mm, 0.0), COALESCE(excluded.precip_1hr_mm, 0.0)),
+                precip_1hr_mm = CASE
+                    WHEN excluded.source = 'WL_HISTORIC' THEN COALESCE(excluded.precip_1hr_mm, local_observations.precip_1hr_mm)
+                    ELSE MAX(COALESCE(local_observations.precip_1hr_mm, 0.0), COALESCE(excluded.precip_1hr_mm, 0.0))
+                END,
                 solar_rad_wm2 = COALESCE(excluded.solar_rad_wm2, local_observations.solar_rad_wm2),
-                uv_index = COALESCE(excluded.uv_index, local_observations.uv_index)
+                uv_index = COALESCE(excluded.uv_index, local_observations.uv_index),
+                source = CASE
+                    WHEN local_observations.source = 'WL_HISTORIC' AND excluded.source != 'WL_HISTORIC' THEN local_observations.source
+                    ELSE excluded.source
+                END
             """,
             obs_rows,
         )
         conn.commit()
     logger.info(
-        f"Upserted {len(obs_rows)} Stone Office hourly observation rows to SQLite."
+        f"Upserted {len(obs_rows)} Stone Office hourly observation rows ({source}) to SQLite."
     )
     return len(obs_rows)
 
@@ -653,7 +703,10 @@ def store_backfill_to_sqlite(
     nwp_dict: Dict[str, pd.DataFrame],
     db_path: str = DB_PATH,
 ) -> None:
-    """Writes historical observations, all 5 reference stations, and NWP forecasts to SQLite."""
+    """
+    Writes historical observations, 5-station reference series (INSERT OR IGNORE so real
+    RAWS/NWS archives are never overwritten), and single-lead (6h) archived NWP forecasts.
+    """
     now_iso = (
         datetime.now(timezone.utc)
         .replace(minute=0, second=0, microsecond=0)
@@ -661,7 +714,7 @@ def store_backfill_to_sqlite(
     )
 
     if obs_df is not None and not obs_df.empty:
-        store_observations_to_sqlite(obs_df, db_path)
+        store_observations_to_sqlite(obs_df, db_path, source="WL_HISTORIC")
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -693,18 +746,20 @@ def store_backfill_to_sqlite(
                     clean_num(r["relative_humidity_2m"]),
                     clean_num(r["wind_speed_10m"], 0.0),
                     clean_num(r["wind_gusts_10m"], 0.0),
-                    clean_num(r["wind_direction_10m"], 0.0),
+                    clean_num(r["wind_direction_10m"], None),
                     clean_num(r.get("precipitation"), 0.0),
+                    "OPENMETEO_SYNTH",
                 )
                 for _, r in rdf.iterrows()
                 if pd.notna(r["temperature_2m"])
             ]
+            # INSERT OR IGNORE preserves genuine Synoptic/NWS station observations
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO reference_observations (
+                INSERT OR IGNORE INTO reference_observations (
                     valid_time_utc, station_id, temp_c, rh_pct,
-                    wind_speed_ms, wind_gust_ms, wind_dir_deg, precip_1hr_mm
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    wind_speed_ms, wind_gust_ms, wind_dir_deg, precip_1hr_mm, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 ref_rows,
             )
@@ -716,7 +771,8 @@ def store_backfill_to_sqlite(
                 if pd.isna(r["temperature_2m"]):
                     continue
                 valid_dt = pd.to_datetime(r["valid_time_utc"], utc=True)
-                for lead_hr in (6, 12):
+                # Single canonical 6-hour lead per archived timestamp (prevents 2x pseudoreplication)
+                for lead_hr in (6,):
                     issue_iso = (valid_dt - timedelta(hours=lead_hr)).isoformat()
                     fc_rows.append(
                         (
@@ -792,14 +848,20 @@ def populate_mos_verification_and_active_forecasts(
         (
             str(r["issue_time_utc"]),
             str(r["valid_time_utc"]),
-            "MOS_GBM_v2_HYDRO",
+            "MOS_GBM_v3_HYDRO",
             float(r["nws_temp_c"]),
             float(r["pred_temp_error_c"]),
             float(r["corrected_temp_c"]),
             float(r["corrected_temp_p10_c"]),
             float(r["corrected_temp_p90_c"]),
             clean_num(train_df.loc[idx, "nws_rh_pct"], 50.0),
-            round(max(clean_num(train_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0, (clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35), 2),
+            round(
+                max(
+                    clean_num(train_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0,
+                    (clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35,
+                ),
+                2,
+            ),
             clean_num(r.get("raw_nws_pop_pct"), 0.0),
             clean_num(r.get("mos_pop_pct"), 0.0),
             clean_num(r.get("raw_nws_qpf_mm"), 0.0),
@@ -929,7 +991,7 @@ def populate_mos_verification_and_active_forecasts(
                 (
                     str(r["issue_time_utc"]),
                     str(r["valid_time_utc"]),
-                    "MOS_GBM_v2_HYDRO",
+                    "MOS_GBM_v3_HYDRO",
                     float(r["nws_temp_c"]),
                     float(r["pred_temp_error_c"]),
                     float(r["corrected_temp_c"]),
@@ -1005,7 +1067,7 @@ def main():
                     wl_client, station_id, days_back=float(args.days)
                 )
                 if not obs_df.empty:
-                    store_observations_to_sqlite(obs_df, DB_PATH)
+                    store_observations_to_sqlite(obs_df, DB_PATH, source="WL_HISTORIC")
                 else:
                     logger.warning(
                         "WeatherLink Historic API returned 0 rows; proceeding with existing SQLite observations."

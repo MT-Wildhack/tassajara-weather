@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-ingest_nws.py (v3.1 — Resilient NOAA NWS /gridpoints/MTR/... + Open-Meteo NWP Ingest)
+ingest_nws.py (v3.2 — Resilient NOAA NWS /gridpoints/MTR/... + Open-Meteo NWP Ingest)
 Queries the NOAA NWS API (api.weather.gov) for the Tassajara grid cell (36.2337, -121.5501):
   1. Resolves /points/36.2337,-121.5501 -> /gridpoints/MTR/{x},{y} (forecastGridData).
-  2. Parses all raw NDFD gridpoint series: quantitativePrecipitation (disaggregated to mm/hr),
+  2. Parses all raw NDFD gridpoint series: quantitativePrecipitation (disaggregated to mm/hr
+     without artificial sine-wave amplification, preserving null Day 4-7 slots for Open-Meteo),
      probabilityOfPrecipitation (%), temperature (C), dewpoint (C), relativeHumidity (%),
      skyCover (%), windSpeed (m/s), windGust (m/s), and windDirection (deg).
   3. Enriches hourly rows with /forecastHourly text descriptions when available, without
      failing if /forecastHourly returns a transient 500/503 error.
-  4. Supplements with Open-Meteo NWP at 880m MSL so nws_qpf_1hr_mm is never 0.0 during storms.
+  4. Supplements with Open-Meteo NWP at 880m MSL and prunes superseded forecast batches.
 """
 
 import re
@@ -30,7 +31,7 @@ TASS_LON = -121.5501
 NWP_GRID_ELEV_M = 880.0
 
 NWS_HEADERS = {
-    "User-Agent": "(TassajaraZenMountainCenter-MOS/3.1, tzmc-weather@tassajara.org)",
+    "User-Agent": "(TassajaraZenMountainCenter-MOS/3.2, tzmc-weather@tassajara.org)",
     "Accept": "application/geo+json",
 }
 
@@ -109,7 +110,9 @@ def expand_nws_grid_series(
     When is_accumulation=True (e.g., quantitativePrecipitation) and n_hours > 1,
     disaggregates the multi-hour block total across its constituent hours using
     1-hour NWP (Open-Meteo) QPF/PoP/RH temporal weights while strictly preserving
-    100% of the official NOAA NWS block accumulation.
+    100% of the official NOAA NWS block accumulation without artificial sine waves.
+    Null values (common beyond the NDFD QPF horizon on Days 4-7) are skipped rather
+    than coerced to 0.0 so Open-Meteo can supply extended QPF.
     """
     if isinstance(prop_or_values, dict):
         uom = str(prop_or_values.get("uom") or "")
@@ -129,10 +132,8 @@ def expand_nws_grid_series(
             continue
         raw_val = item.get("value")
         if raw_val is None:
-            if is_accumulation:
-                raw_val = 0.0
-            else:
-                continue
+            # Never convert null NDFD QPF slots (Days 4-7) into 0.0; allow Open-Meteo fallback
+            continue
         start_str, dur_str = vt.split("/", 1)
         try:
             start_dt = (
@@ -150,17 +151,19 @@ def expand_nws_grid_series(
             block_isos = [(start_dt + timedelta(hours=h)).isoformat() for h in range(n_hours)]
             if is_accumulation and n_hours > 1 and scaled_val > 0.0:
                 weights = []
-                for idx_h, h_iso in enumerate(block_isos):
+                om_total = sum(
+                    max(0.0, float((hourly_weights_map or {}).get(h_iso, {}).get("qpf_mm") or 0.0))
+                    for h_iso in block_isos
+                )
+                for h_iso in block_isos:
                     w_node = (hourly_weights_map or {}).get(h_iso, {})
-                    om_q = float(w_node.get("qpf_mm") or 0.0)
-                    om_pop = float(w_node.get("pop_pct") or 50.0)
-                    om_rh = float(w_node.get("rh_pct") or 75.0)
-                    # Smooth frontal wave shape across the block so hours are never identical flat steps
-                    wave = 1.0 + 0.28 * np.sin(np.pi * (idx_h + 0.5) / float(n_hours))
-                    if om_q > 0.0:
-                        w_h = (om_q + 0.15 * (scaled_val / float(n_hours))) * wave
+                    om_q = max(0.0, float(w_node.get("qpf_mm") or 0.0))
+                    if om_total > 0.0:
+                        w_h = om_q + 0.05 * (om_total / float(n_hours))
                     else:
-                        w_h = max(0.05, (om_pop / 100.0) * max(0.2, (om_rh - 40.0) / 60.0)) * wave
+                        om_pop = float(w_node.get("pop_pct") or 50.0)
+                        om_rh = float(w_node.get("rh_pct") or 75.0)
+                        w_h = max(0.05, (om_pop / 100.0) * max(0.2, (om_rh - 40.0) / 60.0))
                     weights.append(float(w_h))
                 w_sum = sum(weights)
                 for h_iso, w_h in zip(block_isos, weights):
@@ -628,7 +631,7 @@ def fetch_nws_gridpoints_dataframe(
 def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
     """
     Fetches the latest 7-day hourly forecast from NWS /gridpoints/MTR/... (+ /forecastHourly & Open-Meteo),
-    inserts the operational batch into nws_forecasts, and repairs any prior zero-QPF rows in SQLite.
+    inserts the operational batch into nws_forecasts, and logs summary accumulation.
     """
     now_hr_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     df_fc = fetch_nws_gridpoints_dataframe(
@@ -683,6 +686,58 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
         f"({wet_fc_hrs} wet hrs, total 7d QPF = {total_qpf_mm:.2f} mm / {total_qpf_mm/25.4:.2f} in)."
     )
     return len(rows_to_insert)
+
+
+def prune_old_forecasts(db_path: str = "tassajara_weather.db", keep_days: int = 14) -> None:
+    """
+    Prunes superseded multi-batch operational forecasts older than `keep_days`,
+    retaining 1 canonical verification row (closest to 6h lead) per historical valid_time_utc.
+    """
+    cutoff_iso = (
+        datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        - timedelta(days=int(keep_days))
+    ).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM nws_forecasts
+            WHERE valid_time_utc < ?
+              AND rowid NOT IN (
+                  SELECT rowid FROM (
+                      SELECT rowid,
+                             ROW_NUMBER() OVER (
+                                 PARTITION BY valid_time_utc
+                                 ORDER BY
+                                     CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                                     ABS(lead_time_hours - 6) ASC,
+                                     issue_time_utc DESC
+                             ) AS rn
+                      FROM nws_forecasts
+                      WHERE valid_time_utc < ?
+                  ) WHERE rn = 1
+              )
+            """,
+            (cutoff_iso, cutoff_iso),
+        )
+        conn.execute(
+            """
+            DELETE FROM mos_corrected_forecasts
+            WHERE valid_time_utc < ?
+              AND rowid NOT IN (
+                  SELECT rowid FROM (
+                      SELECT rowid,
+                             ROW_NUMBER() OVER (
+                                 PARTITION BY valid_time_utc
+                                 ORDER BY issue_time_utc DESC
+                             ) AS rn
+                      FROM mos_corrected_forecasts
+                      WHERE valid_time_utc < ?
+                  ) WHERE rn = 1
+              )
+            """,
+            (cutoff_iso, cutoff_iso),
+        )
+        conn.commit()
 
 
 ingest_nws_forecasts = fetch_and_store_nws_hourly

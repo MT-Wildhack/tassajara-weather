@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-app.py — Tassajara Zen Mountain Center Meteorological & Hydrological MOS Monitor
+app.py (v2.0 — Tassajara Zen Mountain Center Meteorological & Hydrological MOS Monitor)
 Publication-grade scientific monitoring suite for Station 36966 (Stone Office Vantage Pro2),
 the 5-station Santa Lucia boundary network (Chews Ridge CHWC1, Hastings CAHC1, Arroyo Seco ASRC1,
 Big Sur PPSC1, Ventana Cone VTCC1), and Thermal + Hydrological MOS.
-Includes real-time UTC horizon filtering, automatic live 168-hour NWP top-up,
-comprehensive scientific tooltips (help="..."), and an OLS & Feature Importance suite.
 """
 
 import math
@@ -47,7 +45,7 @@ from hydro_risk_engine import (
     YELLOW_API_MM,
     ORANGE_API_MM,
     RED_API_EXTREME_MM,
-    TIER_METADATA,
+    get_severity_matrix_rows,
     compute_dashboard_hydro_state,
 )
 
@@ -254,12 +252,12 @@ FEATURE_METADATA = {
         "Forecast cloud cover fraction (%) modulating nocturnal longwave radiational cooling.",
     ),
     "pressure_trend_3hr_hpa": (
-        "3-Hr Barometric Tendency (hPa)",
-        "3-hour sea-level pressure change at the Stone Office ISS.",
+        "Decayed 3-Hr Barometric Tendency (hPa)",
+        "Issue-time 3-hour sea-level pressure change decayed exponentially with forecast lead time.",
     ),
     "frontal_pressure_fall_hpa": (
-        "Frontal Pressure Fall (hPa/3h)",
-        "Negative barometric tendency isolating dynamic synoptic frontal lift.",
+        "Decayed Frontal Pressure Fall (hPa/3h)",
+        "Negative issue-time barometric tendency decayed with lead time to isolate near-term frontal lift.",
     ),
     "decayed_chews_precip_mm": (
         "Chews Ridge Feeder-Seeder Rain (mm)",
@@ -317,7 +315,7 @@ def hpa_to_inhg(hpa):
 
 def deg_to_cardinal(deg):
     if deg is None or pd.isna(deg):
-        return "Calm"
+        return "Var"
     dirs = [
         "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
         "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
@@ -326,7 +324,7 @@ def deg_to_cardinal(deg):
         ix = int(round(float(deg) / 22.5)) % 16
         return dirs[ix]
     except Exception:
-        return "Calm"
+        return "Var"
 
 
 def safe_float(val, default=0.0):
@@ -608,8 +606,7 @@ def fetch_live_nwp_topup(now_hour_utc: datetime) -> pd.DataFrame:
     """
     Fetches a live 168-hour (7-day) hourly NWP/NWS forecast for the Tassajara grid cell
     (36.2337°N, -121.5501°W, 880m MSL) combining NOAA NWS /gridpoints/MTR/...
-    (quantitativePrecipitation, windGust, skyCover, PoP) with Open-Meteo GFS/HRRR.
-    Never hardcodes nws_qpf_1hr_mm to 0.0 when either source reports precipitation.
+    with Open-Meteo GFS/HRRR.
     """
     try:
         df_live = fetch_nws_gridpoints_dataframe(
@@ -789,11 +786,7 @@ def backfill_missing_hindcast_verification(
 ) -> pd.DataFrame:
     """
     Ensures every observed hour in `obs_df` (< now_hour_utc) has a paired NWP + MOS
-    hindcast row in `verify_df`. When `nws_forecasts` in SQLite has a gap or expired
-    horizon, fetches the past 10 days of hourly NWP grid data from Open-Meteo at 880m MSL,
-    attaches 6-hour lagged initialization & Santa Lucia reference boundary conditions,
-    and runs `apply_mos_inference_if_needed()` so the hindcast curves and verification
-    scorecard are always complete and never flat-lined.
+    hindcast row in `verify_df` when `nws_forecasts` in SQLite has a gap.
     """
     if obs_df is None or obs_df.empty or "valid_time_utc" not in obs_df.columns:
         return verify_df
@@ -887,6 +880,9 @@ def backfill_missing_hindcast_verification(
             nwp_map = {}
 
     obs_temp_by_hr = dict(zip(obs_clean["_hr_utc"], pd.to_numeric(obs_clean["temp_c"], errors="coerce")))
+    obs_ptrend_by_hr = dict(
+        zip(obs_clean["_hr_utc"], pd.to_numeric(obs_clean.get("pressure_trend_3hr_hpa", 0.0), errors="coerce").fillna(0.0))
+    )
 
     ref_hist_map = {}
     if Path(DB_PATH).exists():
@@ -908,6 +904,9 @@ def backfill_missing_hindcast_verification(
     rows = []
     for _, o_row in missing_obs.iterrows():
         hr_dt = o_row["_hr_utc"]
+        nwp = nwp_map.get(hr_dt)
+        if not nwp or pd.isna(nwp.get("nws_temp_c")):
+            continue
         valid_iso = hr_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         issue_dt = hr_dt - pd.Timedelta(hours=6)
         issue_iso = issue_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
@@ -917,8 +916,7 @@ def backfill_missing_hindcast_verification(
         act_dew = safe_float(o_row.get("dewpoint_c"), act_t - 4.0)
         act_wb = safe_float(o_row.get("wetbulb_c"), compute_wetbulb_stull_c(act_t, act_rh))
 
-        nwp = nwp_map.get(hr_dt, {})
-        nws_t = safe_float(nwp.get("nws_temp_c"), act_t + 2.5)
+        nws_t = float(nwp["nws_temp_c"])
         nws_dew = safe_float(nwp.get("nws_dewpoint_c"), act_dew)
         nws_rh = safe_float(nwp.get("nws_rh_pct"), act_rh)
         nws_wspd = safe_float(nwp.get("nws_wind_speed_ms"), safe_float(o_row.get("wind_speed_ms"), 1.5))
@@ -934,6 +932,7 @@ def backfill_missing_hindcast_verification(
         issue_nwp = nwp_map.get(issue_dt, {})
         issue_nws_t = safe_float(issue_nwp.get("nws_temp_c"), float(issue_tass_t))
         init_bias_c = float(issue_tass_t) - float(issue_nws_t)
+        issue_ptrend = float(obs_ptrend_by_hr.get(issue_dt, 0.0))
 
         def _get_h_ref(stid: str, col: str, default_val: float) -> float:
             rec = ref_hist_map.get((issue_dt, stid))
@@ -963,9 +962,9 @@ def backfill_missing_hindcast_verification(
             "actual_rh_pct": round(act_rh, 1),
             "actual_wind_speed_ms": safe_float(o_row.get("wind_speed_ms"), 0.0),
             "actual_wind_gust_ms": safe_float(o_row.get("wind_gust_ms"), 0.0),
-            "actual_wind_dir_deg": safe_float(o_row.get("wind_dir_deg"), 0.0),
+            "actual_wind_dir_deg": o_row.get("wind_dir_deg"),
             "actual_mslp_hpa": safe_float(o_row.get("mslp_hpa"), 1015.0),
-            "pressure_trend_3hr_hpa": safe_float(o_row.get("pressure_trend_3hr_hpa"), 0.0),
+            "pressure_trend_3hr_hpa": round(issue_ptrend, 2),
             "actual_precip_mm": safe_float(o_row.get("precip_1hr_mm"), 0.0),
             "issue_time_utc": issue_iso,
             "lead_time_hours": 6.0,
@@ -1001,7 +1000,7 @@ def backfill_missing_hindcast_verification(
             "mos_pop_pct": np.nan,
             "mos_qpf_mm": np.nan,
             "mos_qpf_p90_mm": np.nan,
-            "model_version": "MOS_GBM_v2_HYDRO",
+            "model_version": "MOS_GBM_v3_HYDRO",
         })
 
     if not rows:
@@ -1032,6 +1031,7 @@ def load_all_dashboard_data():
     now_hour_iso = now_hour_utc.isoformat()
 
     obs_df = pd.DataFrame()
+    ref_hist_df = pd.DataFrame()
     ref_dict = {}
     future_fc_df = pd.DataFrame()
     verify_df = pd.DataFrame()
@@ -1044,19 +1044,32 @@ def load_all_dashboard_data():
 
     if Path(DB_PATH).exists():
         with sqlite3.connect(DB_PATH) as conn:
-            # 1. Recent Local Observations (Stone Office Vantage Pro2)
+            # 1. Recent Local Observations (14 days / 336 hours, matching hydro_risk_engine.py)
             try:
                 obs_df = pd.read_sql_query(
                     """
                     SELECT * FROM local_observations
                     WHERE temp_c IS NOT NULL
                     ORDER BY valid_time_utc DESC
-                    LIMIT 240
+                    LIMIT 336
                     """,
                     conn,
                 )
             except Exception:
                 obs_df = pd.DataFrame()
+
+            # Historical 5-station reference observations for consistent hydrological API spin-up
+            try:
+                ref_hist_df = pd.read_sql_query(
+                    """
+                    SELECT * FROM reference_observations
+                    ORDER BY valid_time_utc DESC
+                    LIMIT 1680
+                    """,
+                    conn,
+                )
+            except Exception:
+                ref_hist_df = pd.DataFrame()
 
             # Archive-wide Precipitation Stats
             try:
@@ -1120,7 +1133,8 @@ def load_all_dashboard_data():
                             if pd.notna(obs_dt)
                             else 999.0
                         )
-                        is_fresh = age_hrs <= 3.5 and (
+                        is_synth = str(row_d.get("source") or "") == "OPENMETEO_SYNTH"
+                        is_fresh = (not is_synth) and age_hrs <= 3.5 and (
                             pd.notna(row_d.get("temp_c")) or pd.notna(row_d.get("precip_1hr_mm"))
                         )
                         row_d["online"] = bool(is_fresh)
@@ -1161,6 +1175,13 @@ def load_all_dashboard_data():
             )
             hydro_inner_sql = (
                 "mos_pop_pct, mos_qpf_mm, mos_qpf_p90_mm"
+                if has_hydro_cols
+                else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
+            )
+            hydro_coalesce_sql = (
+                "COALESCE(m_ex.mos_pop_pct, m_any.mos_pop_pct) AS mos_pop_pct, "
+                "COALESCE(m_ex.mos_qpf_mm, m_any.mos_qpf_mm) AS mos_qpf_mm, "
+                "COALESCE(m_ex.mos_qpf_p90_mm, m_any.mos_qpf_p90_mm) AS mos_qpf_p90_mm"
                 if has_hydro_cols
                 else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
             )
@@ -1256,7 +1277,7 @@ def load_all_dashboard_data():
             except Exception:
                 future_fc_df = pd.DataFrame()
 
-            # 4. Paired Historical Verification Dataset (with 5-Station Reference Joins)
+            # 4. Paired Historical Verification Dataset (Matched on valid_time_utc + issue_time_utc)
             try:
                 verify_df = pd.read_sql_query(
                     f"""
@@ -1270,7 +1291,7 @@ def load_all_dashboard_data():
                         o.wind_gust_ms AS actual_wind_gust_ms,
                         o.wind_dir_deg AS actual_wind_dir_deg,
                         o.mslp_hpa AS actual_mslp_hpa,
-                        COALESCE(o.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
+                        COALESCE(o_issue.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
                         COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
                         f.issue_time_utc,
                         f.lead_time_hours,
@@ -1297,14 +1318,22 @@ def load_all_dashboard_data():
                         COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
                         COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
                         COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
-                        COALESCE(o_issue.temp_c - f_issue.nws_temp_c, 0.0) AS issue_persistence_bias_c,
-                        m.corrected_temp_c,
-                        m.corrected_temp_p10_c,
-                        m.corrected_temp_p90_c,
-                        m.corrected_rh_pct,
-                        m.corrected_wind_gust_ms,
-                        {hydro_select_sql},
-                        m.model_version
+                        COALESCE(
+                            o_issue.temp_c - (
+                                SELECT fi.nws_temp_c FROM nws_forecasts fi
+                                WHERE fi.valid_time_utc = f.issue_time_utc
+                                  AND fi.issue_time_utc <= f.issue_time_utc
+                                ORDER BY fi.issue_time_utc DESC LIMIT 1
+                            ),
+                            0.0
+                        ) AS issue_persistence_bias_c,
+                        COALESCE(m_ex.corrected_temp_c, m_any.corrected_temp_c) AS corrected_temp_c,
+                        COALESCE(m_ex.corrected_temp_p10_c, m_any.corrected_temp_p10_c) AS corrected_temp_p10_c,
+                        COALESCE(m_ex.corrected_temp_p90_c, m_any.corrected_temp_p90_c) AS corrected_temp_p90_c,
+                        COALESCE(m_ex.corrected_rh_pct, m_any.corrected_rh_pct) AS corrected_rh_pct,
+                        COALESCE(m_ex.corrected_wind_gust_ms, m_any.corrected_wind_gust_ms) AS corrected_wind_gust_ms,
+                        {hydro_coalesce_sql},
+                        COALESCE(m_ex.model_version, m_any.model_version) AS model_version
                     FROM local_observations o
                     INNER JOIN (
                         SELECT
@@ -1334,11 +1363,6 @@ def load_all_dashboard_data():
                     ) f ON o.valid_time_utc = f.valid_time_utc AND f.rn = 1
                     LEFT JOIN local_observations o_issue
                         ON f.issue_time_utc = o_issue.valid_time_utc
-                    LEFT JOIN (
-                        SELECT valid_time_utc, AVG(nws_temp_c) AS nws_temp_c
-                        FROM nws_forecasts
-                        GROUP BY valid_time_utc
-                    ) f_issue ON f.issue_time_utc = f_issue.valid_time_utc
                     LEFT JOIN reference_observations r_chews
                         ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
                     LEFT JOIN reference_observations r_hast
@@ -1349,6 +1373,9 @@ def load_all_dashboard_data():
                         ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
                     LEFT JOIN reference_observations r_vent
                         ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
+                    LEFT JOIN mos_corrected_forecasts m_ex
+                        ON f.valid_time_utc = m_ex.valid_time_utc
+                       AND f.issue_time_utc = m_ex.issue_time_utc
                     LEFT JOIN (
                         SELECT
                             valid_time_utc,
@@ -1366,7 +1393,7 @@ def load_all_dashboard_data():
                                     issue_time_utc DESC
                             ) AS rn
                         FROM mos_corrected_forecasts
-                    ) m ON o.valid_time_utc = m.valid_time_utc AND m.rn = 1
+                    ) m_any ON o.valid_time_utc = m_any.valid_time_utc AND m_any.rn = 1
                     WHERE o.temp_c IS NOT NULL AND o.qc_flag = 'OK'
                     ORDER BY o.valid_time_utc ASC
                     """,
@@ -1396,7 +1423,7 @@ def load_all_dashboard_data():
                 "precip_1hr_mm": 0.0,
             }
 
-    # Live WeatherLink v2 (/current/36966) & 5-Station Synoptic Real-Time Top-Up
+    # Live WeatherLink v2 (/current/36966) In-Memory Top-Up (NO missing-hour temperature cloning or rain smearing)
     try:
         wl_client = WeatherLinkV2Client()
         live_obs = wl_client.fetch_current_observations(station_id=36966)
@@ -1418,9 +1445,11 @@ def load_all_dashboard_data():
                 if not obs_df.empty
                 else 0.0
             )
-            ptrend_live = safe_float(live_obs.get("pressure_trend_hpa"), prev_ptrend)
-            if ptrend_live == 0.0 and prev_ptrend != 0.0:
+            ptrend_live = live_obs.get("pressure_trend_hpa")
+            if ptrend_live is None or pd.isna(ptrend_live):
                 ptrend_live = prev_ptrend
+            else:
+                ptrend_live = float(ptrend_live)
 
             existing_hr_rain = 0.0
             if not obs_df.empty and str(obs_df.iloc[0].get("valid_time_utc")) == now_hour_iso:
@@ -1440,7 +1469,7 @@ def load_all_dashboard_data():
                     safe_float(live_obs.get("wind_speed_ms"), 0.0),
                     safe_float(live_obs.get("wind_gust_ms"), 0.0),
                 ),
-                "wind_dir_deg": safe_float(live_obs.get("wind_dir_deg"), 0.0),
+                "wind_dir_deg": live_obs.get("wind_dir_deg"),
                 "mslp_hpa": safe_float(
                     live_obs.get("mslp_hpa"),
                     safe_float(obs_df.iloc[0].get("mslp_hpa"), 1015.0) if not obs_df.empty else 1015.0,
@@ -1450,6 +1479,7 @@ def load_all_dashboard_data():
                 "solar_rad_wm2": live_obs.get("solar_rad_wm2"),
                 "uv_index": live_obs.get("uv_index"),
                 "qc_flag": "OK",
+                "source": "WL_LIVE",
             }
 
             if obs_df.empty:
@@ -1460,105 +1490,24 @@ def load_all_dashboard_data():
                 obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
                 obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
 
-            # Reconcile Davis console rain_day_in (today since 00:00 PST/PDT) and rain_storm_in
-            # into in-memory obs_df so Streamlit always reflects exact WeatherLink rainfall
-            yesterday_mid_iso, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
+            # Clean, non-smearing current-hour rainfall shortfall reconciliation
+            _, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
             console_day_mm = safe_float(live_obs.get("precip_day_mm"), 0.0)
-            console_storm_mm = safe_float(live_obs.get("precip_storm_mm"), 0.0)
-            storm_start_iso = live_obs.get("rain_storm_start_utc") or yesterday_mid_iso
             obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
             today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
             db_today_mm = float(get_col(obs_df.loc[today_mask], "precip_1hr_mm", 0.0).sum()) if today_mask.any() else 0.0
             shortfall_today_mm = round(console_day_mm - db_today_mm, 3)
-
-            # Ensure all hourly slots today between today_mid_iso and now_hour_iso exist in obs_df
-            if today_mask.any():
-                min_today_dt = max(pd.Timestamp(today_mid_iso), obs_dt_s.min())
-                expected_today_hrs = pd.date_range(
-                    start=min_today_dt, end=pd.Timestamp(now_hour_iso), freq="1h", tz="UTC"
-                )
-                existing_today_set = set(obs_dt_s.dropna().dt.floor("h"))
-                missing_today_hrs = [h for h in expected_today_hrs if h not in existing_today_set]
-                if missing_today_hrs:
-                    fill_rows = []
-                    for mh in missing_today_hrs:
-                        fill_rows.append({
-                            "valid_time_utc": mh.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                            "exact_obs_time_utc": mh.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-                            "station_id": str(live_row_dict["station_id"]),
-                            "temp_c": live_row_dict["temp_c"],
-                            "dewpoint_c": live_row_dict["dewpoint_c"],
-                            "wetbulb_c": live_row_dict["wetbulb_c"],
-                            "rh_pct": max(88.0, live_row_dict["rh_pct"]),
-                            "wind_speed_ms": live_row_dict["wind_speed_ms"],
-                            "wind_gust_ms": live_row_dict["wind_gust_ms"],
-                            "wind_dir_deg": live_row_dict["wind_dir_deg"],
-                            "mslp_hpa": live_row_dict["mslp_hpa"],
-                            "pressure_trend_3hr_hpa": live_row_dict["pressure_trend_3hr_hpa"],
-                            "precip_1hr_mm": 0.0,
-                            "solar_rad_wm2": None,
-                            "uv_index": None,
-                            "qc_flag": "OK",
-                        })
-                    obs_df = pd.concat([obs_df, pd.DataFrame(fill_rows)], ignore_index=True)
-                    obs_df["_sort_dt"] = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
-                    obs_df = obs_df.sort_values("_sort_dt", ascending=False).drop(columns=["_sort_dt"]).reset_index(drop=True)
-                    obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
-                    today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
-
-            if shortfall_today_mm >= 0.20 and today_mask.any():
-                clicks = max(1, int(round(shortfall_today_mm / 0.254)))
+            if shortfall_today_mm >= 0.254 and today_mask.any():
                 live_rate_mm = safe_float(live_obs.get("precip_rate_mm_hr"), 0.0)
-                today_indices = obs_df.index[today_mask].tolist()
-                prior_wet = [
-                    i for i in today_indices[1:]
-                    if safe_float(obs_df.loc[i].get("rh_pct"), 50.0) >= 82.0
-                ][:8] or today_indices[1:7]
-
-                if clicks <= 2 or not prior_wet:
-                    top_idx = today_indices[0]
-                    obs_df.loc[top_idx, "precip_1hr_mm"] = round(
-                        safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + round(clicks * 0.254, 3), 3
-                    )
-                else:
-                    # Cap current hour attribution to actual rain_rate_mm (or ~2.0 mm/hr) and
-                    # distribute the earlier morning accumulation across prior wet hours today.
-                    cur_clicks = (
-                        min(clicks, max(2, int(round(min(live_rate_mm, 4.0) / 0.254))))
-                        if live_rate_mm > 0.0
-                        else 0
-                    )
-                    if cur_clicks > 0:
-                        top_idx = today_indices[0]
-                        obs_df.loc[top_idx, "precip_1hr_mm"] = round(
-                            safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + round(cur_clicks * 0.254, 3), 3
-                        )
-                    rem_clicks = clicks - cur_clicks
-                    if rem_clicks > 0:
-                        n_t = min(len(prior_wet), rem_clicks)
-                        b_c = rem_clicks // n_t
-                        r_c = rem_clicks % n_t
-                        for idx_i, row_idx in enumerate(prior_wet[:n_t]):
-                            c_i = b_c + (1 if idx_i < r_c else 0)
-                            if c_i > 0:
-                                obs_df.loc[row_idx, "precip_1hr_mm"] = round(
-                                    safe_float(obs_df.loc[row_idx, "precip_1hr_mm"], 0.0) + round(c_i * 0.254, 3), 3
-                                )
-
-            pre_midnight_mm = round(max(0.0, console_storm_mm - console_day_mm), 3)
-            if 0.20 <= pre_midnight_mm <= 60.0 and str(storm_start_iso) >= str(yesterday_mid_iso):
-                yest_mask = (obs_dt_s >= pd.Timestamp(storm_start_iso)) & (obs_dt_s < pd.Timestamp(today_mid_iso))
-                db_yest_mm = float(get_col(obs_df.loc[yest_mask], "precip_1hr_mm", 0.0).sum()) if yest_mask.any() else 0.0
-                shortfall_yest_mm = round(pre_midnight_mm - db_yest_mm, 3)
-                if shortfall_yest_mm >= 0.20 and yest_mask.any():
-                    clicks_y = max(1, int(round(shortfall_yest_mm / 0.254)))
-                    add_y_mm = round(clicks_y * 0.254, 3)
-                    yest_idx = obs_df.index[yest_mask][0]
-                    obs_df.loc[yest_idx, "precip_1hr_mm"] = round(
-                        safe_float(obs_df.loc[yest_idx, "precip_1hr_mm"], 0.0) + add_y_mm, 3
-                    )
-
-            # In-memory live update only (prevents dirtying tassajara_weather.db in Git)
+                add_now_mm = (
+                    min(shortfall_today_mm, max(live_rate_mm, 2.54))
+                    if live_rate_mm > 0.0
+                    else shortfall_today_mm
+                )
+                top_idx = obs_df.index[today_mask][0]
+                obs_df.loc[top_idx, "precip_1hr_mm"] = round(
+                    safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + add_now_mm, 3
+                )
     except Exception:
         pass
 
@@ -1569,19 +1518,8 @@ def load_all_dashboard_data():
     try:
         live_refs = fetch_regional_reference_stations() if fresh_sqlite_refs < 4 else {}
         if isinstance(live_refs, dict):
-            ref_db_rows = []
             for stid, rdata in live_refs.items():
-                if isinstance(rdata, dict) and rdata.get("online") and rdata.get("temp_c") is not None:
-                    ref_db_rows.append((
-                        now_hour_iso,
-                        stid,
-                        float(rdata["temp_c"]),
-                        safe_float(rdata.get("rh_pct"), None),
-                        safe_float(rdata.get("wind_speed_ms"), 0.0),
-                        safe_float(rdata.get("wind_gust_ms"), 0.0),
-                        safe_float(rdata.get("wind_dir_deg"), 0.0),
-                        safe_float(rdata.get("precip_1hr_mm"), 0.0),
-                    ))
+                if isinstance(rdata, dict) and rdata.get("temp_c") is not None:
                     meta = REFERENCE_STATIONS.get(stid, {})
                     ref_dict[stid] = {
                         "station_id": stid,
@@ -1589,13 +1527,14 @@ def load_all_dashboard_data():
                         "elev_m": meta.get("elev_m"),
                         "role": meta.get("role", "Reference"),
                         "valid_time_utc": rdata.get("valid_time_utc") or now_hour_iso,
-                        "online": True,
+                        "online": bool(rdata.get("online", False)),
+                        "source": str(rdata.get("source") or "RAWS_SYNOPTIC"),
                         "age_hours": 0.1,
                         "temp_c": float(rdata["temp_c"]),
                         "rh_pct": safe_float(rdata.get("rh_pct"), np.nan),
                         "wind_speed_ms": safe_float(rdata.get("wind_speed_ms"), np.nan),
                         "wind_gust_ms": safe_float(rdata.get("wind_gust_ms"), np.nan),
-                        "wind_dir_deg": safe_float(rdata.get("wind_dir_deg"), np.nan),
+                        "wind_dir_deg": rdata.get("wind_dir_deg"),
                         "precip_1hr_mm": safe_float(rdata.get("precip_1hr_mm"), 0.0),
                     }
         if (
@@ -1603,7 +1542,7 @@ def load_all_dashboard_data():
             and pd.notna(ref_dict.get("CHWC1", {}).get("temp_c"))
         ):
             ref_dict["VTCC1"]["temp_c"] = round(float(ref_dict["CHWC1"]["temp_c"]) + 0.54, 2)
-            ref_dict["VTCC1"]["online"] = True
+            ref_dict["VTCC1"]["online"] = False
             ref_dict["VTCC1"]["age_hours"] = ref_dict["CHWC1"].get("age_hours", 0.2)
     except Exception:
         pass
@@ -1676,15 +1615,14 @@ def load_all_dashboard_data():
         now_hour_utc=now_hour_utc,
     )
 
-    return ref_dict, obs_df, future_fc_df, verify_df, archive_stats
+    return ref_dict, ref_hist_df, obs_df, future_fc_df, verify_df, archive_stats
 
 
 @st.cache_data(ttl=300)
 def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
     """
-    Fits a standardized, well-conditioned Statsmodels OLS regression with Newey-West
-    HAC robust standard errors (12-hour lag) and computes permutation feature importances
-    for both the Thermal and Hydrological MOS models from models/tassajara_mos_v1.joblib.
+    Loads precomputed standardized Newey-West HAC OLS & permutation importances from
+    models/tassajara_mos_v1.joblib (or computes them cleanly on verify_df if absent).
     """
     diag_out = {
         "model_loaded": False,
@@ -1814,7 +1752,7 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
     except Exception:
         pass
 
-    # 2. Compute Feature Importance Rankings (Permutation Importance on GBDT + Hydro Sensitivity)
+    # 2. Compute Feature Importance Rankings against ACTUAL observations
     feat_cols = diag_out["feature_names"] if diag_out["feature_names"] else list(X_full.columns)
     for c in feat_cols:
         if c not in X_full.columns:
@@ -1844,17 +1782,19 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
     t_sum = float(thermal_raw.sum())
     thermal_pct = (thermal_raw / t_sum * 100.0) if t_sum > 0 else np.zeros_like(thermal_raw)
 
-    y_hydro_target = get_col(eval_sub, "mos_qpf_mm", get_col(eval_sub, "actual_precip_mm", 0.0)).values
+    y_actual_precip = get_col(eval_sub, "actual_precip_mm", 0.0)
+    wet_idx = y_actual_precip[y_actual_precip >= 0.254].index
     if (
         mos_obj is not None
         and getattr(mos_obj, "precip_ml_trained", False)
         and hasattr(mos_obj, "model_qpf_mean")
+        and len(wet_idx) >= 20
     ):
         try:
             perm_h = permutation_importance(
                 mos_obj.model_qpf_mean,
-                X_model,
-                y_hydro_target,
+                X_model.loc[wet_idx],
+                y_actual_precip.loc[wet_idx].values,
                 scoring="neg_root_mean_squared_error",
                 n_repeats=5,
                 random_state=42,
@@ -1924,7 +1864,7 @@ def get_weather_icon_and_label(
         if temp_f <= 34.0:
             return "🌨️", "Wintry Mix / Snow"
         return "🌧️", "Rain Likely"
-    if qpf_in >= 0.02 or pop_pct >= 35:
+    if qpf_in >= 0.01 or pop_pct >= 45:
         return "🌦️", "Chance of Showers"
     if pop_pct >= 20:
         return "☁️", "Mostly Cloudy"
@@ -1952,8 +1892,6 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     """
     Renders a high-visibility 4-Tier Creek Flood & Tassajara Road Passability
     Warning Banner for both the Everyday Community View and Scientific MOS Suite.
-    Uses theme-adaptive CSS variables (`var(--text-color)`) so text is crisp and
-    legible in both Streamlit Light and Dark modes.
     """
     if not isinstance(hydro_summary, dict) or not hydro_summary:
         return
@@ -1966,7 +1904,6 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     bg_rgba = str(hydro_summary.get("bg_rgba", "rgba(16, 185, 129, 0.14)"))
     border_rgba = str(hydro_summary.get("border_rgba", "rgba(16, 185, 129, 0.45)"))
 
-    # High-contrast tier label colors that read clearly on both light and dark backgrounds
     tier_accent_map = {
         "GREEN": "#059669",
         "YELLOW": "#b45309",
@@ -1978,9 +1915,9 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
     api_in = float(hydro_summary.get("api_in", 0.0))
     api_mm = float(hydro_summary.get("api_mm", 0.0))
     proj_api_24_in = float(hydro_summary.get("projected_max_api_24h_in", api_in))
-    c_val = float(hydro_summary.get("runoff_coeff_c", 0.08))
-    c_pct = float(hydro_summary.get("runoff_coeff_pct", 8.0))
-    decay_k = float(hydro_summary.get("decay_k", 0.91))
+    c_val = float(hydro_summary.get("runoff_coeff_c", 0.05))
+    c_pct = float(hydro_summary.get("runoff_coeff_pct", 5.0))
+    decay_k_day = float(hydro_summary.get("decay_k_daily_equiv", 0.91))
 
     rain_24_in = float(hydro_summary.get("precip_24hr_in", 0.0))
     fc_qpf_24_in = float(hydro_summary.get("forecast_qpf_24hr_in", 0.0))
@@ -1998,7 +1935,7 @@ def render_flood_and_road_warning_banner(hydro_summary: dict, is_scientific: boo
         f'<div class="tzmc-muted" style="font-family: monospace; font-size: 0.78rem; '
         f'margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(148, 163, 184, 0.35);">'
         f'<b>HYDROLOGICAL TELEMETRY:</b> '
-        f'API<sub>t</sub> = {api_in:.2f} in ({api_mm:.1f} mm, k={decay_k:.3f}) &bull; '
+        f'API<sub>t</sub> = {api_in:.2f} in ({api_mm:.1f} mm, k<sub>day</sub>={decay_k_day:.3f}) &bull; '
         f'24h Peak API = {proj_api_24_in:.2f} in &bull; '
         f'Runoff Coeff C = {c_val:.2f} ({c_pct:.0f}%) &bull; '
         f'24h Rain Obs/Fcst = {rain_24_in:.2f}" / {fc_qpf_24_in:.2f}" &bull; '
@@ -2061,15 +1998,16 @@ def render_hydro_risk_section(
 
     # 1. 4-Card Hydrological KPI Row
     hc1, hc2, hc3, hc4 = st.columns(4)
+    k_day_disp = float(s.get("decay_k_daily_equiv", s["decay_k"] ** 24))
     hc1.metric(
         "Antecedent Wetness (API_t)",
         f"{s['api_in']:.2f} in ({s['api_mm']:.1f} mm)",
-        f"24h Peak: {s['projected_max_api_24h_in']:.2f} in | Decay k={s['decay_k']:.3f}",
+        f"24h Peak: {s['projected_max_api_24h_in']:.2f} in | Daily k={k_day_disp:.3f}",
         delta_color="off",
         help=(
-            "Antecedent Precipitation Index (API_t = API_{t-1} * k + P_t) tracking multi-day "
-            "soil moisture storage across the rocky Santa Lucia chaparral and mixed-oak catchment. "
-            "Values above 1.00 in (25.4 mm) indicate a saturated catchment primed for rapid runoff."
+            "Multi-day Antecedent Precipitation Index (API_t = API_{t-1} * k_hr + P_t, where k_hr = k_day^(1/24)) "
+            "tracking soil moisture storage across the rocky Santa Lucia chaparral and mixed-oak catchment. "
+            f"Values above {YELLOW_API_MM/MM_PER_INCH:.2f} in indicate primed soil; above {ORANGE_API_MM/MM_PER_INCH:.2f} in indicate saturation."
         ),
     )
     hc2.metric(
@@ -2078,9 +2016,9 @@ def render_hydro_risk_section(
         f"Headwater Spillover: {s['upstream_spillover_in']:.2f} in/hr",
         delta_color="off",
         help=(
-            "Nonlinear fraction of incoming rainfall converted directly into surface quickflow "
-            "(R_t = C_t * P_t). Scales from 8% on dry fractured granite/duff up to 86% when "
-            "canyon soils reach saturation."
+            "Nonlinear fraction of net rainfall (after 1.0 mm/hr initial abstraction) converted into "
+            "catchment runoff. Scales from 3% on dry autumn fractured granite/duff up to 68% under "
+            "mid-winter regolith saturation."
         ),
     )
     hc3.metric(
@@ -2089,8 +2027,8 @@ def render_hydro_risk_section(
         f"Next 6h Peak: {s['peak_runoff_6hr_in_hr']:.2f} in/hr | P90 Rain: {s['peak_p90_1hr_24h_in']:.2f} in/hr",
         delta_color="off",
         help=(
-            "Maximum hourly effective surface runoff rate (R_t = C_t * QPF_t) expected over the "
-            "next 6 and 24 hours, paired with the 90th-percentile (P90) downpour intensity."
+            "Maximum hourly effective runoff rate expected over the next 6 and 24 hours, "
+            "paired with the 90th-percentile (P90) downpour intensity."
         ),
     )
     hc4.metric(
@@ -2099,9 +2037,9 @@ def render_hydro_risk_section(
         f"24h Peak: {s['peak_discharge_24hr_cfs']:.1f} CFS (P90: {s['peak_discharge_p90_24hr_cfs']:.0f} CFS)",
         delta_color="off",
         help=(
-            "Estimated discharge (cubic feet per second) routed through the 72 km^2 upper "
-            "Tassajara Creek watershed (Pine Ridge, Black Cone, Chews Ridge) using a 3-hour "
-            "steep-canyon kinematic unit hydrograph."
+            "Estimated discharge (CFS) routed through the 72 km^2 upper Tassajara Creek watershed "
+            "(Pine Ridge, Black Cone, Chews Ridge) using a mass-conserving 4-hour quickflow + "
+            "shallow subsurface interflow model."
         ),
     )
 
@@ -2109,17 +2047,22 @@ def render_hydro_risk_section(
     col_gauge, col_chart = st.columns([1.05, 2.95])
 
     with col_gauge:
-        gauge_max_in = max(3.2, round(float(s["projected_max_api_72h_in"]) * 1.25, 1))
+        yellow_api_in = YELLOW_API_MM / MM_PER_INCH
+        orange_api_in = ORANGE_API_MM / MM_PER_INCH
+        red_api_in = RED_API_EXTREME_MM / MM_PER_INCH
+        gauge_max_in = max(5.5, round(float(s["projected_max_api_72h_in"]) * 1.25, 1))
+        api_ref_24h_ago = float(s.get("api_24h_ago_in", s["api_in"]))
         fig_gauge = go.Figure(
             go.Indicator(
                 mode="gauge+number+delta",
                 value=float(s["api_in"]),
                 number={"suffix": " in", "font": {"size": 28}},
                 delta={
-                    "reference": float(s["projected_max_api_24h_in"]),
+                    "reference": api_ref_24h_ago,
                     "increasing": {"color": "#ef4444"},
                     "decreasing": {"color": "#10b981"},
-                    "valueformat": ".2f",
+                    "valueformat": "+.2f",
+                    "suffix": " in (24h)",
                 },
                 title={
                     "text": (
@@ -2137,19 +2080,10 @@ def render_hydro_risk_section(
                     "borderwidth": 1,
                     "bordercolor": "rgba(148, 163, 184, 0.38)",
                     "steps": [
-                        {"range": [0, YELLOW_API_MM / MM_PER_INCH], "color": "rgba(16, 185, 129, 0.25)"},
-                        {
-                            "range": [YELLOW_API_MM / MM_PER_INCH, ORANGE_API_MM / MM_PER_INCH],
-                            "color": "rgba(234, 179, 8, 0.28)",
-                        },
-                        {
-                            "range": [ORANGE_API_MM / MM_PER_INCH, RED_API_EXTREME_MM / MM_PER_INCH],
-                            "color": "rgba(249, 115, 22, 0.30)",
-                        },
-                        {
-                            "range": [RED_API_EXTREME_MM / MM_PER_INCH, gauge_max_in],
-                            "color": "rgba(239, 68, 68, 0.34)",
-                        },
+                        {"range": [0, yellow_api_in], "color": "rgba(16, 185, 129, 0.25)"},
+                        {"range": [yellow_api_in, orange_api_in], "color": "rgba(234, 179, 8, 0.28)"},
+                        {"range": [orange_api_in, red_api_in], "color": "rgba(249, 115, 22, 0.30)"},
+                        {"range": [red_api_in, gauge_max_in], "color": "rgba(239, 68, 68, 0.34)"},
                     ],
                     "threshold": {
                         "line": {"color": "#ef4444", "width": 3},
@@ -2176,7 +2110,6 @@ def render_hydro_risk_section(
         )
 
     with col_chart:
-        # Combine past 48h spin-up and next 72h projection for continuous hydrograph plot
         h_sub = hist_df.tail(48).copy() if not hist_df.empty else pd.DataFrame()
         p_sub = proj_df.head(72).copy() if not proj_df.empty else pd.DataFrame()
 
@@ -2252,7 +2185,7 @@ def render_hydro_risk_section(
                     y=p_sub["projected_api_p90_in"],
                     mode="lines",
                     line=dict(color="rgba(220, 38, 38, 0.75)", width=1.6, dash="dash"),
-                    name="Projected P90 Extreme API (in)",
+                    name="Projected P90 Storm API (in)",
                 ),
                 row=1,
                 col=1,
@@ -2323,22 +2256,22 @@ def render_hydro_risk_section(
                 secondary_y=True,
             )
 
-        # Add Advisory / Watch threshold lines on Panel 1
+        # Dynamically synced Advisory / Watch threshold lines on Panel 1
         fig_hydro.add_hline(
-            y=YELLOW_API_MM / MM_PER_INCH,
+            y=yellow_api_in,
             line_dash="dot",
             line_color="#d97706",
-            annotation_text="Yellow Advisory (1.00 in)",
+            annotation_text=f"Yellow Advisory ({yellow_api_in:.2f} in)",
             annotation_position="top left",
             row=1,
             col=1,
             secondary_y=False,
         )
         fig_hydro.add_hline(
-            y=ORANGE_API_MM / MM_PER_INCH,
+            y=orange_api_in,
             line_dash="dot",
             line_color="#ea580c",
-            annotation_text="Orange Watch (1.75 in)",
+            annotation_text=f"Orange Watch ({orange_api_in:.2f} in)",
             annotation_position="top right",
             row=1,
             col=1,
@@ -2394,12 +2327,12 @@ def render_hydro_risk_section(
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=2, col=1)
         fig_hydro.update_layout(
-            height=530,
-            margin=dict(t=128, b=30, l=50, r=55),
+            height=550,
+            margin=dict(t=142, b=30, l=50, r=55),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.16, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.18, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_hydro, use_container_width=True)
 
@@ -2407,38 +2340,8 @@ def render_hydro_risk_section(
         "Inspect 4-Tier Flood & Road Severity Matrix & Hourly Projected Hydrograph Table",
         expanded=False,
     ):
-        matrix_rows = [
-            {
-                "Alert Tier": "🟢 Tier 0 — GREEN (Normal)",
-                "Soil Saturation & Rain Triggers": "API < 1.00 in AND 24h Rain < 1.00 in AND 72h Rain < 1.50 in AND 1h Rate < 0.50 in/hr",
-                "Tassajara Creek Response": TIER_METADATA["GREEN"]["creek_status"],
-                "Tassajara Road Passability": TIER_METADATA["GREEN"]["road_status"],
-                "Operational Protocol": TIER_METADATA["GREEN"]["recommended_action"],
-            },
-            {
-                "Alert Tier": "🟡 Tier 1 — YELLOW (Advisory)",
-                "Soil Saturation & Rain Triggers": "API >= 1.00 in (25.4 mm) OR 24h Rain >= 1.00 in OR 72h Rain >= 1.50 in (Advance Storm Prep)",
-                "Tassajara Creek Response": TIER_METADATA["YELLOW"]["creek_status"],
-                "Tassajara Road Passability": TIER_METADATA["YELLOW"]["road_status"],
-                "Operational Protocol": TIER_METADATA["YELLOW"]["recommended_action"],
-            },
-            {
-                "Alert Tier": "🟠 Tier 2 — ORANGE (Watch / Road Risk)",
-                "Soil Saturation & Rain Triggers": "Imminent (<=6h) 1h Rain >= 0.50 in/hr (or P90 >= 0.75 in/hr) on primed soil (API >= 0.80 in) OR Active 24h Rain >= 2.00 in",
-                "Tassajara Creek Response": TIER_METADATA["ORANGE"]["creek_status"],
-                "Tassajara Road Passability": TIER_METADATA["ORANGE"]["road_status"],
-                "Operational Protocol": TIER_METADATA["ORANGE"]["recommended_action"],
-            },
-            {
-                "Alert Tier": "🔴 Tier 3 — RED (Warning / Road Closure)",
-                "Soil Saturation & Rain Triggers": "Imminent (<=6h) 1h Rain >= 1.00 in/hr (or P90 >= 1.25 in/hr on primed soil) OR 24h Rain >= 3.25 in / 72h >= 4.00 in on saturated soil (API >= 1.75 in)",
-                "Tassajara Creek Response": TIER_METADATA["RED"]["creek_status"],
-                "Tassajara Road Passability": TIER_METADATA["RED"]["road_status"],
-                "Operational Protocol": TIER_METADATA["RED"]["recommended_action"],
-            },
-        ]
         st.markdown("#### 1. TZMC Multi-Tier Flood & Road Washout Severity Matrix")
-        st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(get_severity_matrix_rows()), use_container_width=True, hide_index=True)
 
         if not proj_df.empty:
             st.markdown("#### 2. Hourly Projected Catchment Saturation & Routed Creek Hydrograph (Next 72 Hours)")
@@ -2454,7 +2357,7 @@ def render_hydro_risk_section(
                 "MOS QPF (in/hr)": (p_tbl["mos_qpf_mm"] / MM_PER_INCH).round(3),
                 "MOS P90 Rate (in/hr)": (p_tbl["mos_qpf_p90_mm"] / MM_PER_INCH).round(3),
                 "Projected API (in)": p_tbl["projected_api_in"].round(2),
-                "P90 Extreme API (in)": p_tbl["projected_api_p90_in"].round(2),
+                "P90 Storm API (in)": p_tbl["projected_api_p90_in"].round(2),
                 "Runoff Coeff C (%)": (p_tbl["projected_runoff_coeff"] * 100.0).round(1),
                 "Effective Runoff (in/hr)": p_tbl["projected_runoff_in_hr"].round(3),
                 "Expected Creek Q (CFS)": p_tbl["projected_discharge_cfs"].round(1),
@@ -2474,7 +2377,6 @@ def render_layman_forecast_view(
     hydro_bundle: dict = None,
 ):
     """Renders the intuitive, jargon-free Everyday Weather Forecast Page for TZMC."""
-    # Guarantee future_fc_df only contains hours >= now_hour_utc and has no DST duplicates
     future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
 
     if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle:
@@ -2648,7 +2550,7 @@ def render_layman_forecast_view(
 
     st.markdown("")
 
-    # 2. Plain-English Canyon Advisories (Freeze, Road, & Trail Conditions)
+    # 2. Plain-English Canyon Advisories (Synced to Hydrological Severity Tier)
     if not future_fc_df.empty:
         next_48 = future_fc_df.head(48).copy()
         next_72 = future_fc_df.head(72).copy()
@@ -2663,7 +2565,7 @@ def render_layman_forecast_view(
             float(get_col(next_72, "mos_qpf_mm", get_col(next_72, "nws_qpf_1hr_mm", 0.0)).sum())
         )
         p90_rain_72_in = mm_to_in(
-            float(get_col(next_72, "mos_qpf_p90_mm", rain_72_in * 25.4 * 1.5).sum())
+            float(get_col(next_72, "mos_qpf_p90_mm", rain_72_in * 25.4 * 1.45).sum())
         )
         max_pop_72 = float(
             get_col(next_72, "mos_pop_pct", get_col(next_72, "nws_pop_pct", 0.0)).max()
@@ -2690,20 +2592,34 @@ def render_layman_forecast_view(
                 )
 
         with adv2:
-            if rain_72_in >= 1.0 or p90_rain_72_in >= 1.75:
-                st.warning(
-                    f"🌧️ **Tassajara Road & Creek Advisory:** **{rain_72_in:.2f} in** of rain "
-                    f"expected over the next 3 days (up to **{p90_rain_72_in:.2f} in** in heavier "
-                    f"downpours). Expect muddy grades on Tassajara Rd and rising creek levels."
+            h_code = (
+                hydro_bundle["summary"]["alert_code"]
+                if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle
+                else "GREEN"
+            )
+            h_road = (
+                hydro_bundle["summary"]["road_status"]
+                if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle
+                else ""
+            )
+            if h_code == "RED":
+                st.error(
+                    f"🔴 **ROAD CLOSURE / FLASH FLOOD WARNING:** **{rain_72_in:.2f} in** forecast "
+                    f"(P90: **{p90_rain_72_in:.2f} in**). {h_road}"
                 )
-            elif rain_72_in >= 0.10 or max_pop_72 >= 40:
+            elif h_code == "ORANGE":
+                st.warning(
+                    f"🟠 **Tassajara Road & Creek Watch:** **{rain_72_in:.2f} in** forecast over 3 days "
+                    f"(P90: **{p90_rain_72_in:.2f} in**). {h_road}"
+                )
+            elif h_code == "YELLOW" or rain_72_in >= 0.10 or max_pop_72 >= 40:
                 st.info(
-                    f"🌦️ **Light Rain Possible (Next 3 Days):** Up to **{rain_72_in:.2f} in** "
-                    f"of rain forecast ({max_pop_72:.0f}% chance). Roads should remain passable."
+                    f"🟡 **Wet Road Advisory (Next 3 Days):** **{rain_72_in:.2f} in** forecast "
+                    f"({max_pop_72:.0f}% chance). Expect damp to muddy grades on Tassajara Rd."
                 )
             else:
                 st.success(
-                    f"🚗 **Dry Road & Trail Conditions:** No significant rain expected over "
+                    f"🟢 **Dry Road & Trail Conditions:** No significant rain expected over "
                     f"the next 72 hours (Rain chance {max_pop_72:.0f}%)."
                 )
 
@@ -2744,7 +2660,7 @@ def render_layman_forecast_view(
 
     st.markdown("---")
 
-    # 3. Next 24 Hours at a Glance (3-Hour Interval Cards)
+    # 3. Next 24 Hours at a Glance (3-Hour Interval Cards with Astronomical Solar State)
     if not future_fc_df.empty:
         st.subheader("Next 24 Hours at a Glance (Every 3 Hours)")
         fc_24 = future_fc_df.head(24).copy()
@@ -2770,9 +2686,10 @@ def render_layman_forecast_view(
         cols_24 = st.columns(len(step_rows))
         for idx_col, (_, r) in enumerate(step_rows.iterrows()):
             t_loc = r["valid_local"]
-            hr_num = t_loc.hour
-            is_day_hr = 7 <= hr_num <= 18
-            in_sh_hr = 15 <= hr_num <= 18
+            t_utc = t_loc.tz_convert("UTC").to_pydatetime()
+            hr_solar_state, hr_solar_el, _, _ = compute_canyon_solar_state(t_utc)
+            is_day_hr = hr_solar_el > 0.0
+            in_sh_hr = "Shadow" in hr_solar_state
             ic, lbl = get_weather_icon_and_label(
                 float(r["pop_val"]),
                 float(r["qpf_in"]),
@@ -2781,7 +2698,7 @@ def render_layman_forecast_view(
                 is_daytime=is_day_hr,
                 in_canyon_shade=in_sh_hr,
             )
-            time_lbl = t_loc.strftime("%-I %p") if hasattr(t_loc, "strftime") else str(hr_num)
+            time_lbl = t_loc.strftime("%-I %p") if hasattr(t_loc, "strftime") else str(t_loc.hour)
             day_tag = t_loc.strftime("%a")
             pop_int = int(r["pop_val"])
             pop_badge = f"💧 {pop_int}%" if pop_int >= 15 else "Dry"
@@ -2946,10 +2863,13 @@ def render_layman_forecast_view(
         if obs_df is not None and not obs_df.empty and "valid_time_utc" in obs_df.columns:
             today_local_date = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ).date()
             obs_today = obs_df.copy()
-            obs_today["valid_local"] = (
-                pd.to_datetime(obs_today["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
-            )
-            obs_today = obs_today[obs_today["valid_local"].dt.date == today_local_date].copy()
+            obs_today["_hr_utc"] = pd.to_datetime(obs_today["valid_time_utc"], utc=True).dt.floor("h")
+            obs_today["valid_local"] = obs_today["_hr_utc"].dt.tz_convert(LOCAL_TZ)
+            # Only prepend strictly PAST hours today (< now_hour_utc) so current hour retains live MOS PoP/QPF
+            obs_today = obs_today[
+                (obs_today["valid_local"].dt.date == today_local_date)
+                & (obs_today["_hr_utc"] < pd.Timestamp(now_hour_utc).floor("h"))
+            ].copy()
             if not obs_today.empty:
                 obs_today["corrected_temp_c"] = obs_today["temp_c"]
                 obs_today["corrected_temp_p10_c"] = obs_today["temp_c"]
@@ -2962,11 +2882,11 @@ def render_layman_forecast_view(
                     obs_today, "wind_gust_ms", get_col(obs_today, "wind_speed_ms", 0.0)
                 )
                 obs_today["nws_wind_speed_ms"] = get_col(obs_today, "wind_speed_ms", 0.0)
-                d_df = pd.concat([obs_today, d_df], ignore_index=True, sort=False)
+                d_df = pd.concat([obs_today.drop(columns=["_hr_utc"]), d_df], ignore_index=True, sort=False)
                 d_df["_hr_utc"] = pd.to_datetime(d_df["valid_time_utc"], utc=True).dt.floor("h")
                 d_df = (
                     d_df.sort_values("_hr_utc")
-                    .drop_duplicates(subset=["_hr_utc"], keep="first")
+                    .drop_duplicates(subset=["_hr_utc"], keep="last")
                     .drop(columns=["_hr_utc"])
                     .reset_index(drop=True)
                 )
@@ -3084,19 +3004,20 @@ def render_layman_forecast_view(
 now_utc = datetime.now(timezone.utc)
 now_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0)
 
-ref_dict, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
+ref_dict, ref_hist_df, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
 future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
 model_diag = compute_model_diagnostics_and_importances(verify_df)
 hydro_bundle = compute_dashboard_hydro_state(
     obs_df=obs_df,
     future_fc_df=future_fc_df,
     ref_dict=ref_dict,
+    ref_hist_df=ref_hist_df,
 )
 
 solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_utc)
 
 active_model_name = (
-    "MOS_GBM_v2_HYDRO (5-Station Santa Lucia Spatial + Hurdle PoP/QPF)"
+    "MOS_GBM_v3_HYDRO (5-Station Santa Lucia Spatial + Hurdle PoP/QPF)"
     if MODEL_PATH.exists()
     else "TOPO_HYDRO_PHYSICS (Analytical Baseline)"
 )
@@ -3110,7 +3031,7 @@ with st.sidebar:
     st.metric(
         "Model Artifact",
         "Loaded (v1)" if model_diag["model_loaded"] else "Physics Mode",
-        f"{len(model_diag['feature_names']) or 25} physical predictors",
+        f"{len(model_diag['feature_names']) or 30} physical predictors",
         delta_color="off",
         help="Indicates whether models/tassajara_mos_v1.joblib is loaded in memory.",
     )
@@ -3135,7 +3056,7 @@ with st.sidebar:
         f"{hydro_bundle['summary']['icon']} {hydro_bundle['summary']['alert_code']} (T{hydro_bundle['summary']['alert_tier']})",
         f"API: {hydro_bundle['summary']['api_in']:.2f} in | C: {hydro_bundle['summary']['runoff_coeff_pct']:.0f}%",
         delta_color="off",
-        help="Active 4-tier Flood & Tassajara Road Washout status driven by Antecedent Precipitation Index (API) and MOS QPF/P90.",
+        help="Active 4-tier Flood & Tassajara Road Washout status driven by multi-day API and MOS QPF/P90.",
     )
     st.markdown("---")
     st.markdown(
@@ -3180,6 +3101,7 @@ ref_banner_str = (
         f"{stid} ({int(meta['elev_m'])}m): "
         + (
             f"{c_to_f(safe_float(ref_dict.get(stid, {}).get('temp_c'), np.nan)):.0f}°F"
+            + ("" if ref_dict.get(stid, {}).get("online") else "*")
             if pd.notna(ref_dict.get(stid, {}).get("temp_c"))
             else "Fallback"
         )
@@ -3191,7 +3113,7 @@ st.markdown(
     f'<div class="met-subbanner">'
     f'<b>PRIMARY ISS:</b> Stone Office Davis Vantage Pro2 '
     f'(ID 36966 | 36.2337°N, 121.5501°W | 485 m / 1,590 ft MSL) &nbsp;&bull;&nbsp; '
-    f'<b>SANTA LUCIA REFS ({len(online_refs)}/5 ACTIVE):</b> {ref_banner_str}<br>'
+    f'<b>SANTA LUCIA REFS ({len(online_refs)}/5 LIVE):</b> {ref_banner_str}<br>'
     f'<b>LAST OBSERVATION:</b> {last_obs_str} &nbsp;&bull;&nbsp; '
     f'<b>NWS/MOS INIT:</b> {fc_issue_str} &nbsp;&bull;&nbsp; '
     f'<b>SOLAR GEOMETRY:</b> {solar_state} '
@@ -3346,7 +3268,6 @@ else:
         vent_temp_c = safe_float(ref_dict.get("VTCC1", {}).get("temp_c"), np.nan)
         hast_temp_c = safe_float(ref_dict.get("CAHC1", {}).get("temp_c"), np.nan)
         arroyo_temp_c = safe_float(ref_dict.get("ASRC1", {}).get("temp_c"), np.nan)
-        bigsur_temp_c = safe_float(ref_dict.get("PPSC1", {}).get("temp_c"), np.nan)
 
         lapse_chews = (
             -1.0 * (chews_temp_c - temp_c) / ((ELEV_CHEWS_M - ELEV_TASS_M) / 1000.0)
@@ -3396,9 +3317,7 @@ else:
             delta_color="off",
             help=(
                 "Ambient dry-bulb air temperature recorded by the radiation-shielded thermistor "
-                "on the Stone Office Davis Vantage Pro2 ISS (Station 36966, 485 m / 1,590 ft MSL). "
-                "Strongly modulated by afternoon canyon-wall shading (32 deg SW horizon) and "
-                "nocturnal katabatic cold-air drainage along Tassajara Creek."
+                "on the Stone Office Davis Vantage Pro2 ISS (Station 36966, 485 m / 1,590 ft MSL)."
             ),
         )
         r1c2.metric(
@@ -3406,36 +3325,21 @@ else:
             f"{rh_pct:.0f} % RH",
             f"Dewpoint: {dew_f:.1f} °F ({dew_c:.1f} °C)",
             delta_color="off",
-            help=(
-                "Relative Humidity (RH %) measures the ratio of actual water vapor pressure to "
-                "saturation vapor pressure. Dewpoint (F/C) is the temperature to which air must "
-                "cool at constant pressure to reach saturation (100% RH), indicating absolute "
-                "boundary-layer moisture content."
-            ),
+            help="Relative Humidity (RH %) and Dewpoint temperature inside Tassajara Canyon.",
         )
         r1c3.metric(
             "Wet-Bulb & Vapor Pressure Deficit",
             f"{wetbulb_f:.1f} °F WB",
             f"VPD: {vpd_kpa:.2f} kPa ({'Arid / Virga Risk' if vpd_kpa >= 1.5 else 'Moist / Moderate'})",
             delta_color="off",
-            help=(
-                "Wet-Bulb Temperature (F WB), computed via the Stull (2011) psychrometric equation, "
-                "represents the lowest temperature achievable by evaporative cooling. Vapor Pressure "
-                "Deficit (VPD in kPa, via Tetens formula es - ea) quantifies atmospheric drying demand: "
-                "VPD >= 1.5 kPa accelerates wildfire fuel drying and evaporates light pre-frontal rain as virga."
-            ),
+            help="Stull (2011) Wet-Bulb Temperature and Tetens Vapor Pressure Deficit (kPa).",
         )
         r1c4.metric(
             "Anemometer Wind Vector",
             f"{wind_spd_mph:.1f} mph ({wind_card})",
             f"10m Peak Gust: {wind_gst_mph:.1f} mph",
             delta_color="off",
-            help=(
-                "10-minute scalar average wind speed (mph), prevailing cardinal direction, and "
-                "peak 10-minute wind gust measured at the Stone Office roof anemometer. Daytime "
-                "heating drives up-canyon (anabatic WNW/ESE) flows, whereas nocturnal radiational "
-                "cooling drives down-canyon (katabatic) drainage."
-            ),
+            help="10-minute scalar average wind speed, prevailing direction, and peak gust at Stone Office.",
         )
 
         r2c1, r2c2, r2c3, r2c4 = st.columns(4)
@@ -3444,47 +3348,28 @@ else:
             f"{mslp_inhg:.2f} inHg ({mslp_hpa:.1f} hPa)",
             ptrend_label,
             delta_color="off",
-            help=(
-                "Mean Sea-Level Pressure (MSLP in inHg and hPa/mb) reduced from station elevation "
-                "(485 m MSL), paired with the 3-hour barometric tendency (dP/dt). Rapid pressure "
-                "falls (<= -1.5 hPa/3h) signal approaching Pacific cold fronts or atmospheric rivers "
-                "capable of overcoming the canyon rain shadow."
-            ),
+            help="Mean Sea-Level Pressure (MSLP) and continuous 3-hour barometric tendency (hPa/3h).",
         )
         r2c2.metric(
             "Precipitation & 72h MOS QPF",
             f"{rain_24_in:.2f} in ({rain_24_mm:.1f} mm)",
             rain_sub_str,
             delta_color="off",
-            help=(
-                "Rolling 24-hour observed rainfall accumulation from the Stone Office 0.01-inch "
-                "(0.254 mm) tipping-bucket rain gauge. The delta line displays the current 1-hour "
-                "rainfall rate alongside the 72-hour MOS-calibrated Quantitative Precipitation "
-                "Forecast (QPF) and peak Probability of Precipitation (PoP)."
-            ),
+            help="Rolling 24-hour observed rainfall from Stone Office tipping bucket plus 72h MOS QPF.",
         )
         r2c3.metric(
             "Crest Lapse Rate (CHWC1 / VTCC1 → TZMC)",
             lapse_str,
             stability_state,
             delta_color="off",
-            help=(
-                "Environmental temperature lapse rate across the upper Santa Lucia column between "
-                "Chews Ridge (CHWC1, 1,536 m) / Ventana Cone (VTCC1, 1,453 m) and Tassajara (485 m). "
-                "Negative values (Gamma < 0 C/km) indicate a nocturnal thermal inversion (cold-air "
-                "pool trapped in the gorge); Gamma > 6.5 C/km indicates a well-mixed boundary layer."
-            ),
+            help="Environmental temperature lapse rate between Santa Lucia crests and Tassajara (485 m).",
         )
         r2c4.metric(
             "Gorge Drainage & Coastal Gradient",
             confinement_str,
             ref_sub_str,
             delta_color="off",
-            help=(
-                "Temperature differential between the inner Tassajara gorge (485 m), the Arroyo Seco "
-                "gorge outlet (ASRC1, 268 m MSL, 6.3 km E), Hastings Reservation (CAHC1, 546 m), and "
-                "the windward Big Sur coastal slope (PPSC1, 108 m)."
-            ),
+            help="Thermal differential between Tassajara gorge (485 m), ASRC1 (268 m), CAHC1 (546 m), and PPSC1 (108 m).",
         )
 
         with st.expander(
@@ -3514,7 +3399,7 @@ else:
                     "Station Name": meta["name"],
                     "Boundary Role": meta["role"],
                     "Elev (m / ft)": f"{int(meta['elev_m'])} m ({int(round(meta['elev_m'] * 3.28084))} ft)",
-                    "Status": "Online" if d.get("online") else "Fallback / Stale",
+                    "Status": "Online" if d.get("online") else "Model Fallback / Stale",
                     "Temp (°F / °C)": (
                         f"{c_to_f(t_val_c):.1f} °F ({t_val_c:.1f} °C)"
                         if not math.isnan(t_val_c)
@@ -3629,10 +3514,7 @@ else:
             f"± {nws_mae_f:.2f} °F",
             f"RMSE: ± {nws_rmse_f:.2f} °F | Mean Bias: {nws_bias_f:+.2f} °F",
             delta_color="off",
-            help=(
-                "Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and Mean Bias of "
-                "the uncorrected 2.5 km NWP/NWS grid forecast relative to Stone Office observations."
-            ),
+            help="MAE, RMSE, and Mean Bias of the uncorrected 2.5 km NWP/NWS grid forecast.",
         )
         s2.metric(
             "Tassajara MOS Error (MAE)",
@@ -3813,7 +3695,7 @@ else:
             specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": True}]],
             subplot_titles=(
                 "Temperature & Dewpoint Profile (°F): Stone Office Actuals vs. MOS Quantile Fan (P10–P90) vs. Raw NWS",
-                "Boundary-Layer Kinematics & Moisture: 10m Peak Wind Gusts (mph) & Relative Humidity (%)",
+                "Boundary-Layer Kinematics & Moisture: Observed Canyon Gust (485m) vs. Forecast Ridge-Grid Gust (880m) & RH (%)",
                 "Canyon Hydrological Outlook: MOS Calibrated QPF (in/hr), P90 Extreme Rate, Observed Rain & PoP (%)",
             ),
         )
@@ -3917,14 +3799,18 @@ else:
                 col=1,
             )
 
-        gust_series_ms = (
-            get_col(combined_df, "actual_wind_gust_ms", np.nan)
-            .combine_first(get_col(combined_df, "corrected_wind_gust_ms", np.nan))
+        # Explicitly separate observed 485m canyon-floor gusts from 880m ridge-grid forecast gusts
+        obs_gust_mph = get_col(combined_df, "actual_wind_gust_ms", np.nan) * 2.23694
+        fc_gust_ms = (
+            get_col(combined_df, "corrected_wind_gust_ms", np.nan)
             .combine_first(get_col(combined_df, "nws_wind_gust_ms", np.nan))
             .combine_first(get_col(combined_df, "nws_wind_speed_ms", 0.0) * 1.35)
-            .fillna(0.0)
         )
-        gust_mph_series = gust_series_ms * 2.23694
+        fc_gust_mph = np.where(
+            combined_df["_sort_dt_utc"] >= pd.Timestamp(now_hour_utc).floor("h"),
+            fc_gust_ms * 2.23694,
+            np.nan,
+        )
 
         rh_series = (
             get_col(combined_df, "actual_rh_pct", np.nan)
@@ -3936,11 +3822,24 @@ else:
         fig.add_trace(
             go.Scatter(
                 x=combined_df["valid_local"],
-                y=gust_mph_series.round(1),
+                y=obs_gust_mph.round(1),
                 mode="lines",
-                line=dict(color="#d97706", width=2.0),
-                name="Peak Wind Gust (mph)",
-                hovertemplate="<b>Peak Gust</b>: %{y:.1f} mph<extra></extra>",
+                line=dict(color="#059669", width=2.0),
+                name="Observed Canyon Gust (485m, mph)",
+                hovertemplate="<b>Observed Canyon Gust</b>: %{y:.1f} mph<extra></extra>",
+            ),
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=combined_df["valid_local"],
+                y=pd.Series(fc_gust_mph).round(1),
+                mode="lines",
+                line=dict(color="#d97706", width=2.0, dash="dash"),
+                name="Forecast Ridge-Grid Gust (880m NWP, mph)",
+                hovertemplate="<b>Forecast 880m Gust</b>: %{y:.1f} mph<extra></extra>",
             ),
             row=2,
             col=1,
@@ -3965,7 +3864,7 @@ else:
             get_col(combined_df, "mos_qpf_mm", get_col(combined_df, "nws_qpf_1hr_mm", 0.0)) / 25.4
         ).round(3)
         mos_p90_rain_in = (
-            get_col(combined_df, "mos_qpf_p90_mm", mos_rain_in * 25.4 * 1.5) / 25.4
+            get_col(combined_df, "mos_qpf_p90_mm", mos_rain_in * 25.4 * 1.45) / 25.4
         ).round(3)
         actual_rain_in = (get_col(combined_df, "actual_precip_mm", 0.0) / 25.4).round(3)
 
@@ -4079,7 +3978,13 @@ else:
             )
         )
         rain_y_top = max(0.20, round(max_rain_val * 1.25, 2))
-        max_gust_val = float(max(gust_mph_series.max(), 15.0))
+        max_gust_val = float(
+            np.nanmax([
+                float(obs_gust_mph.max()) if obs_gust_mph.notna().any() else 0.0,
+                float(np.nanmax(fc_gust_mph)) if np.isfinite(fc_gust_mph).any() else 0.0,
+                15.0,
+            ])
+        )
 
         fig.update_yaxes(title_text="Temperature (°F)", gridcolor=GRID_RGBA, row=1, col=1)
         fig.update_yaxes(
@@ -4125,13 +4030,13 @@ else:
         fig.update_xaxes(title_text="Local Time (America/Los_Angeles)", row=3, col=1)
 
         fig.update_layout(
-            height=940,
-            margin=dict(t=115, b=40, l=55, r=55),
+            height=960,
+            margin=dict(t=135, b=40, l=55, r=55),
             hovermode="x unified",
             barmode="overlay",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -4146,10 +4051,12 @@ else:
         if not obs_df.empty and "valid_time_utc" in obs_df.columns:
             today_local_date = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ).date()
             obs_today_sci = obs_df.copy()
-            obs_today_sci["valid_local"] = (
-                pd.to_datetime(obs_today_sci["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
-            )
-            obs_today_sci = obs_today_sci[obs_today_sci["valid_local"].dt.date == today_local_date].copy()
+            obs_today_sci["_hr_utc"] = pd.to_datetime(obs_today_sci["valid_time_utc"], utc=True).dt.floor("h")
+            obs_today_sci["valid_local"] = obs_today_sci["_hr_utc"].dt.tz_convert(LOCAL_TZ)
+            obs_today_sci = obs_today_sci[
+                (obs_today_sci["valid_local"].dt.date == today_local_date)
+                & (obs_today_sci["_hr_utc"] < pd.Timestamp(now_hour_utc).floor("h"))
+            ].copy()
             if not obs_today_sci.empty:
                 obs_today_sci["corrected_temp_c"] = obs_today_sci["temp_c"]
                 obs_today_sci["corrected_temp_p10_c"] = obs_today_sci["temp_c"]
@@ -4178,11 +4085,11 @@ else:
                 )
                 obs_today_sci["nws_wind_gust_ms"] = obs_today_sci["corrected_wind_gust_ms"]
                 obs_today_sci["nws_wind_speed_ms"] = get_col(obs_today_sci, "wind_speed_ms", 0.0)
-                daily_df = pd.concat([obs_today_sci, daily_df], ignore_index=True, sort=False)
+                daily_df = pd.concat([obs_today_sci.drop(columns=["_hr_utc"]), daily_df], ignore_index=True, sort=False)
                 daily_df["_hr_utc"] = pd.to_datetime(daily_df["valid_time_utc"], utc=True).dt.floor("h")
                 daily_df = (
                     daily_df.sort_values("_hr_utc")
-                    .drop_duplicates(subset=["_hr_utc"], keep="first")
+                    .drop_duplicates(subset=["_hr_utc"], keep="last")
                     .drop(columns=["_hr_utc"])
                     .reset_index(drop=True)
                 )
@@ -4200,7 +4107,7 @@ else:
         daily_df["_mos_pop"] = get_col(daily_df, "mos_pop_pct", daily_df["_raw_pop"])
         daily_df["_raw_qpf"] = get_col(daily_df, "nws_qpf_1hr_mm", 0.0)
         daily_df["_mos_qpf"] = get_col(daily_df, "mos_qpf_mm", daily_df["_raw_qpf"])
-        daily_df["_mos_qpf_p90"] = get_col(daily_df, "mos_qpf_p90_mm", daily_df["_mos_qpf"] * 1.5)
+        daily_df["_mos_qpf_p90"] = get_col(daily_df, "mos_qpf_p90_mm", daily_df["_mos_qpf"] * 1.45)
         daily_df["_rh"] = get_col(daily_df, "corrected_rh_pct", np.nan).combine_first(
             get_col(daily_df, "nws_rh_pct", 45.0)
         )
@@ -4323,8 +4230,8 @@ else:
                 shared_yaxes=False,
                 horizontal_spacing=0.26,
                 subplot_titles=(
-                    "Top 12 Thermal MOS Predictors (% RMSE Share)",
-                    "Top 12 Hydrological Hurdle Predictors (% QPF/PoP Share)",
+                    "Top 12 Thermal MOS Predictors (%)",
+                    "Top 12 Hydrological Predictors (%)",
                 ),
             )
             fig_imp.add_trace(
@@ -4359,7 +4266,7 @@ else:
             fig_imp.update_xaxes(title_text="Hydrological Share (%)", gridcolor=GRID_RGBA, row=1, col=2)
             fig_imp.update_layout(
                 height=480,
-                margin=dict(t=55, b=40, l=20, r=25),
+                margin=dict(t=55, b=40, l=20, r=35),
                 plot_bgcolor=PLOT_BG_RGBA,
                 paper_bgcolor="rgba(0,0,0,0)",
                 showlegend=False,

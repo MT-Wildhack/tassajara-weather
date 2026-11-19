@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-ingest_weather.py
+ingest_weather.py (v2.0 — Patched for Credential Safety, Retry/Backoff,
+Discrete dst=2 Barometric Trend Filtering, True North Wind Preservation,
+Synoptic 1-Hr Rain Safety & Reference Source Provenance)
+
 Fetches ground-truth observations from the Tassajara Stone Office Davis Vantage Pro2
 via WeatherLink API v2, pulls the 5-station Santa Lucia regional reference network
 (Chews Ridge CHWC1, Hastings CAHC1, Arroyo Seco ASRC1, Big Sur PPSC1, Ventana Cone VTCC1)
@@ -9,9 +12,11 @@ with per-station fault isolation, and performs spatial anomaly & lapse-rate diag
 
 import os
 import math
+import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
+from zoneinfo import ZoneInfo
 import requests
 
 logging.basicConfig(
@@ -20,15 +25,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TassajaraIngest")
 
+
+def _get_secret(env_key: str) -> str:
+    """Reads a credential from environment variables, falling back to Streamlit secrets if present."""
+    val = (os.getenv(env_key) or "").strip()
+    if val:
+        return val
+    try:
+        import streamlit as st
+        s_val = st.secrets.get(env_key, "")
+        return str(s_val).strip() if s_val else ""
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
-# Configuration & Credentials (Immune to empty-string "" env vars in CI)
+# Configuration & Credentials (Loaded strictly from Env Vars / Secrets)
 # ---------------------------------------------------------------------------
-WEATHERLINK_API_KEY = (os.getenv("WL_API_KEY") or "").strip() or "tigkhjhsweahdrae2cl0uenfuws3kv8k"
-WEATHERLINK_API_SECRET = (os.getenv("WL_API_SECRET") or "").strip() or "ffnphp69pdbsqwsahkdewvctewmxagwt"
+WEATHERLINK_API_KEY = _get_secret("WL_API_KEY")
+WEATHERLINK_API_SECRET = _get_secret("WL_API_SECRET")
 WEATHERLINK_BASE_URL = "https://api.weatherlink.com/v2"
 
 # Synoptic Data (MesoWest) public token for RAWS/CNRFC/HADS stations
-SYNOPTIC_API_TOKEN = (os.getenv("SYNOPTIC_TOKEN") or "").strip() or "ee99ea4962204176a8fccdd037b046d7"
+SYNOPTIC_API_TOKEN = _get_secret("SYNOPTIC_TOKEN")
 
 # Primary Tassajara Station ID (Stone Office Vantage Pro2)
 DEFAULT_TASSAJARA_STATION_ID = 36966
@@ -215,21 +234,45 @@ def extract_record_wind(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[
 class WeatherLinkV2Client:
     """Client for Davis WeatherLink v2 API using X-Api-Secret header authentication."""
 
-    def __init__(self, api_key: str = WEATHERLINK_API_KEY, api_secret: str = WEATHERLINK_API_SECRET):
-        self.api_key = (api_key or "").strip() or WEATHERLINK_API_KEY
-        self.api_secret = (api_secret or "").strip() or WEATHERLINK_API_SECRET
+    def __init__(self, api_key: str = "", api_secret: str = ""):
+        self.api_key = (api_key or "").strip() or _get_secret("WL_API_KEY")
+        self.api_secret = (api_secret or "").strip() or _get_secret("WL_API_SECRET")
         self.session = requests.Session()
         self.session.headers.update({
             "X-Api-Secret": self.api_secret,
             "Accept": "application/json",
         })
 
+    def _get_with_retry(self, url: str, params: dict, timeout: int = 15, retries: int = 3):
+        """Issues a GET request with exponential backoff on transient 429/5xx errors."""
+        if not self.api_key or not self.api_secret:
+            raise ValueError(
+                "WeatherLink credentials missing: set WL_API_KEY and WL_API_SECRET in environment or Streamlit secrets."
+            )
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(url, params=params, timeout=timeout)
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"WeatherLink GET failed for {url}")
+
     def get_station_id(self) -> int:
         """Discovers the active station_id associated with the API key, defaulting to 36966."""
         url = f"{WEATHERLINK_BASE_URL}/stations"
         try:
-            resp = self.session.get(url, params={"api-key": self.api_key}, timeout=15)
-            resp.raise_for_status()
+            resp = self._get_with_retry(url, params={"api-key": self.api_key}, timeout=15)
             stations = resp.json().get("stations", [])
             if stations:
                 for stn in stations:
@@ -260,8 +303,7 @@ class WeatherLinkV2Client:
             station_id = self.get_station_id()
 
         url = f"{WEATHERLINK_BASE_URL}/current/{station_id}"
-        resp = self.session.get(url, params={"api-key": self.api_key}, timeout=15)
-        resp.raise_for_status()
+        resp = self._get_with_retry(url, params={"api-key": self.api_key}, timeout=15)
         payload = resp.json()
 
         parsed: Dict[str, Any] = {
@@ -273,7 +315,7 @@ class WeatherLinkV2Client:
             "rh_pct": None,
             "wind_speed_ms": 0.0,
             "wind_gust_ms": 0.0,
-            "wind_dir_deg": 0.0,
+            "wind_dir_deg": None,
             "mslp_hpa": None,
             "pressure_trend_hpa": None,
             "precip_1hr_mm": 0.0,
@@ -297,7 +339,7 @@ class WeatherLinkV2Client:
                 continue
             latest = data_records[0]
 
-            # 1. Barometric Pressure (often on Console/Barometer sensor dst 3, 9, 12, 19, 20)
+            # 1. Barometric Pressure (often on Console/Barometer sensor dst 2, 3, 9, 12, 19, 20)
             bar_sl = first_not_none(
                 latest.get("bar_sea_level"),
                 latest.get("bar"),
@@ -307,11 +349,12 @@ class WeatherLinkV2Client:
             if bar_sl is not None:
                 parsed["mslp_hpa"] = inhg_to_hpa(bar_sl)
                 btrend = first_not_none(latest.get("bar_trend"), latest.get("bar_trend_3_hr"))
-                if btrend is not None:
+                # Legacy Davis dst=2 bar_trend is a discrete 5-state code (-60,-20,0,20,60),
+                # not continuous inHg; leave None so run_hourly_mos_pipeline computes true 3h MSLP delta.
+                if btrend is not None and dst != 2:
                     bt_val = float(btrend)
-                    if abs(bt_val) > 2.0:
-                        bt_val = bt_val / 1000.0
-                    parsed["pressure_trend_hpa"] = inhg_to_hpa(bt_val)
+                    if abs(bt_val) <= 2.0:
+                        parsed["pressure_trend_hpa"] = inhg_to_hpa(bt_val)
 
             # Skip strictly indoor/health/AirLink AQI sensors for outdoor weather metrics
             stype = int(sensor.get("sensor_type") or 0)
@@ -358,14 +401,14 @@ class WeatherLinkV2Client:
                 if hum is not None:
                     parsed["rh_pct"] = float(hum)
 
-            # 3. Wind Speed, Gust & Direction
+            # 3. Wind Speed, Gust & Direction (preserves True North 0.0 deg vs None)
             spd_ms, gst_ms, dir_deg = extract_record_wind(latest)
             if spd_ms is not None and spd_ms > parsed["wind_speed_ms"]:
                 parsed["wind_speed_ms"] = spd_ms
             if gst_ms is not None and gst_ms > parsed["wind_gust_ms"]:
                 parsed["wind_gust_ms"] = gst_ms
             parsed["wind_gust_ms"] = max(parsed["wind_gust_ms"], parsed["wind_speed_ms"])
-            if dir_deg is not None and dir_deg > 0.0:
+            if dir_deg is not None and 0.0 <= dir_deg <= 360.0:
                 parsed["wind_dir_deg"] = dir_deg
 
             # 4. Rainfall (1-Hour, 24-Hour / Daily, Storm, and Rate)
@@ -541,6 +584,8 @@ def _empty_reference_record(stid: str, status: str = "OFFLINE") -> Dict[str, Any
         "role": meta.get("role", "Reference"),
         "valid_time_utc": None,
         "online": False,
+        "is_model_fallback": False,
+        "source": "OFFLINE",
         "status": status,
         "temp_c": None,
         "rh_pct": None,
@@ -652,7 +697,7 @@ def _fetch_openmeteo_reference_batch(stids: List[str]) -> Dict[str, Dict[str, An
                 "rh_pct": round(float(cur["relative_humidity_2m"]), 1) if cur.get("relative_humidity_2m") is not None else None,
                 "wind_speed_ms": round(float(cur.get("wind_speed_10m") or 0.0), 2),
                 "wind_gust_ms": round(float(cur.get("wind_gusts_10m") or cur.get("wind_speed_10m") or 0.0), 2),
-                "wind_dir_deg": round(float(cur.get("wind_direction_10m") or 0.0), 1),
+                "wind_dir_deg": round(float(cur.get("wind_direction_10m")), 1) if cur.get("wind_direction_10m") is not None else None,
                 "precip_1hr_mm": round(max(0.0, float(cur.get("precipitation") or 0.0)), 2),
             }
         except Exception:
@@ -666,9 +711,9 @@ def fetch_regional_reference_stations(
     """
     Pulls latest observations for the 5-station Santa Lucia reference array
     (CHWC1, CAHC1, ASRC1, PPSC1, VTCC1) using a 3-tier high-availability cascade:
-      1. Synoptic Data (MesoWest) v2 API (with automatic Account Key -> Token resolution)
+      1. Synoptic Data (MesoWest) v2 API (strictly 1-hr precip; never water-year precip_accum)
       2. NOAA/NWS Observation API (api.weather.gov/stations/{stid}/observations/latest)
-      3. Open-Meteo HRRR/GFS Real-Time Boundary Analysis at exact station coordinates & elevation
+      3. Open-Meteo HRRR/GFS Boundary Analysis (explicitly tagged OPENMETEO_SYNTH / online=False)
     """
     if stids is None:
         stids = list(REFERENCE_STATIONS.keys())
@@ -680,30 +725,31 @@ def fetch_regional_reference_stations(
     }
 
     # --- Tier 1: Synoptic Data v2 API ---
-    url = "https://api.synopticdata.com/v2/stations/latest"
-    params = {
-        "stid": ",".join(stids),
-        "vars": (
-            "air_temp,relative_humidity,wind_speed,wind_gust,"
-            "wind_direction,precip_accum_one_hour,precip_accum"
-        ),
-        "units": "metric",
-        "within": 360,
-        "token": SYNOPTIC_API_TOKEN,
-    }
-
+    syn_tok = _get_secret("SYNOPTIC_TOKEN")
     data = None
-    try:
-        resp = requests.get(url, params=params, timeout=12)
-        if resp.status_code in (401, 403):
-            resolved_tok = _resolve_synoptic_token(SYNOPTIC_API_TOKEN)
-            if resolved_tok != SYNOPTIC_API_TOKEN:
-                params["token"] = resolved_tok
-                resp = requests.get(url, params=params, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-    except Exception:
-        data = None
+    if syn_tok:
+        url = "https://api.synopticdata.com/v2/stations/latest"
+        params = {
+            "stid": ",".join(stids),
+            "vars": (
+                "air_temp,relative_humidity,wind_speed,wind_gust,"
+                "wind_direction,precip_accum_one_hour"
+            ),
+            "units": "metric",
+            "within": 360,
+            "token": syn_tok,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=12)
+            if resp.status_code in (401, 403):
+                resolved_tok = _resolve_synoptic_token(syn_tok)
+                if resolved_tok != syn_tok:
+                    params["token"] = resolved_tok
+                    resp = requests.get(url, params=params, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+        except Exception:
+            data = None
 
     station_list = data.get("STATION") if isinstance(data, dict) else None
     if isinstance(station_list, list):
@@ -720,9 +766,10 @@ def fetch_regional_reference_stations(
                 w_spd, _ = _extract_synoptic_obs(obs, ["wind_speed_value_1"])
                 w_gst, _ = _extract_synoptic_obs(obs, ["wind_gust_value_1"])
                 w_dir, _ = _extract_synoptic_obs(obs, ["wind_direction_value_1"])
+                # Strictly 1-hour accumulation; NEVER fall back to water-year precip_accum_value_1
                 precip_1h, p_ts = _extract_synoptic_obs(
                     obs,
-                    ["precip_accum_one_hour_value_1", "precip_accum_value_1"],
+                    ["precip_accum_one_hour_value_1"],
                     default=0.0,
                 )
                 obs_ts = first_not_none(temp_ts, rh_ts, p_ts) or now_hr_iso
@@ -736,6 +783,8 @@ def fetch_regional_reference_stations(
                         "role": meta.get("role", "Reference"),
                         "valid_time_utc": obs_ts,
                         "online": True,
+                        "is_model_fallback": False,
+                        "source": "RAWS_SYNOPTIC",
                         "status": "OK",
                         "temp_c": round(temp_c, 2) if temp_c is not None else None,
                         "rh_pct": round(rh_pct, 1) if rh_pct is not None else None,
@@ -760,6 +809,8 @@ def fetch_regional_reference_stations(
                 "role": meta.get("role", "Reference"),
                 "valid_time_utc": nws_rec.get("valid_time_utc") or now_hr_iso,
                 "online": True,
+                "is_model_fallback": False,
+                "source": "NWS_OBS",
                 "status": "OK_NWS",
                 "temp_c": nws_rec["temp_c"],
                 "rh_pct": nws_rec["rh_pct"],
@@ -781,8 +832,10 @@ def fetch_regional_reference_stations(
                 "elev_m": meta.get("elev_m"),
                 "role": meta.get("role", "Reference"),
                 "valid_time_utc": om_rec["valid_time_utc"],
-                "online": True,
-                "status": "OK_OPENMETEO",
+                "online": False,
+                "is_model_fallback": True,
+                "source": "OPENMETEO_SYNTH",
+                "status": "FALLBACK_OPENMETEO",
                 "temp_c": om_rec["temp_c"],
                 "rh_pct": om_rec["rh_pct"],
                 "wind_speed_ms": om_rec["wind_speed_ms"],
@@ -791,7 +844,7 @@ def fetch_regional_reference_stations(
                 "precip_1hr_mm": om_rec["precip_1hr_mm"],
             }
 
-    # Backfill missing RH on CHWC1/VTCC1 if temperature came from HADS/NWS without RH
+    # Backfill missing RH/wind on CHWC1/VTCC1 if temperature came from HADS/NWS without RH
     for stid in stids:
         if references[stid].get("online") and references[stid].get("rh_pct") is None:
             om_fill = _fetch_openmeteo_reference_batch([stid]).get(stid)
@@ -874,15 +927,19 @@ def compute_microclimate_diagnostics(
     if bigsur.get("rh_pct") is not None and chews.get("rh_pct") is not None:
         diagnostics["marine_layer_rh_diff_pct"] = round(bigsur["rh_pct"] - chews["rh_pct"], 1)
 
-    tass_p = max(tass_obs.get("precip_1hr_mm") or 0.0, tass_obs.get("precip_24hr_mm") or 0.0)
+    # Compare 1-hour Stone Office rain (or active rate) against 1-hour crest rain
+    tass_p = max(
+        float(tass_obs.get("precip_1hr_mm") or 0.0),
+        float(tass_obs.get("precip_rate_mm_hr") or 0.0),
+    )
     crest_max_p = max(
-        chews.get("precip_1hr_mm") or 0.0,
-        ventana.get("precip_1hr_mm") or 0.0,
-        bigsur.get("precip_1hr_mm") or 0.0,
+        float(chews.get("precip_1hr_mm") or 0.0),
+        float(ventana.get("precip_1hr_mm") or 0.0),
+        float(bigsur.get("precip_1hr_mm") or 0.0),
     )
     wet_stations = [
         stid for stid, d in ref_obs.items()
-        if (d.get("precip_1hr_mm") or 0.0) > 2.0
+        if d.get("online") and (d.get("precip_1hr_mm") or 0.0) > 2.0
     ]
 
     if crest_max_p > 1.0 and tass_p == 0.0 and (rh_tass or 100.0) < 75.0:
@@ -901,20 +958,19 @@ def compute_microclimate_diagnostics(
 
     return diagnostics
 
+
 def get_local_day_boundaries_utc(ref_utc: Optional[datetime] = None) -> Tuple[str, str, str]:
     """
     Returns (yesterday_midnight_utc_iso, today_midnight_utc_iso, now_hour_utc_iso)
     anchored to 00:00:00 America/Los_Angeles (the exact time the Davis Vantage Pro2
     console resets rain_day_in to 0.00).
     """
-    from zoneinfo import ZoneInfo
     tz_local = ZoneInfo("America/Los_Angeles")
     if ref_utc is None:
         ref_utc = datetime.now(timezone.utc)
     now_hr_utc = ref_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     local_dt = now_hr_utc.astimezone(tz_local)
     today_midnight_local = local_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    from datetime import timedelta
     yesterday_midnight_local = today_midnight_local - timedelta(days=1)
     return (
         yesterday_midnight_local.astimezone(timezone.utc).isoformat(),
