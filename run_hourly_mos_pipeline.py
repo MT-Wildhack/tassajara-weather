@@ -148,76 +148,35 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
         cur_rh = clean_num(tass_obs.get("rh_pct"), hist_rh)
         cur_mslp = clean_num(tass_obs.get("mslp_hpa"), hist_mslp or 1013.25)
 
-        # Compute exact incremental rain delta from Davis console rain_day_mm
+        # Monotonic counter rain delta (immune to console midnight rollover / clock offset)
         _, today_mid_iso, _ = get_local_day_boundaries_utc(
             pd.to_datetime(obs_hour_iso, utc=True).to_pydatetime()
         )
         console_day_mm = clean_num(tass_obs.get("precip_day_mm"), 0.0) or 0.0
-        prev_day_iso, prev_console_day_mm = _get_state_num(conn, "last_console_rain_day_mm")
+        console_year_mm = clean_num(tass_obs.get("precip_year_mm"), 0.0) or 0.0
+        _, prev_console_day_mm = _get_state_num(conn, "last_console_rain_day_mm")
+        _, prev_console_year_mm = _get_state_num(conn, "last_console_rain_year_mm")
         prev_obs_iso, _ = _get_state_num(conn, "last_obs_hour_iso")
 
         delta_console_mm = 0.0
-        if prev_day_iso == today_mid_iso and prev_console_day_mm is not None:
+        if console_year_mm > 0.0 and prev_console_year_mm is not None and console_year_mm >= prev_console_year_mm:
+            delta_console_mm = round(console_year_mm - prev_console_year_mm, 3)
+        elif prev_console_day_mm is not None:
+            # Never assume midnight reset: only treat as reset when console counter actually drops
             if console_day_mm >= prev_console_day_mm:
                 delta_console_mm = round(console_day_mm - prev_console_day_mm, 3)
-        elif prev_day_iso is not None and prev_day_iso != today_mid_iso:
-            # Local midnight reset occurred since last run
-            delta_console_mm = round(console_day_mm, 3)
+            else:
+                delta_console_mm = round(console_day_mm, 3)
 
-        # Attribute incremental clicks cleanly without 4.0 mm/hr cap or dry-hour smearing
         live_60m_mm = clean_num(tass_obs.get("precip_1hr_mm"), 0.0) or 0.0
         if prev_obs_iso == obs_hour_iso:
             cur_hr_rain = round(max(hist_hr_rain + delta_console_mm, live_60m_mm), 3)
         else:
             cur_hr_rain = round(max(hist_hr_rain, delta_console_mm, live_60m_mm), 3)
 
-        # If a multi-hour cron gap occurred within today, check remaining daily shortfall
-        if console_day_mm > 0.0:
-            db_today_prior = float(
-                conn.execute(
-                    """
-                    SELECT COALESCE(SUM(precip_1hr_mm), 0.0)
-                    FROM local_observations
-                    WHERE valid_time_utc >= ? AND valid_time_utc < ?
-                    """,
-                    (today_mid_iso, obs_hour_iso),
-                ).fetchone()[0]
-                or 0.0
-            )
-            remaining_shortfall = round(console_day_mm - (db_today_prior + cur_hr_rain), 3)
-            if remaining_shortfall >= 0.254:
-                live_rate_mm = clean_num(tass_obs.get("precip_rate_mm_hr"), 0.0) or 0.0
-                # If raining right now, put shortfall up to live_rate_mm (no artificial 4mm cap) in current hour
-                if live_rate_mm > 0.0:
-                    add_now = min(remaining_shortfall, max(live_rate_mm, 2.54))
-                    cur_hr_rain = round(cur_hr_rain + add_now, 3)
-                    remaining_shortfall = round(remaining_shortfall - add_now, 3)
-                # Distribute any leftover shortfall ONLY across recent saturated hours (RH >= 90%)
-                if remaining_shortfall >= 0.254:
-                    sat_rows = conn.execute(
-                        """
-                        SELECT valid_time_utc FROM local_observations
-                        WHERE valid_time_utc >= ? AND valid_time_utc < ?
-                          AND COALESCE(rh_pct, 0.0) >= 90.0
-                        ORDER BY valid_time_utc DESC LIMIT 4
-                        """,
-                        (today_mid_iso, obs_hour_iso),
-                    ).fetchall()
-                    if sat_rows:
-                        per_hr = round(remaining_shortfall / len(sat_rows), 3)
-                        for (r_ts,) in sat_rows:
-                            conn.execute(
-                                """
-                                UPDATE local_observations
-                                SET precip_1hr_mm = ROUND(COALESCE(precip_1hr_mm, 0.0) + ?, 3)
-                                WHERE valid_time_utc = ?
-                                """,
-                                (per_hr, r_ts),
-                            )
-                    else:
-                        cur_hr_rain = round(cur_hr_rain + remaining_shortfall, 3)
-
         _set_state(conn, "last_console_rain_day_mm", today_mid_iso, console_day_mm, obs_hour_iso)
+        if console_year_mm > 0.0:
+            _set_state(conn, "last_console_rain_year_mm", obs_hour_iso, console_year_mm, obs_hour_iso)
         _set_state(conn, "last_obs_hour_iso", obs_hour_iso, None, obs_hour_iso)
 
         cur_wspd = max(hist_hr_wspd, clean_num(tass_obs.get("wind_speed_ms"), 0.0) or 0.0)

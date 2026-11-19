@@ -331,6 +331,7 @@ def evaluate_single_hour_tier(
     rolling_72h_mm: float,
     allow_red: bool = True,
     allow_orange: bool = True,
+    discharge_cfs: Optional[float] = None,
     stream_stage_m: Optional[float] = None,
     rate_of_rise_m_hr: Optional[float] = None,
 ) -> Tuple[str, List[str]]:
@@ -381,6 +382,8 @@ def evaluate_single_hour_tier(
             )
         if stream_stage_m is not None and not pd.isna(stream_stage_m) and float(stream_stage_m) >= RED_STAGE_M:
             red_reasons.append(f"Creek stage {float(stream_stage_m):.2f} m exceeds bankfull warning level")
+        if discharge_cfs is not None and not pd.isna(discharge_cfs) and float(discharge_cfs) >= 500.0:
+            red_reasons.append(f"Routed creek discharge {float(discharge_cfs):.0f} CFS (>= 500 CFS flood stage)")
         if rate_of_rise_m_hr is not None and not pd.isna(rate_of_rise_m_hr) and float(rate_of_rise_m_hr) >= RED_RISE_RATE_M_HR:
             red_reasons.append(f"Rapid creek surge +{float(rate_of_rise_m_hr):.2f} m/hr")
 
@@ -413,6 +416,8 @@ def evaluate_single_hour_tier(
             orange_reasons.append(f"Elevated effective surface runoff ({r1/MM_PER_INCH:.2f} in/hr)")
         if stream_stage_m is not None and not pd.isna(stream_stage_m) and float(stream_stage_m) >= ORANGE_STAGE_M:
             orange_reasons.append(f"Creek stage elevated at {float(stream_stage_m):.2f} m")
+        if discharge_cfs is not None and not pd.isna(discharge_cfs) and float(discharge_cfs) >= 250.0:
+            orange_reasons.append(f"High-velocity creek discharge {float(discharge_cfs):.0f} CFS (>= 250 CFS debris/footbridge risk)")
         if rate_of_rise_m_hr is not None and not pd.isna(rate_of_rise_m_hr) and float(rate_of_rise_m_hr) >= ORANGE_RISE_RATE_M_HR:
             orange_reasons.append(f"Creek rising at +{float(rate_of_rise_m_hr):.2f} m/hr")
 
@@ -451,6 +456,7 @@ def evaluate_flood_and_road_tier(
     precip_72hr_mm: float,
     current_runoff_mm_hr: float = 0.0,
     proj_fc_df: Optional[pd.DataFrame] = None,
+    current_discharge_cfs: Optional[float] = None,
     stream_stage_m: Optional[float] = None,
     rate_of_rise_m_hr: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -474,6 +480,7 @@ def evaluate_flood_and_road_tier(
         rolling_72h_mm=precip_72hr_mm,
         allow_red=True,
         allow_orange=True,
+        discharge_cfs=current_discharge_cfs,
         stream_stage_m=stream_stage_m,
         rate_of_rise_m_hr=rate_of_rise_m_hr,
     )
@@ -497,6 +504,7 @@ def evaluate_flood_and_road_tier(
                 rolling_72h_mm=float(row.get("rolling_72h_mm", 0.0)),
                 allow_red=allow_red,
                 allow_orange=allow_orange,
+                discharge_cfs=float(row.get("projected_discharge_cfs", 0.0)),
             )
             if tier_rank[h_code] > tier_rank[best_code]:
                 best_code = h_code
@@ -511,7 +519,15 @@ def evaluate_flood_and_road_tier(
                         collected[h_code].append(tagged)
 
     if best_code != "GREEN" and collected[best_code]:
-        triggers = collected[best_code][:5]
+        deduped = []
+        seen_cats = set()
+        for msg in collected[best_code]:
+            body = msg.split(": ", 1)[1] if ": " in msg else msg
+            cat = body.split("(")[0].strip()[:22]
+            if cat not in seen_cats:
+                seen_cats.add(cat)
+                deduped.append(msg)
+        triggers = deduped[:4]
     else:
         triggers = [
             f"Catchment wetness low (API {float(api_mm or 0.0)/MM_PER_INCH:.2f} in) and "
@@ -584,6 +600,8 @@ def spinup_historical_api_series(
     bigsur_map: Dict[pd.Timestamp, float] = {}
     if ref_df is not None and not ref_df.empty and "valid_time_utc" in ref_df.columns:
         r_tmp = ref_df.copy()
+        if "source" in r_tmp.columns:
+            r_tmp = r_tmp[~r_tmp["source"].isin(["OPENMETEO_SYNTH", "OFFLINE"])].copy()
         r_tmp["_dt_utc"] = pd.to_datetime(r_tmp["valid_time_utc"], utc=True, errors="coerce").dt.floor("h")
         for stid, target_map in (("CHWC1", chews_map), ("VTCC1", vent_map), ("PPSC1", bigsur_map)):
             sub = r_tmp[r_tmp["station_id"] == stid]
@@ -917,9 +935,9 @@ def compute_dashboard_hydro_state(
     vent_p_now = 0.0
     bigsur_p_now = 0.0
     if isinstance(ref_dict, dict):
-        chews_p_now = float(ref_dict.get("CHWC1", {}).get("precip_1hr_mm") or 0.0)
-        vent_p_now = float(ref_dict.get("VTCC1", {}).get("precip_1hr_mm") or 0.0)
-        bigsur_p_now = float(ref_dict.get("PPSC1", {}).get("precip_1hr_mm") or 0.0)
+        chews_p_now = float(ref_dict.get("CHWC1", {}).get("precip_1hr_mm") or 0.0) if ref_dict.get("CHWC1", {}).get("online") else 0.0
+        vent_p_now = float(ref_dict.get("VTCC1", {}).get("precip_1hr_mm") or 0.0) if ref_dict.get("VTCC1", {}).get("online") else 0.0
+        bigsur_p_now = float(ref_dict.get("PPSC1", {}).get("precip_1hr_mm") or 0.0) if ref_dict.get("PPSC1", {}).get("online") else 0.0
 
     if not hist_hydro_df.empty:
         latest_row = hist_hydro_df.iloc[-1]
@@ -1040,6 +1058,7 @@ def compute_dashboard_hydro_state(
         precip_72hr_mm=precip_72hr_mm,
         current_runoff_mm_hr=current_runoff_mm_hr,
         proj_fc_df=proj_fc_df,
+        current_discharge_cfs=discharge_cfs,
         stream_stage_m=stage_m,
         rate_of_rise_m_hr=rise_m_hr,
     )

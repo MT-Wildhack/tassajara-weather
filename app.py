@@ -1512,24 +1512,30 @@ def load_all_dashboard_data():
                 obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
                 obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
 
-            # Clean, non-smearing current-hour rainfall shortfall reconciliation
-            _, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
-            console_day_mm = safe_float(live_obs.get("precip_day_mm"), 0.0)
-            obs_dt_s = pd.to_datetime(obs_df["valid_time_utc"], utc=True, errors="coerce")
-            today_mask = obs_dt_s >= pd.Timestamp(today_mid_iso)
-            db_today_mm = float(get_col(obs_df.loc[today_mask], "precip_1hr_mm", 0.0).sum()) if today_mask.any() else 0.0
-            shortfall_today_mm = round(console_day_mm - db_today_mm, 3)
-            if shortfall_today_mm >= 0.254 and today_mask.any():
-                live_rate_mm = safe_float(live_obs.get("precip_rate_mm_hr"), 0.0)
-                add_now_mm = (
-                    min(shortfall_today_mm, max(live_rate_mm, 2.54))
-                    if live_rate_mm > 0.0
-                    else shortfall_today_mm
-                )
-                top_idx = obs_df.index[today_mask][0]
-                obs_df.loc[top_idx, "precip_1hr_mm"] = round(
-                    safe_float(obs_df.loc[top_idx, "precip_1hr_mm"], 0.0) + add_now_mm, 3
-                )
+            # Safe monotonic live rainfall delta since last SQLite sync (immune to midnight rollover)
+            if Path(DB_PATH).exists() and not obs_df.empty:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn_st:
+                        st_rows = dict(
+                            conn_st.execute(
+                                "SELECT key, val_num FROM ingest_state WHERE key IN ('last_console_rain_year_mm', 'last_console_rain_day_mm')"
+                            ).fetchall()
+                        )
+                    live_yr = safe_float(live_obs.get("precip_year_mm"), 0.0)
+                    live_day = safe_float(live_obs.get("precip_day_mm"), 0.0)
+                    prev_yr = st_rows.get("last_console_rain_year_mm")
+                    prev_day = st_rows.get("last_console_rain_day_mm")
+                    delta_live = 0.0
+                    if live_yr > 0.0 and prev_yr is not None and live_yr >= float(prev_yr):
+                        delta_live = round(live_yr - float(prev_yr), 3)
+                    elif prev_day is not None:
+                        delta_live = round(live_day - float(prev_day), 3) if live_day >= float(prev_day) else round(live_day, 3)
+                    if delta_live >= 0.254:
+                        obs_df.loc[0, "precip_1hr_mm"] = round(
+                            safe_float(obs_df.loc[0, "precip_1hr_mm"], 0.0) + delta_live, 3
+                        )
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -3410,7 +3416,7 @@ else:
                 dz_km = (float(meta["elev_m"]) - ELEV_TASS_M) / 1000.0
                 lapse_vs_tass = (
                     f"{-1.0 * (t_val_c - temp_c) / dz_km:+.1f} °C/km"
-                    if not math.isnan(t_val_c) and abs(dz_km) >= 0.20
+                    if not math.isnan(t_val_c) and dz_km >= 0.30
                     else (
                         f"{c_to_f(temp_c) - c_to_f(t_val_c):+.1f} °F ΔT"
                         if not math.isnan(t_val_c)
