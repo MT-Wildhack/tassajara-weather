@@ -257,7 +257,7 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
 
         ref_rows = []
         for stid, rdata in ref_obs.items():
-            if rdata.get("temp_c") is None and rdata.get("precip_1hr_mm") is None:
+            if rdata.get("temp_c") is None or str(rdata.get("source") or "") == "OFFLINE":
                 continue
             ref_rows.append((
                 obs_hour_iso,

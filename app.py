@@ -1082,6 +1082,7 @@ def load_all_dashboard_data():
                         COALESCE(MAX(precip_1hr_mm), 0.0)
                     FROM local_observations
                     WHERE temp_c IS NOT NULL
+                      AND COALESCE(source, 'WL_LIVE') != 'OPENMETEO_SYNTH'
                     """
                 ).fetchone()
                 if row_st:
@@ -1112,6 +1113,7 @@ def load_all_dashboard_data():
                             ) AS rn
                         FROM reference_observations
                         WHERE valid_time_utc <= ?
+                          AND temp_c IS NOT NULL
                     )
                     SELECT * FROM ranked_refs WHERE rn = 1
                     """,
@@ -1133,10 +1135,9 @@ def load_all_dashboard_data():
                             if pd.notna(obs_dt)
                             else 999.0
                         )
-                        is_synth = str(row_d.get("source") or "") == "OPENMETEO_SYNTH"
-                        is_fresh = (not is_synth) and age_hrs <= 3.5 and (
-                            pd.notna(row_d.get("temp_c")) or pd.notna(row_d.get("precip_1hr_mm"))
-                        )
+                        src_str = str(row_d.get("source") or "")
+                        is_non_live = src_str in ("OPENMETEO_SYNTH", "OFFLINE")
+                        is_fresh = (not is_non_live) and age_hrs <= 3.5 and pd.notna(row_d.get("temp_c"))
                         row_d["online"] = bool(is_fresh)
                         row_d["age_hours"] = round(age_hrs, 1)
                         row_d["name"] = meta["name"]
@@ -1373,9 +1374,26 @@ def load_all_dashboard_data():
                         ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
                     LEFT JOIN reference_observations r_vent
                         ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
-                    LEFT JOIN mos_corrected_forecasts m_ex
+                    LEFT JOIN (
+                        SELECT
+                            issue_time_utc,
+                            valid_time_utc,
+                            corrected_temp_c,
+                            corrected_temp_p10_c,
+                            corrected_temp_p90_c,
+                            corrected_rh_pct,
+                            corrected_wind_gust_ms,
+                            {hydro_inner_sql},
+                            model_version,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY valid_time_utc, issue_time_utc
+                                ORDER BY model_version DESC
+                            ) AS rn
+                        FROM mos_corrected_forecasts
+                    ) m_ex
                         ON f.valid_time_utc = m_ex.valid_time_utc
                        AND f.issue_time_utc = m_ex.issue_time_utc
+                       AND m_ex.rn = 1
                     LEFT JOIN (
                         SELECT
                             valid_time_utc,
@@ -1400,6 +1418,10 @@ def load_all_dashboard_data():
                     conn,
                 )
                 if not verify_df.empty:
+                    verify_df = (
+                        verify_df.drop_duplicates(subset=["valid_time_utc"], keep="last")
+                        .reset_index(drop=True)
+                    )
                     verify_df = apply_mos_inference_if_needed(verify_df)
             except Exception:
                 verify_df = pd.DataFrame()
@@ -2327,12 +2349,12 @@ def render_hydro_risk_section(
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=1, col=1)
         fig_hydro.update_xaxes(gridcolor=GRID_RGBA, row=2, col=1)
         fig_hydro.update_layout(
-            height=550,
-            margin=dict(t=142, b=30, l=50, r=55),
+            height=600,
+            margin=dict(t=45, b=115, l=50, r=55),
             hovermode="x unified",
             plot_bgcolor=PLOT_BG_RGBA,
             paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.18, xanchor="left", x=0.0),
+            legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0.0),
         )
         st.plotly_chart(fig_hydro, use_container_width=True)
 
@@ -2873,8 +2895,9 @@ def render_layman_forecast_view(
             if not obs_today.empty:
                 obs_today["corrected_temp_c"] = obs_today["temp_c"]
                 obs_today["corrected_temp_p10_c"] = obs_today["temp_c"]
-                obs_today["mos_pop_pct"] = 0.0
-                obs_today["nws_pop_pct"] = 0.0
+                _obs_wet_pop = np.where(get_col(obs_today, "precip_1hr_mm", 0.0) >= 0.254, 100.0, 0.0)
+                obs_today["mos_pop_pct"] = _obs_wet_pop
+                obs_today["nws_pop_pct"] = _obs_wet_pop
                 obs_today["mos_qpf_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
                 obs_today["nws_qpf_1hr_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
                 obs_today["nws_sky_cover_pct"] = 20.0
@@ -4073,8 +4096,9 @@ else:
                             .map(v_map["raw_nws_temp_c"])
                             .combine_first(obs_today_sci["temp_c"])
                         )
-                obs_today_sci["nws_pop_pct"] = 0.0
-                obs_today_sci["mos_pop_pct"] = 0.0
+                _obs_wet_pop_sci = np.where(get_col(obs_today_sci, "precip_1hr_mm", 0.0) >= 0.254, 100.0, 0.0)
+                obs_today_sci["nws_pop_pct"] = _obs_wet_pop_sci
+                obs_today_sci["mos_pop_pct"] = _obs_wet_pop_sci
                 obs_today_sci["nws_qpf_1hr_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
                 obs_today_sci["mos_qpf_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
                 obs_today_sci["mos_qpf_p90_mm"] = get_col(obs_today_sci, "precip_1hr_mm", 0.0)
