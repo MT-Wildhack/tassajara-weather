@@ -662,6 +662,61 @@ def _fetch_nws_station_latest(stid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+
+def _fetch_iem_station_latest(stid: str) -> Optional[Dict[str, Any]]:
+    """Fallback Tier 2B: Free, no-key Iowa Environmental Mesonet (CA_DCP) live RAWS/HADS feed."""
+    url = "https://mesonet.agron.iastate.edu/json/current.py"
+    try:
+        r = requests.get(
+            url,
+            params={"network": "CA_DCP", "station": stid},
+            headers={"User-Agent": "(TassajaraWeatherMOSMonitor/2.0, tzmc-weather@tassajara.org)"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        ob = (r.json() or {}).get("last_ob") or {}
+        if not ob:
+            return None
+
+        def _f(key: str) -> Optional[float]:
+            v = ob.get(key)
+            if v is None:
+                return None
+            try:
+                fv = float(v)
+                return None if math.isnan(fv) else fv
+            except (ValueError, TypeError):
+                return None
+
+        t_f = _f("airtemp[F]")
+        rh = _f("relh[%]")
+        w_kt = _f("sknt[kt]")
+        g_kt = _f("gust[kt]")
+        w_dir = _f("drct")
+        p_in = _f("phour[in]")
+        ts = ob.get("utc_valid")
+
+        if t_f is None and rh is None:
+            return None
+
+        w_spd_ms = round(w_kt * 0.514444, 2) if w_kt is not None else None
+        w_gst_ms = round(g_kt * 0.514444, 2) if g_kt is not None else w_spd_ms
+        p_mm = round(max(0.0, p_in * 25.4), 2) if p_in is not None else 0.0
+
+        return {
+            "valid_time_utc": ts,
+            "temp_c": f_to_c(t_f) if t_f is not None else None,
+            "rh_pct": round(rh, 1) if rh is not None else None,
+            "wind_speed_ms": w_spd_ms,
+            "wind_gust_ms": w_gst_ms,
+            "wind_dir_deg": round(w_dir, 1) if w_dir is not None else None,
+            "precip_1hr_mm": p_mm,
+        }
+    except Exception:
+        return None
+
+
 def _fetch_openmeteo_reference_batch(stids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Fallback Tier 3: Pulls real-time HRRR/GFS boundary conditions at exact station lat/lon/elev."""
     out: Dict[str, Dict[str, Any]] = {}
@@ -818,6 +873,30 @@ def fetch_regional_reference_stations(
                 "wind_gust_ms": nws_rec["wind_gust_ms"],
                 "wind_dir_deg": nws_rec["wind_dir_deg"],
                 "precip_1hr_mm": nws_rec["precip_1hr_mm"],
+            }
+
+    # --- Tier 2B: Iowa Environmental Mesonet (CA_DCP) free live RAWS/HADS feed ---
+    iem_missing = [s for s in stids if not references[s].get("online") or references[s].get("temp_c") is None]
+    for stid in iem_missing:
+        iem_rec = _fetch_iem_station_latest(stid)
+        if iem_rec and iem_rec.get("temp_c") is not None:
+            meta = REFERENCE_STATIONS.get(stid, {})
+            references[stid] = {
+                "station_id": stid,
+                "name": meta.get("name", stid),
+                "elev_m": meta.get("elev_m"),
+                "role": meta.get("role", "Reference"),
+                "valid_time_utc": iem_rec.get("valid_time_utc") or now_hr_iso,
+                "online": True,
+                "is_model_fallback": False,
+                "source": "IEM_CA_DCP",
+                "status": "OK_IEM",
+                "temp_c": iem_rec["temp_c"],
+                "rh_pct": iem_rec["rh_pct"],
+                "wind_speed_ms": iem_rec["wind_speed_ms"],
+                "wind_gust_ms": iem_rec["wind_gust_ms"],
+                "wind_dir_deg": iem_rec["wind_dir_deg"],
+                "precip_1hr_mm": iem_rec["precip_1hr_mm"],
             }
 
     # --- Tier 3: Open-Meteo Real-Time Boundary Analysis for any remaining gaps ---
