@@ -1550,7 +1550,8 @@ def load_all_dashboard_data():
         live_refs = fetch_regional_reference_stations() if fresh_sqlite_refs < 4 else {}
         if isinstance(live_refs, dict):
             for stid, rdata in live_refs.items():
-                if isinstance(rdata, dict) and rdata.get("temp_c") is not None:
+                has_live_precip = bool(rdata.get("online")) and rdata.get("precip_1hr_mm") is not None
+                if isinstance(rdata, dict) and (rdata.get("temp_c") is not None or has_live_precip):
                     meta = REFERENCE_STATIONS.get(stid, {})
                     ref_dict[stid] = {
                         "station_id": stid,
@@ -1561,7 +1562,7 @@ def load_all_dashboard_data():
                         "online": bool(rdata.get("online", False)),
                         "source": str(rdata.get("source") or "RAWS_SYNOPTIC"),
                         "age_hours": 0.1,
-                        "temp_c": float(rdata["temp_c"]),
+                        "temp_c": safe_float(rdata.get("temp_c"), np.nan),
                         "rh_pct": safe_float(rdata.get("rh_pct"), np.nan),
                         "wind_speed_ms": safe_float(rdata.get("wind_speed_ms"), np.nan),
                         "wind_gust_ms": safe_float(rdata.get("wind_gust_ms"), np.nan),
@@ -1569,7 +1570,8 @@ def load_all_dashboard_data():
                         "precip_1hr_mm": safe_float(rdata.get("precip_1hr_mm"), 0.0),
                     }
         if (
-            pd.isna(ref_dict.get("VTCC1", {}).get("temp_c"))
+            not ref_dict.get("VTCC1", {}).get("online")
+            and pd.isna(ref_dict.get("VTCC1", {}).get("temp_c"))
             and pd.notna(ref_dict.get("CHWC1", {}).get("temp_c"))
         ):
             ref_dict["VTCC1"]["temp_c"] = round(float(ref_dict["CHWC1"]["temp_c"]) + 0.54, 2)
@@ -3437,7 +3439,11 @@ else:
                     "Station Name": meta["name"],
                     "Boundary Role": meta["role"],
                     "Elev (m / ft)": f"{int(meta['elev_m'])} m ({int(round(meta['elev_m'] * 3.28084))} ft)",
-                    "Status": "Online" if d.get("online") else "Model Fallback / Stale",
+                    "Status": (
+                        "Online (Rain Gauge)"
+                        if (d.get("online") and math.isnan(t_val_c))
+                        else ("Online" if d.get("online") else "Model Fallback / Stale")
+                    ),
                     "Temp (°F / °C)": (
                         f"{c_to_f(t_val_c):.1f} °F ({t_val_c:.1f} °C)"
                         if not math.isnan(t_val_c)
