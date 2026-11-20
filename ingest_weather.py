@@ -690,28 +690,46 @@ def _fetch_iem_station_latest(stid: str) -> Optional[Dict[str, Any]]:
                 return None
 
         t_f = _f("airtemp[F]")
+        td_f = _f("dewpointtemp[F]")
         rh = _f("relh[%]")
-        w_kt = _f("sknt[kt]")
-        g_kt = _f("gust[kt]")
-        w_dir = _f("drct")
-        p_in = _f("phour[in]")
+        w_kt = _f("windspeed[kt]") if _f("windspeed[kt]") is not None else _f("sknt[kt]")
+        g_kt = _f("windgust[kt]") if _f("windgust[kt]") is not None else _f("gust[kt]")
+        w_dir = _f("winddirection[deg]") if _f("winddirection[deg]") is not None else _f("drct")
+        p_hr_in = _f("phour[in]")
+        p_day_in = _f("precip_today[in]")
         ts = ob.get("utc_valid")
 
-        if t_f is None and rh is None:
+        if t_f is None and rh is None and p_day_in is None and p_hr_in is None:
             return None
+
+        t_c = f_to_c(t_f) if t_f is not None else None
+        if rh is None and t_c is not None and td_f is not None:
+            td_c = f_to_c(td_f)
+            if td_c is not None:
+                rh = max(
+                    0.0,
+                    min(
+                        100.0,
+                        100.0
+                        * math.exp((17.625 * td_c) / (243.04 + td_c))
+                        / math.exp((17.625 * t_c) / (243.04 + t_c)),
+                    ),
+                )
 
         w_spd_ms = round(w_kt * 0.514444, 2) if w_kt is not None else None
         w_gst_ms = round(g_kt * 0.514444, 2) if g_kt is not None else w_spd_ms
-        p_mm = round(max(0.0, p_in * 25.4), 2) if p_in is not None else 0.0
+        p_hr_mm = round(max(0.0, p_hr_in * 25.4), 2) if p_hr_in is not None else 0.0
+        p_day_mm = round(max(0.0, p_day_in * 25.4), 2) if p_day_in is not None else None
 
         return {
             "valid_time_utc": ts,
-            "temp_c": f_to_c(t_f) if t_f is not None else None,
+            "temp_c": t_c,
             "rh_pct": round(rh, 1) if rh is not None else None,
             "wind_speed_ms": w_spd_ms,
             "wind_gust_ms": w_gst_ms,
             "wind_dir_deg": round(w_dir, 1) if w_dir is not None else None,
-            "precip_1hr_mm": p_mm,
+            "precip_1hr_mm": p_hr_mm,
+            "precip_day_mm": p_day_mm,
         }
     except Exception:
         return None
@@ -879,8 +897,9 @@ def fetch_regional_reference_stations(
     iem_missing = [s for s in stids if not references[s].get("online") or references[s].get("temp_c") is None]
     for stid in iem_missing:
         iem_rec = _fetch_iem_station_latest(stid)
-        if iem_rec and iem_rec.get("temp_c") is not None:
+        if iem_rec and (iem_rec.get("temp_c") is not None or iem_rec.get("precip_day_mm") is not None):
             meta = REFERENCE_STATIONS.get(stid, {})
+            is_precip_only = iem_rec.get("temp_c") is None
             references[stid] = {
                 "station_id": stid,
                 "name": meta.get("name", stid),
@@ -890,17 +909,18 @@ def fetch_regional_reference_stations(
                 "online": True,
                 "is_model_fallback": False,
                 "source": "IEM_CA_DCP",
-                "status": "OK_IEM",
+                "status": "OK_IEM_PRECIP" if is_precip_only else "OK_IEM",
                 "temp_c": iem_rec["temp_c"],
                 "rh_pct": iem_rec["rh_pct"],
                 "wind_speed_ms": iem_rec["wind_speed_ms"],
                 "wind_gust_ms": iem_rec["wind_gust_ms"],
                 "wind_dir_deg": iem_rec["wind_dir_deg"],
                 "precip_1hr_mm": iem_rec["precip_1hr_mm"],
+                "precip_day_mm": iem_rec["precip_day_mm"],
             }
 
     # --- Tier 3: Open-Meteo Real-Time Boundary Analysis for any remaining gaps ---
-    still_missing = [s for s in stids if not references[s].get("online") or references[s].get("temp_c") is None]
+    still_missing = [s for s in stids if not references[s].get("online")]
     if still_missing:
         om_batch = _fetch_openmeteo_reference_batch(still_missing)
         for stid, om_rec in om_batch.items():

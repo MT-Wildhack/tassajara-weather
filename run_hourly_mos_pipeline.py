@@ -216,8 +216,19 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
 
         ref_rows = []
         for stid, rdata in ref_obs.items():
-            if rdata.get("temp_c") is None or str(rdata.get("source") or "") == "OFFLINE":
+            src_r = str(rdata.get("source") or "")
+            if src_r == "OFFLINE" or (rdata.get("temp_c") is None and rdata.get("precip_day_mm") is None):
                 continue
+            # Compute hourly rain increment from monotonic precip_today[in] for IEM CA_DCP gauges
+            if rdata.get("precip_day_mm") is not None and (rdata.get("precip_1hr_mm") or 0.0) == 0.0:
+                ref_day_mm = float(rdata["precip_day_mm"])
+                st_key = f"last_ref_rain_day_mm_{stid}"
+                _, prev_ref_day = _get_state_num(conn, st_key)
+                if prev_ref_day is not None:
+                    ref_delta = round(ref_day_mm - prev_ref_day, 2) if ref_day_mm >= prev_ref_day else round(ref_day_mm, 2)
+                    if ref_delta > 0.0:
+                        rdata["precip_1hr_mm"] = ref_delta
+                _set_state(conn, st_key, obs_hour_iso, ref_day_mm, obs_hour_iso)
             ref_rows.append((
                 obs_hour_iso,
                 stid,

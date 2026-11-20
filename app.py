@@ -1113,7 +1113,7 @@ def load_all_dashboard_data():
                             ) AS rn
                         FROM reference_observations
                         WHERE valid_time_utc <= ?
-                          AND temp_c IS NOT NULL
+                          AND (temp_c IS NOT NULL OR source = 'IEM_CA_DCP')
                     )
                     SELECT * FROM ranked_refs WHERE rn = 1
                     """,
@@ -1137,7 +1137,10 @@ def load_all_dashboard_data():
                         )
                         src_str = str(row_d.get("source") or "")
                         is_non_live = src_str in ("OPENMETEO_SYNTH", "OFFLINE")
-                        is_fresh = (not is_non_live) and age_hrs <= 3.5 and pd.notna(row_d.get("temp_c"))
+                        is_fresh = (not is_non_live) and age_hrs <= 3.5 and (
+                            pd.notna(row_d.get("temp_c"))
+                            or (src_str == "IEM_CA_DCP" and pd.notna(row_d.get("precip_1hr_mm")))
+                        )
                         row_d["online"] = bool(is_fresh)
                         row_d["age_hours"] = round(age_hrs, 1)
                         row_d["name"] = meta["name"]
