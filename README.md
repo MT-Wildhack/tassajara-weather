@@ -227,7 +227,7 @@ Implemented in `hydro_risk_engine.py`, this module tracks continuous catchment s
 **Evaporative Recession ($`k_{\text{day}}`$):** Modulated dynamically between 0.88 and 0.94 from observed Vapor Pressure Deficit (VPD) so saturated winter storms drain slower than dry autumn intervals:
 
 ```math
-k_{\text{day}} = \operatorname{clip}\left(0.935 - 0.025 \cdot \min(\mathrm{VPD}, 2.2),\; 0.88,\; 0.94\right)
+k_{\text{day}} = \mathrm{clip}\left(0.935 - 0.025 \cdot \min(\mathrm{VPD}, 2.2),\; 0.88,\; 0.94\right)
 ```
 
 **Effective Catchment Rain ($`P_{\text{eff}}`$):** Blends Stone Office tipping-bucket rain with **online-only** ridge stations (`CHWC1`, `VTCC1`, `PPSC1`), explicitly ignoring `OPENMETEO_SYNTH` / `OFFLINE` fallback rows.
