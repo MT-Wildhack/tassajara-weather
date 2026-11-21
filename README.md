@@ -114,7 +114,7 @@ The suite runs on an automated hourly cycle (`:05` past each hour via GitHub Act
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                app.py (Streamlit Web Dashboard — https://tassajara-weather.streamlit.app)                    │
+│                app.py (Streamlit Web Dashboard — [https://tassajara-weather.streamlit.app](https://tassajara-weather.streamlit.app))                    │
 │  Mode 1: Everyday Forecast (Community & Guest View — plain-language cards, road/creek alerts, freeze lows)   │
 │  Mode 2: Scientific & Statistical MOS Suite (8-metric grid, 3-panel Plotly, verification scorecard, OLS)     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -182,7 +182,7 @@ The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`*
 
 * **Raw Generic NWP Forecast RMSE:** $2.715^\circ\text{C}$ ($4.89^\circ\text{F}$)
 * **Tassajara MOS Corrected RMSE:** **$2.024^\circ\text{C}$ ($3.64^\circ\text{F}$)**
-* **Full-Cycle Thermal Skill Improvement:** **$+25.5\%$ RMSE reduction**
+* **Full-Cycle Thermal Skill Improvement:** **+25.5% RMSE reduction**
 * **HAC OLS Diagnostic Baseline ($n = 17,570$):** $R^2 = 0.419$, $\text{Adj } R^2 = 0.418$, matrix condition number $\kappa < 30$ (well-conditioned, zero severe multicollinearity).
 
 ### Subsystem Design
@@ -190,12 +190,20 @@ The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`*
 1. **Thermal Subsystem (`HistGradientBoostingRegressor`):**
    * Mean error corrector (`loss='squared_error'`, L2-regularized) paired with dual quantile estimators ($\alpha = 0.10$ and $\alpha = 0.90$) generating conformal-calibrated 80% uncertainty bands ($P_{10}$ cold-pool floor to $P_{90}$ daytime ceiling).
    * Issue-time local anomalies (temperature persistence, lapse-rate anomaly, gorge confinement, and barometric pressure tendency) decay exponentially with forecast lead time:
-     $$\Gamma_{\text{eff}}(h) = 6.5 + (\Gamma_0 - 6.5)\cdot e^{-h / 12.0}$$
+
+     $$
+     \Gamma_{\text{eff}}(h) = 6.5 + (\Gamma_0 - 6.5)\cdot e^{-h / 12.0}
+     $$
+
 2. **Two-Stage Hydrological Hurdle Subsystem:**
    * **Stage 1 (Calibrated PoP Classifier):** `CalibratedClassifierCV` wrapping `HistGradientBoostingClassifier` estimating $P(\text{Rain} \ge 0.254\text{ mm})$.
    * **Stage 2 (Wet-Only QPF & $P_{90}$ Regressors):** Trained strictly on verified wet hours ($\ge 0.254\text{ mm}$) to prevent dry-hour zero-inflation from suppressing heavy Santa Lucia rain rates.
    * **Virga & Orographic Modulation:** Modulates pre-frontal QPF using boundary-layer Vapor Pressure Deficit (VPD) and upslope moisture flux:
-     $$F_{\text{virga}} = \exp(-0.48 \cdot \text{VPD}), \quad F_{\text{oro}} = 1.0 + 0.08 \cdot \text{Flux}_{\text{upslope}} + 0.05 \cdot (-\Delta P_{3\text{h}})$$
+
+     $$
+     F_{\text{virga}} = \exp(-0.48 \cdot \text{VPD}), \quad F_{\text{oro}} = 1.0 + 0.08 \cdot \text{Flux}_{\text{upslope}} + 0.05 \cdot (-\Delta P_{3\text{h}})
+     $$
+
 3. **Econometric HAC OLS Baseline:**
    * Standardized predictors evaluated via Ordinary Least Squares with 12-hour lag Newey-West Heteroskedasticity and Autocorrelation Consistent standard errors (`cov_type='HAC', maxlags=12`), exposed directly in the Scientific UI for ongoing physical interpretability.
 
@@ -207,15 +215,23 @@ Implemented in `hydro_risk_engine.py`, this module tracks continuous catchment s
 
 ### 1. Dynamic Antecedent Precipitation Index ($API$)
 
-$$API_t = API_{t-1} \cdot k_{\text{hr}} + P_{\text{eff}, t}$$
+$$
+API_t = API_{t-1} \cdot k_{\text{hr}} + P_{\text{eff}, t}
+$$
 
 * **Evaporative Recession ($k_{\text{day}}$):** Modulated dynamically between $0.88$ and $0.94$ from observed Vapor Pressure Deficit (VPD) so saturated winter storms drain slower than dry autumn intervals:
-  $$k_{\text{day}} = \text{clip}\!\left(0.935 - 0.025 \cdot \min(\text{VPD},\, 2.2),\, 0.88,\, 0.94\right)$$
+
+  $$
+  k_{\text{day}} = \text{clip}\!\left(0.935 - 0.025 \cdot \min(\text{VPD},\, 2.2),\, 0.88,\, 0.94\right)
+  $$
+
 * **Effective Catchment Rain ($P_{\text{eff}}$):** Blends Stone Office tipping-bucket rain with **online-only** ridge stations (`CHWC1`, `VTCC1`, `PPSC1`), explicitly ignoring `OPENMETEO_SYNTH` / `OFFLINE` fallback rows.
 
 ### 2. Nonlinear Soil-Saturation Runoff Coefficient ($C$)
 
-$$C(API) = C_{\min} + \frac{C_{\max} - C_{\min}}{1 + \exp\!\left(-\dfrac{API + 0.18 \cdot P_{72\text{h}} - API_{\text{mid}}}{s}\right)}$$
+$$
+C(API) = C_{\min} + \frac{C_{\max} - C_{\min}}{1 + \exp\!\left(-\dfrac{API + 0.18 \cdot P_{72\text{h}} - API_{\text{mid}}}{s}\right)}
+$$
 
 Where $C_{\min} = 0.08$ (dry fractured granite / duff abstraction) and $C_{\max} = 0.86$ (saturated bedrock/regolith sheetflow ceiling).
 
@@ -223,8 +239,8 @@ Where $C_{\min} = 0.08$ (dry fractured granite / duff abstraction) and $C_{\max}
 
 Rather than snapping abruptly back to dry baseflow after rain pauses, effective runoff ($R_t = C_t \cdot P_{\text{eff}, t}$) splits across two physical storage pathways over the $72\text{ km}^2$ watershed above a $6.5\text{ CFS}$ spring baseflow floor ($Q_{\text{base}} = 6.5\text{ CFS}$):
 
-* **Fast Surface Quickflow ($18\%$):** Routed via a steep-canyon 4-hour unit hydrograph kernel to capture rapid storm-band peaks.
-* **Shallow Subsurface Interflow ($57\%$):** Routed through a linear hillslope storage reservoir ($k_{\text{interflow}} = 0.955\text{ hr}^{-1}$) sustaining realistic multi-day post-storm creek recession across the `now` boundary with zero step discontinuity.
+* **Fast Surface Quickflow (18%):** Routed via a steep-canyon 4-hour unit hydrograph kernel to capture rapid storm-band peaks.
+* **Shallow Subsurface Interflow (57%):** Routed through a linear hillslope storage reservoir ($k_{\text{interflow}} = 0.955\text{ hr}^{-1}$) sustaining realistic multi-day post-storm creek recession across the `now` boundary with zero step discontinuity.
 
 > **Calibration Note:** Until a physical stream stage gauge is installed at the bathhouse footbridge, routed `CFS` is an uncalibrated catchment-scaled discharge index. Visual ground-truth logs at the footbridges during storms can be used to tune `API_MIDPOINT_MM` and `INTERFLOW_FRACTION` in `hydro_risk_engine.py`.
 
@@ -253,7 +269,7 @@ PRAGMA synchronous = NORMAL;
 * **`local_observations`:** Ground-truth Stone Office Davis Vantage Pro2 records (`WL_HISTORIC`, `WL_LIVE`). Stores temperature, dewpoint, wetbulb, MSLP, wind vector, solar radiation, and $0.254\text{ mm}$-quantum tipping-bucket rainfall (`precip_1hr_mm`).
 * **`reference_observations`:** Synchronized hourly records from the 5 Santa Lucia reference stations (`CHWC1`, `VTCC1`, `CAHC1`, `ASRC1`, `PPSC1`) with explicit `source` provenance (`SYNOPTIC`, `NWS_OBS`, `IEM_CA_DCP`).
 * **`nws_forecasts`:** Operational 168-hour NWS `/gridpoints/MTR` forecast grids stored by `issue_time_utc` and `valid_time_utc`.
-* **`mos_corrected_forecasts`:** Deduplicated `MOS_GBM_v3_HYDRO` hourly temperature, $P_{10}$/$P_{90}$ bounds, calibrated PoP (%), and expected/$P_{90}$ QPF rates.
+* **`mos_corrected_forecasts`:** Deduplicated `MOS_GBM_v3_HYDRO` hourly temperature, $P_{10}/P_{90}$ bounds, calibrated PoP (%), and expected/$P_{90}$ QPF rates.
 * **`hydrological_risk_state`:** Hourly archive of catchment saturation ($API$), runoff coefficient ($C$), peak runoff, routed creek discharge (CFS), and 4-tier alert status.
 * **`hydrological_forecast_series`:** Forward 72-hour projected hydrograph and $API$ trajectory.
 * **`ingest_state`:** Key-value state table holding monotonic rainfall counters (`last_console_rain_year_mm`, `last_console_rain_day_mm`, `last_ref_rain_day_mm_<STID>`) and `last_obs_hour_iso`.
@@ -284,7 +300,7 @@ Never commit API keys, secrets, or physical Davis device `DID`/`KEY` credentials
 ### 2. Local Development & Manual Execution
 
 ```bash
-git clone https://github.com/MT-Wildhack/tassajara-weather.git
+git clone [https://github.com/MT-Wildhack/tassajara-weather.git](https://github.com/MT-Wildhack/tassajara-weather.git)
 cd tassajara-weather
 
 python3 -m venv .venv
@@ -333,7 +349,7 @@ During severe Santa Lucia winter storms, Tassajara's satellite/WAN internet link
 | **Power Draw** | $6\text{–}12\text{ W}$ idle, $15\text{–}20\text{ W}$ peak (easily backed by a small UPS) | $3\text{–}5\text{ W}$ idle, $10\text{–}12\text{ W}$ peak (best if running purely on off-grid DC solar/battery) |
 | **MOS Retraining Speed** | Full 730-day (`17,570`-row) 5-fold GBDT + OLS retrain in **~45–75 seconds** | Full 730-day retrain in ~2.5–4 minutes |
 | **Dust & Thermal Resilience** | Fanless aluminum chassis (e.g., MeLE Quieter4C) resists canyon dust and summer heat | Requires dust-filtered aluminum case + heatsink |
-| **Estimated Cost (w/ UPS)** | ~$220–$300 (Mini PC + 500–600 VA UPS) | ~$200–$260 (Pi 5 + NVMe Hat/SSD + PSU + Case + UPS) |
+| **Estimated Cost (w/ UPS)** | ~\$220–\$300 (Mini PC + 500–600 VA UPS) | ~\$200–\$260 (Pi 5 + NVMe Hat/SSD + PSU + Case + UPS) |
 
 **Recommendation:** Deploy a **fanless Intel N100/N150 Mini PC (16 GB RAM, 256–512 GB NVMe SSD)** running **Ubuntu Server 24.04 LTS**, backed by a **600–850 VA Sine-Wave UPS** (e.g., APC Back-UPS Pro or CyberPower CP850PFCLCD). Plug all four critical components into the **Battery Backup** outlets of the same UPS:
 1. The Mini PC
@@ -378,7 +394,7 @@ To prevent disrupting cloud uploads while guaranteeing instant offline survival,
 ```bash
 sudo apt update && sudo apt install -y python3-venv python3-pip sqlite3 git ufw avahi-daemon netcat-openbsd
 
-# Set local hostname so staff can browse to http://tassajara-weather.local:8501
+# Set local hostname so staff can browse to [http://tassajara-weather.local:8501](http://tassajara-weather.local:8501)
 sudo hostnamectl set-hostname tassajara-weather
 
 # Lock down firewall: allow SSH and Streamlit strictly from the local Stone Office LAN subnet
@@ -390,7 +406,7 @@ sudo ufw enable
 
 # Create dedicated unprivileged service user
 sudo useradd -r -m -d /opt/tassajara-weather -s /bin/bash tzmc
-sudo -u tzmc git clone https://github.com/MT-Wildhack/tassajara-weather.git /opt/tassajara-weather/app
+sudo -u tzmc git clone [https://github.com/MT-Wildhack/tassajara-weather.git](https://github.com/MT-Wildhack/tassajara-weather.git) /opt/tassajara-weather/app
 cd /opt/tassajara-weather/app
 sudo -u tzmc python3 -m venv .venv
 sudo -u tzmc .venv/bin/pip install --upgrade pip -r requirements.txt
@@ -488,11 +504,11 @@ Hosted live at **[https://tassajara-weather.streamlit.app](https://tassajara-wea
 * **8-Metric Boundary-Layer Telemetry Grid:** Live dry-bulb, RH/dewpoint, Stull wet-bulb/Tetens VPD, anemometer vector, MSLP + 3-hour barometric tendency, 24h rain + 72h MOS QPF, crest lapse rate ($^\circ\text{C/km}$ for crest stations $\Delta z \ge 0.30\text{ km}$), and gorge/coastal differentials ($\Delta T$ in $^\circ\text{F}$).
 * **5-Station Santa Lucia Network Table:** Live status (`Online`, `Online (Rain Gauge)` for `VTCC1`, or `Model Fallback / Stale`), temperature, RH, wind/gust, hourly rain, and vertical/horizontal gradient vs. Stone Office.
 * **3-Panel Interactive Plotly Suite:**
-  * *Panel 1:* Observed temperature actuals vs. MOS Quantile Fan ($P_{10}$–$P_{90}$) vs. Raw NWS forecast.
+  * *Panel 1:* Observed temperature actuals vs. MOS Quantile Fan ($P_{10}\text{–}P_{90}$) vs. Raw NWS forecast.
   * *Panel 2:* Observed canyon gusts ($485\text{ m}$) cleanly separated from forecast ridge-grid gusts ($880\text{ m}$) + RH (%).
   * *Panel 3:* MOS calibrated QPF, $P_{90}$ extreme downpour rates, observed tipping-bucket rain, and PoP (%).
-* **Deduplicated Forecast Accuracy Verification Scorecard:** Evaluates exact paired hours (72h or Full Archive) for Raw NWS vs. MOS MAE/RMSE, RMSE Skill Score (%), Hourly Win Frequency, $P_{10}$–$P_{90}$ empirical coverage, and hydrological Brier Score & QPF bias.
-* **Model Interpretability & HAC OLS Diagnostics:** Permutation feature importances and standardized Newey-West HAC OLS regression summary ($R^2$, $F$-stat, $\kappa$, $95\%$ CIs).
+* **Deduplicated Forecast Accuracy Verification Scorecard:** Evaluates exact paired hours (72h or Full Archive) for Raw NWS vs. MOS MAE/RMSE, RMSE Skill Score (%), Hourly Win Frequency, $P_{10}\text{–}P_{90}$ empirical coverage, and hydrological Brier Score & QPF bias.
+* **Model Interpretability & HAC OLS Diagnostics:** Permutation feature importances and standardized Newey-West HAC OLS regression summary ($R^2$, $F$-stat, $\kappa$, 95% CIs).
 
 ---
 
