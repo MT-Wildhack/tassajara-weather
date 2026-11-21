@@ -176,36 +176,38 @@ Production storm auditing uncovered and permanently eliminated several subtle te
 
 ## 5. MOS Machine Learning Architecture
 
-The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`**) is trained on **$17,570$ verified Davis Vantage Pro2 hourly pairs** spanning 2 full annual cycles (**$870$ observed wet hours**, $51.62\text{ in}$ verified tipping-bucket rainfall) with **30 physical predictors**.
+The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`**, artifact `models/tassajara_mos_v1.joblib`) is trained on **$17,570$ verified Davis Vantage Pro2 hourly pairs** spanning 2 full annual cycles with **30 physical predictors** (live growing archive: $17,600+$ genuine Davis hours, $876$ observed wet hours, and $51.39\text{ in}$ verified tipping-bucket rainfall as of November 21, 2026).
 
 ### Verified Production Benchmarks (Full 730-Day Purged 5-Fold Out-of-Fold CV)
 
 * **Raw Generic NWP Forecast RMSE:** $2.715^\circ\text{C}$ ($4.89^\circ\text{F}$)
-* **Tassajara MOS Corrected RMSE:** **$2.024^\circ\text{C}$ ($3.64^\circ\text{F}$)**
-* **Full-Cycle Thermal Skill Improvement:** **+25.5% RMSE reduction**
-* **HAC OLS Diagnostic Baseline ($n = 17,570$):** $R^2 = 0.419$, $\text{Adj } R^2 = 0.418$, matrix condition number $\kappa < 30$ (well-conditioned, zero severe multicollinearity).
+* **Tassajara MOS Corrected RMSE (Out-of-Fold):** **$2.024^\circ\text{C}$ ($3.64^\circ\text{F}$)**
+* **Full-Cycle Thermal Skill Improvement (Out-of-Fold):** **+25.5% RMSE reduction**
+* **HAC OLS Diagnostic Baseline ($n = 17,570$, 27 standardized terms):** $R^2 = 0.419$, $\text{Adj } R^2 = 0.418$, $F = 118.2$ ($p < 0.001$), matrix condition number $\kappa = 19.7$ (well-conditioned, zero severe multicollinearity).
+
+> **Note on Dashboard Scorecard vs. Out-of-Fold CV:** In `app.py`, selecting **Full Historical Archive** ($17,601+$ paired hours) evaluates the fitted ensemble across both historical `MOS_GBM_v2_HYDRO` backfill hindcasts (`2024-11-17` to `2026-11-18`) and live `MOS_GBM_v3_HYDRO` operational runs (`2026-11-05` onward). Because most archive rows overlap the training window, full-archive scorecard figures are tighter (e.g., MOS RMSE $\pm 1.82^\circ\text{F}$ vs. Raw NWP $\pm 4.76^\circ\text{F}$, +61.8% RMSE skill, 81.3% win frequency, 95.8% $P_{10}\text{–}P_{90}$ coverage, and hydrological Brier Score $0.0153$). Use the **Purged 5-Fold Out-of-Fold CV** figures above (or the rolling **72-Hour** operational verification window in the UI) when assessing unbiased out-of-sample generalization error.
 
 ### Subsystem Design
 
 1. **Thermal Subsystem (`HistGradientBoostingRegressor`):**
-   * Mean error corrector (`loss='squared_error'`, L2-regularized) paired with dual quantile estimators ($\alpha = 0.10$ and $\alpha = 0.90$) generating conformal-calibrated 80% uncertainty bands ($P_{10}$ cold-pool floor to $P_{90}$ daytime ceiling).
+   * Mean error corrector (`loss='squared_error'`, L2-regularized) paired with dual quantile estimators ($\alpha = 0.10$ and $\alpha = 0.90$) and asymmetric split-conformal residual pads ($-1.86^\circ\text{C}$ low / $+1.44^\circ\text{C}$ high) generating calibrated 80% uncertainty bands ($P_{10}$ cold-pool floor to $P_{90}$ daytime ceiling).
    * Issue-time local anomalies (temperature persistence, lapse-rate anomaly, gorge confinement, and barometric pressure tendency) decay exponentially with forecast lead time:
 
-     $$
+     ```math
      \Gamma_{\text{eff}}(h) = 6.5 + (\Gamma_0 - 6.5)\cdot e^{-h / 12.0}
-     $$
+     ```
 
 2. **Two-Stage Hydrological Hurdle Subsystem:**
    * **Stage 1 (Calibrated PoP Classifier):** `CalibratedClassifierCV` wrapping `HistGradientBoostingClassifier` estimating $P(\text{Rain} \ge 0.254\text{ mm})$.
    * **Stage 2 (Wet-Only QPF & $P_{90}$ Regressors):** Trained strictly on verified wet hours ($\ge 0.254\text{ mm}$) to prevent dry-hour zero-inflation from suppressing heavy Santa Lucia rain rates.
    * **Virga & Orographic Modulation:** Modulates pre-frontal QPF using boundary-layer Vapor Pressure Deficit (VPD) and upslope moisture flux:
 
-     $$
+     ```math
      F_{\text{virga}} = \exp(-0.48 \cdot \text{VPD}), \quad F_{\text{oro}} = 1.0 + 0.08 \cdot \text{Flux}_{\text{upslope}} + 0.05 \cdot (-\Delta P_{3\text{h}})
-     $$
+     ```
 
 3. **Econometric HAC OLS Baseline:**
-   * Standardized predictors evaluated via Ordinary Least Squares with 12-hour lag Newey-West Heteroskedasticity and Autocorrelation Consistent standard errors (`cov_type='HAC', maxlags=12`), exposed directly in the Scientific UI for ongoing physical interpretability.
+   * 27 linearly independent standardized predictors evaluated via Ordinary Least Squares with 12-hour lag Newey-West Heteroskedasticity and Autocorrelation Consistent standard errors (`cov_type='HAC', maxlags=12`), exposed directly in the Scientific UI for ongoing physical interpretability.
 
 ---
 
@@ -215,23 +217,23 @@ Implemented in `hydro_risk_engine.py`, this module tracks continuous catchment s
 
 ### 1. Dynamic Antecedent Precipitation Index ($API$)
 
-$$
+```math
 API_t = API_{t-1} \cdot k_{\text{hr}} + P_{\text{eff}, t}
-$$
+```
 
 * **Evaporative Recession ($k_{\text{day}}$):** Modulated dynamically between $0.88$ and $0.94$ from observed Vapor Pressure Deficit (VPD) so saturated winter storms drain slower than dry autumn intervals:
 
-  $$
+  ```math
   k_{\text{day}} = \text{clip}\!\left(0.935 - 0.025 \cdot \min(\text{VPD},\, 2.2),\, 0.88,\, 0.94\right)
-  $$
+  ```
 
 * **Effective Catchment Rain ($P_{\text{eff}}$):** Blends Stone Office tipping-bucket rain with **online-only** ridge stations (`CHWC1`, `VTCC1`, `PPSC1`), explicitly ignoring `OPENMETEO_SYNTH` / `OFFLINE` fallback rows.
 
 ### 2. Nonlinear Soil-Saturation Runoff Coefficient ($C$)
 
-$$
+```math
 C(API) = C_{\min} + \frac{C_{\max} - C_{\min}}{1 + \exp\!\left(-\dfrac{API + 0.18 \cdot P_{72\text{h}} - API_{\text{mid}}}{s}\right)}
-$$
+```
 
 Where $C_{\min} = 0.08$ (dry fractured granite / duff abstraction) and $C_{\max} = 0.86$ (saturated bedrock/regolith sheetflow ceiling).
 
