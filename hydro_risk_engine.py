@@ -807,7 +807,7 @@ def project_forward_hydro_series(
 # ---------------------------------------------------------------------------
 def ensure_hydro_schema(db_path: str = "tassajara_weather.db") -> None:
     """Idempotently creates the Early Flood & Road Warning tables and view in SQLite."""
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS stream_gauge_observations (
@@ -1150,7 +1150,7 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
     """Pipeline entry point invoked every hour by `run_hourly_mos_pipeline.py`."""
     ensure_hydro_schema(db_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         obs_df = pd.read_sql_query(
             """
             SELECT * FROM local_observations

@@ -4,8 +4,11 @@ mos_model.py (v5.0 — Leak-Free 30-Feature Santa Lucia Spatial MOS, Purged Temp
 True OOF Conformal Quantiles & Proper Wet-Only Hydrological Hurdle)
 """
 
+import logging
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger("TassajaraMOS")
 import joblib
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
@@ -212,7 +215,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_well_conditioned_ols_matrix(X_df: pd.DataFrame, max_r2: float = 0.94) -> pd.DataFrame:
+def build_well_conditioned_ols_matrix(X_df: pd.DataFrame, max_r2: float = 0.85) -> pd.DataFrame:
     """
     Standardizes (Z-scores) predictors and explicitly PRUNES strictly constant or
     near-collinear derived predictors (R^2 > 0.94 / VIF > 16.7) rather than silently
@@ -374,14 +377,25 @@ class TassajaraMOSCorrector:
         )
         try:
             gap_cal = min(24, max(0, len(X_tr) // 20))
-            cal_cv = CalibratedClassifierCV(
-                estimator=clf_base,
-                method="sigmoid",
-                cv=TimeSeriesSplit(n_splits=3, gap=gap_cal),
-            )
-            cal_cv.fit(X_tr, y_wet)
-            m_pop = cal_cv
-        except Exception:
+            inner_splits = [
+                (tr_i, va_i)
+                for tr_i, va_i in TimeSeriesSplit(n_splits=3, gap=gap_cal).split(X_tr)
+                if int(y_wet.iloc[tr_i].sum()) >= 5 and int(y_wet.iloc[va_i].sum()) >= 5
+            ]
+            if len(inner_splits) >= 2:
+                cal_cv = CalibratedClassifierCV(
+                    estimator=clf_base,
+                    method="sigmoid",
+                    cv=inner_splits,
+                )
+                cal_cv.fit(X_tr, y_wet)
+                m_pop = cal_cv
+            else:
+                logger.warning("Skipping Platt calibration: fewer than 2 inner folds with >= 5 wet hours.")
+                clf_base.fit(X_tr, y_wet)
+                m_pop = clf_base
+        except Exception as exc:
+            logger.warning(f"CalibratedClassifierCV fallback to raw PoP probabilities: {exc}")
             clf_base.fit(X_tr, y_wet)
             m_pop = clf_base
 

@@ -77,7 +77,7 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
     """
     Path("models").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         if Path("schema.sql").exists():
             with open("schema.sql", "r", encoding="utf-8") as f:
                 conn.executescript(f.read())
@@ -194,6 +194,7 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
 
         conn.executescript(
             """
+            DROP INDEX IF EXISTS idx_nws_valid_time;
             DROP VIEW IF EXISTS vw_mos_training_dataset;
             CREATE VIEW vw_mos_training_dataset AS
             WITH canonical_fc AS (
@@ -332,6 +333,7 @@ def fetch_weatherlink_history(
 
             for sensor in payload.get("sensors", []):
                 dst = int(sensor.get("data_structure_type") or 0)
+                stype = int(sensor.get("sensor_type") or 0)
 
                 for rec in sensor.get("data", []):
                     ts = rec.get("ts")
@@ -374,8 +376,8 @@ def fetch_weatherlink_history(
                     if bar_sl is not None:
                         b["mslp_hpa"] = inhg_to_hpa(bar_sl)
 
-                    # Skip indoor/health sensors for outdoor temperature, wind, and rain
-                    if dst in INDOOR_OR_HEALTH_DST and "temp_out" not in rec:
+                    # Skip indoor/health/AirLink sensors for outdoor temperature, wind, and rain
+                    if (dst in INDOOR_OR_HEALTH_DST or stype in {323, 326, 504, 506}) and "temp_out" not in rec:
                         continue
 
                     # 2. Accumulate tipping-bucket rain across sub-hourly archive intervals
@@ -491,7 +493,12 @@ def fetch_weatherlink_history(
 
     if "mslp_hpa" in df.columns and df["mslp_hpa"].notna().any():
         df["mslp_hpa"] = df["mslp_hpa"].ffill().bfill().fillna(1013.25)
-        df["pressure_trend_3hr_hpa"] = df["mslp_hpa"].diff(3).round(2).fillna(0.0)
+        _dt_idx = pd.to_datetime(df["valid_time_utc"], utc=True)
+        _mslp_hr = pd.Series(df["mslp_hpa"].values, index=_dt_idx).sort_index()
+        _mslp_hr = _mslp_hr[~_mslp_hr.index.duplicated(keep="last")]
+        _full_idx = pd.date_range(_mslp_hr.index.min(), _mslp_hr.index.max(), freq="1h", tz="UTC")
+        _trend_3h = _mslp_hr.reindex(_full_idx).diff(3).round(2)
+        df["pressure_trend_3hr_hpa"] = _dt_idx.map(_trend_3h).fillna(0.0).values
     else:
         df["mslp_hpa"] = 1013.25
         df["pressure_trend_3hr_hpa"] = 0.0
@@ -652,7 +659,7 @@ def store_observations_to_sqlite(
         for _, r in obs_df.iterrows()
         if pd.notna(r["temp_c"])
     ]
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         conn.executemany(
             """
             INSERT INTO local_observations (
@@ -712,7 +719,7 @@ def store_backfill_to_sqlite(
     if obs_df is not None and not obs_df.empty:
         store_observations_to_sqlite(obs_df, db_path, source="WL_HISTORIC")
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute(
             """
             DELETE FROM nws_forecasts
@@ -856,7 +863,7 @@ def populate_mos_verification_and_active_forecasts(
         hist_src = train_df.reset_index(drop=True)
         hist_model_ver = "MOS_GBM_v3_HYDRO"
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         existing_op_pairs = set(
             conn.execute(
                 """
@@ -894,7 +901,7 @@ def populate_mos_verification_and_active_forecasts(
         if (str(r["issue_time_utc"]), str(r["valid_time_utc"])) not in existing_op_pairs
     ]
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         if use_oof:
             conn.execute("DELETE FROM mos_corrected_forecasts WHERE model_version = 'MOS_GBM_v3_OOF'")
         if hist_rows:

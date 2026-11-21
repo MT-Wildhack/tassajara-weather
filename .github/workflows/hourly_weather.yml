@@ -94,12 +94,17 @@ jobs:
               IS_WEEKLY="true"
             fi
 
-            python run_hourly_mos_pipeline.py
+            if [ "${attempt:-1}" -gt 1 ]; then
+              python run_hourly_mos_pipeline.py --skip-alerts
+            else
+              python run_hourly_mos_pipeline.py
+            fi
 
             python -c "
           import sqlite3
           with sqlite3.connect('tassajara_weather.db') as conn:
               conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+              conn.execute('PRAGMA journal_mode=DELETE;')
               if '${IS_WEEKLY}' == 'true':
                   conn.execute('VACUUM;')
               obs_cnt = conn.execute('SELECT COUNT(*) FROM local_observations WHERE temp_c IS NOT NULL').fetchone()[0]

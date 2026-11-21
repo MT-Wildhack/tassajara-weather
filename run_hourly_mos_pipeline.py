@@ -102,7 +102,7 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
 
     obs_hour_iso = snap_to_hour_iso(tass_obs.get("valid_time_utc"))
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         _ensure_ingest_state_table(conn)
 
         # Continuous 3-hour barometric tendency from SQLite MSLP (never relies on discrete dst=2 codes)
@@ -292,7 +292,7 @@ def run_nws_forecast_ingest(db_path: str = DB_PATH) -> int:
 
 
 def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         latest_fc_df = pd.read_sql_query(
             """
             SELECT * FROM nws_forecasts
@@ -464,6 +464,7 @@ def run_alert_evaluation(db_path: str = DB_PATH) -> None:
 
 
 def main():
+    skip_alerts = "--skip-alerts" in sys.argv
     ensure_schema_and_view(DB_PATH)
     ensure_hydro_schema(DB_PATH)
     critical_failures = []
@@ -494,7 +495,10 @@ def main():
         logger.error(f"Hydrological risk engine failure: {exc}")
         critical_failures.append(f"hydro_risk: {exc}")
 
-    run_alert_evaluation(DB_PATH)
+    if not skip_alerts:
+        run_alert_evaluation(DB_PATH)
+    else:
+        logger.info("Skipping alert dispatch (--skip-alerts active).")
 
     if critical_failures:
         logger.error(f"Pipeline completed with critical failure(s): {'; '.join(critical_failures)}")

@@ -331,6 +331,20 @@ class WeatherLinkV2Client:
         }
 
         max_iss_ts = 0
+        for _s in payload.get("sensors", []):
+            _dst = int(_s.get("data_structure_type") or 0)
+            _stype = int(_s.get("sensor_type") or 0)
+            _recs = _s.get("data", [])
+            if not _recs:
+                continue
+            _lat = _recs[0]
+            if (_dst in INDOOR_OR_HEALTH_DST or _stype in {323, 326, 504, 506}) and "temp_out" not in _lat:
+                continue
+            _ts = int(_lat.get("ts") or 0)
+            if _ts > max_iss_ts:
+                max_iss_ts = _ts
+        if max_iss_ts > 0:
+            parsed["valid_time_utc"] = datetime.fromtimestamp(max_iss_ts, tz=timezone.utc).isoformat()
 
         for sensor in payload.get("sensors", []):
             dst = int(sensor.get("data_structure_type") or 0)

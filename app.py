@@ -190,8 +190,20 @@ FEATURE_METADATA = {
         "Binary indicator (1.0 when Sun is above 0 deg but blocked by the 32 deg SW Black Cone Trail ridge).",
     ),
     "effective_insolation": (
-        "Effective Canyon Insolation",
-        "Direct-beam solar radiation factor sin(el) gated by the local topographic horizon profile.",
+        "Effective Canyon Insolation (Clear-Sky)",
+        "Clear-sky direct-beam solar radiation factor sin(el) gated by the local topographic horizon profile.",
+    ),
+    "cloud_attenuated_insolation": (
+        "Cloud-Attenuated Canyon Insolation",
+        "Direct canyon insolation attenuated by Kasten-Czeplak cloud transmittance and active rainfall.",
+    ),
+    "overcast_daytime_cooling_idx": (
+        "Overcast Daytime Cooling Index",
+        "Interaction of daytime solar geometry, squared cloud fraction, and RH suppressing clear-sky warm bias.",
+    ),
+    "clear_nocturnal_cooling_idx": (
+        "Clear Nocturnal Katabatic Index",
+        "Night/shade clear-sky radiational cooling potential weighted by calm wind confinement.",
     ),
     "decayed_init_bias_c": (
         "Decayed Initialization Bias (C)",
@@ -1041,7 +1053,7 @@ def backfill_missing_hindcast_verification(
     return merged_v
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180)
 def load_all_dashboard_data():
     now_hour_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     now_hour_iso = now_hour_utc.isoformat()
@@ -1502,7 +1514,7 @@ def load_all_dashboard_data():
             prev_day_val = 0.0
             if now_hour_iso == today_mid_iso and Path(DB_PATH).exists():
                 try:
-                    with sqlite3.connect(DB_PATH) as conn_st:
+                    with _connect_ro(DB_PATH) as conn_st:
                         st_rows = {
                             r[0]: (r[1], r[2])
                             for r in conn_st.execute(
@@ -1576,7 +1588,7 @@ def load_all_dashboard_data():
 
     fresh_sqlite_refs = sum(
         1 for d in ref_dict.values()
-        if d.get("online") and d.get("age_hours") is not None and float(d.get("age_hours", 99.0)) <= 0.42
+        if d.get("online") and d.get("age_hours") is not None and float(d.get("age_hours", 99.0)) <= 1.25
     )
     try:
         live_refs = fetch_regional_reference_stations() if fresh_sqlite_refs < 4 else {}
@@ -1684,7 +1696,8 @@ def load_all_dashboard_data():
 
 
 @st.cache_data(ttl=300)
-def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
+def compute_model_diagnostics_and_importances(_verify_df: pd.DataFrame, model_mtime: float = 0.0):
+    verify_df = _verify_df
     """
     Loads precomputed standardized Newey-West HAC OLS & permutation importances from
     models/tassajara_mos_v1.joblib (or computes them cleanly on verify_df if absent).
@@ -2162,7 +2175,7 @@ def render_hydro_risk_section(
             margin=dict(t=55, b=20, l=22, r=22),
             paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        st.plotly_chart(fig_gauge, width="stretch")
 
         st.markdown(
             f'<div class="tzmc-card" style="padding: 10px 12px; font-size: 0.79rem;">'
@@ -2355,6 +2368,28 @@ def render_hydro_risk_section(
             secondary_y=False,
         )
 
+        if float(s.get("peak_discharge_p90_24hr_cfs", 0.0)) >= 120.0:
+            fig_hydro.add_hline(
+                y=250.0,
+                line_dash="dot",
+                line_color="#ea580c",
+                annotation_text="Orange Debris/Bridge Watch (250 CFS)",
+                annotation_position="top left",
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+            fig_hydro.add_hline(
+                y=500.0,
+                line_dash="dot",
+                line_color="#dc2626",
+                annotation_text="Red Flood Stage Warning (500 CFS)",
+                annotation_position="top right",
+                row=2,
+                col=1,
+                secondary_y=False,
+            )
+
         divider_local = pd.Timestamp(now_hour_utc).tz_convert(LOCAL_TZ)
         for r_i in (1, 2):
             fig_hydro.add_vline(
@@ -2411,14 +2446,14 @@ def render_hydro_risk_section(
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0.0),
         )
-        st.plotly_chart(fig_hydro, use_container_width=True)
+        st.plotly_chart(fig_hydro, width="stretch")
 
     with st.expander(
         "Inspect 4-Tier Flood & Road Severity Matrix & Hourly Projected Hydrograph Table",
         expanded=False,
     ):
         st.markdown("#### 1. TZMC Multi-Tier Flood & Road Washout Severity Matrix")
-        st.dataframe(pd.DataFrame(get_severity_matrix_rows()), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(get_severity_matrix_rows()), width="stretch", hide_index=True)
 
         if not proj_df.empty:
             st.markdown("#### 2. Hourly Projected Catchment Saturation & Routed Creek Hydrograph (Next 72 Hours)")
@@ -2440,7 +2475,7 @@ def render_hydro_risk_section(
                 "Expected Creek Q (CFS)": p_tbl["projected_discharge_cfs"].round(1),
                 "P90 Surge Ceiling Q (CFS)": p_tbl["projected_discharge_p90_cfs"].round(1),
             })
-            st.dataframe(display_hydro_tbl, use_container_width=True, hide_index=True)
+            st.dataframe(display_hydro_tbl, width="stretch", hide_index=True)
 
 
 def render_layman_forecast_view(
@@ -2583,7 +2618,7 @@ def render_layman_forecast_view(
         c1, c2 = st.columns(2)
         wind_disp = "Calm" if w_mph < 0.5 else f"{w_mph:.0f} mph {w_card}"
         c1.metric(
-            "Today's High / Low",
+            "Past 24h High / Low",
             f"{hi_24_f:.0f}°F / {lo_24_f:.0f}°F",
             "Past 24-Hour Range",
             delta_color="off",
@@ -2936,7 +2971,7 @@ def render_layman_forecast_view(
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0.0),
         )
-        st.plotly_chart(fig_layman, use_container_width=True)
+        st.plotly_chart(fig_layman, width="stretch")
 
     if isinstance(hydro_bundle, dict) and "summary" in hydro_bundle:
         st.markdown("---")
@@ -2966,7 +3001,7 @@ def render_layman_forecast_view(
                 obs_today["nws_pop_pct"] = _obs_wet_pop
                 obs_today["mos_qpf_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
                 obs_today["nws_qpf_1hr_mm"] = get_col(obs_today, "precip_1hr_mm", 0.0)
-                obs_today["nws_sky_cover_pct"] = 20.0
+                obs_today["nws_sky_cover_pct"] = np.nan
                 obs_today["corrected_wind_gust_ms"] = get_col(
                     obs_today, "wind_gust_ms", get_col(obs_today, "wind_speed_ms", 0.0)
                 )
@@ -2996,7 +3031,7 @@ def render_layman_forecast_view(
         d_df["_qpf_in"] = (
             get_col(d_df, "mos_qpf_mm", get_col(d_df, "nws_qpf_1hr_mm", 0.0)) / 25.4
         )
-        d_df["_sky"] = get_col(d_df, "nws_sky_cover_pct", 20.0)
+        d_df["_sky"] = get_col(d_df, "nws_sky_cover_pct", np.nan)
         d_df["_gust_mph"] = (
             get_col(d_df, "corrected_wind_gust_ms", get_col(d_df, "nws_wind_speed_ms", 1.0) * 1.35)
             * 2.23694
@@ -3010,7 +3045,7 @@ def render_layman_forecast_view(
                 Coldest_Creek_F=("_p10_f", lambda s: round(float(s.min()), 0)),
                 Rain_Chance_Pct=("_pop", lambda s: int(round(safe_float(s.max(), 0.0), 0))),
                 Rain_Total_In=("_qpf_in", lambda s: round(float(s.sum()), 2)),
-                Avg_Sky=("_sky", lambda s: float(s.mean())),
+                Avg_Sky=("_sky", lambda s: float(s.mean()) if s.notna().any() else 20.0),
                 Peak_Breeze_MPH=("_gust_mph", lambda s: round(float(s.max()), 0)),
             )
             .sort_values("Sort_Date")
@@ -3082,7 +3117,7 @@ def render_layman_forecast_view(
         with st.expander("View Detailed 7-Day Planner Table", expanded=False):
             st.dataframe(
                 pd.DataFrame(summary_rows),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -3095,7 +3130,8 @@ now_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0)
 
 ref_dict, ref_hist_df, obs_df, future_fc_df, verify_df, archive_stats = load_all_dashboard_data()
 future_fc_df = filter_future_horizon(future_fc_df, now_hour_utc)
-model_diag = compute_model_diagnostics_and_importances(verify_df)
+_model_mtime = MODEL_PATH.stat().st_mtime if MODEL_PATH.exists() else 0.0
+model_diag = compute_model_diagnostics_and_importances(verify_df, model_mtime=_model_mtime)
 hydro_bundle = compute_dashboard_hydro_state(
     obs_df=obs_df,
     future_fc_df=future_fc_df,
@@ -3208,7 +3244,7 @@ st.markdown(
     f'<b>SANTA LUCIA REFS ({len(online_refs)}/5 LIVE):</b> {ref_banner_str}<br>'
     f'<b>LAST OBSERVATION:</b> {last_obs_str} &nbsp;&bull;&nbsp; '
     f'<b>NWS/MOS INIT:</b> {fc_issue_str} &nbsp;&bull;&nbsp; '
-    f'<b>SOLAR GEOMETRY:</b> {solar_state} '
+    f'<b>SOLAR GEOMETRY (CLEAR-SKY):</b> {solar_state} '
     f'(El: {solar_el:.1f}°, Az: {solar_az:.0f}°, Horizon: {horizon_elev:.0f}°) &nbsp;&bull;&nbsp; '
     f'<b>ENGINE:</b> {active_model_name}'
     f'</div>',
@@ -3512,7 +3548,7 @@ else:
                 })
             st.dataframe(
                 pd.DataFrame(ref_rows_ui),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -3673,7 +3709,7 @@ else:
                 ),
             }).iloc[::-1].reset_index(drop=True)
 
-            st.dataframe(ver_table, use_container_width=True, hide_index=True)
+            st.dataframe(ver_table, width="stretch", hide_index=True)
     else:
         st.warning(
             "No paired observation-forecast records found in tassajara_weather.db. "
@@ -4134,7 +4170,7 @@ else:
             paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0.0),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.markdown("---")
 
@@ -4301,7 +4337,7 @@ else:
                 "Peak_Gust_MPH": "Peak Gust (mph)",
             }
         )
-        st.dataframe(display_daily, use_container_width=True, hide_index=True)
+        st.dataframe(display_daily, width="stretch", hide_index=True)
 
     st.markdown("---")
 
@@ -4368,8 +4404,8 @@ else:
                 paper_bgcolor="rgba(0,0,0,0)",
                 showlegend=False,
             )
-            st.plotly_chart(fig_imp, use_container_width=True)
-            st.dataframe(imp_df, use_container_width=True, hide_index=True)
+            st.plotly_chart(fig_imp, width="stretch")
+            st.dataframe(imp_df, width="stretch", hide_index=True)
         else:
             st.info("Insufficient verification rows to compute permutation feature importances.")
 
@@ -4404,7 +4440,7 @@ else:
 
         if not model_diag["ols_coef_df"].empty:
             st.markdown("#### Standardized Newey-West HAC OLS Coefficient Table (`cov_type='HAC', maxlags=12`)")
-            st.dataframe(model_diag["ols_coef_df"], use_container_width=True, hide_index=True)
+            st.dataframe(model_diag["ols_coef_df"], width="stretch", hide_index=True)
 
         if model_diag["ols_summary_text"]:
             with st.expander("View Raw Statsmodels ASCII Summary Output (corrector.ols_summary)", expanded=True):

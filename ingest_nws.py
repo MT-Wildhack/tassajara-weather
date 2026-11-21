@@ -674,7 +674,7 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
         for _, r in df_future.iterrows()
     ]
 
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         conn.executemany(
             """
             INSERT OR REPLACE INTO nws_forecasts (
@@ -706,7 +706,7 @@ def prune_old_forecasts(db_path: str = "tassajara_weather.db", keep_days: int = 
         datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         - timedelta(days=int(keep_days))
     ).isoformat()
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute(
             """
             DELETE FROM nws_forecasts
