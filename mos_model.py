@@ -124,6 +124,17 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["nws_sky_cover_pct"] = sky_pct
 
     w_spd = _num_series(df, "nws_wind_speed_ms", 0.0).clip(lower=0.0)
+    cloud_frac = np.clip(sky_pct / 100.0, 0.0, 1.0)
+    cloud_trans = 1.0 - 0.75 * (cloud_frac ** 3.4)
+    rain_atten = np.exp(-0.35 * qpf_mm)
+    out["cloud_attenuated_insolation"] = solar_df["effective_insolation"] * cloud_trans * rain_atten
+    out["overcast_daytime_cooling_idx"] = (
+        solar_df["effective_insolation"] * (cloud_frac ** 2) * (rh_pct / 100.0)
+    )
+    is_dark_or_shade = (solar_df["effective_insolation"] <= 0.0).astype(float)
+    out["clear_nocturnal_cooling_idx"] = (
+        is_dark_or_shade * (1.0 - 0.75 * (cloud_frac ** 2)) * np.exp(-w_spd / 3.0)
+    )
     w_dir_rad = np.radians(_num_series(df, "nws_wind_dir_deg", 0.0))
     out["wind_along_canyon_ms"] = w_spd * np.cos(w_dir_rad - CANYON_AXIS_RAD)
     out["wind_cross_canyon_ms"] = w_spd * np.sin(w_dir_rad - CANYON_AXIS_RAD)
@@ -349,6 +360,8 @@ class TassajaraMOSCorrector:
         self.q_scale_high = 1.0
         self.conformal_pad_low_c = 0.0
         self.conformal_pad_high_c = 0.0
+        self.qpf_uses_log_ratio = True
+        self.oof_predictions_df = None
 
     def _fit_hydro_models(self, X_tr: pd.DataFrame, y_p_tr: pd.Series):
         y_wet = (y_p_tr >= TIPPING_BUCKET_MM).astype(int)
@@ -373,17 +386,53 @@ class TassajaraMOSCorrector:
             m_pop = clf_base
 
         wet_mask = y_p_tr >= TIPPING_BUCKET_MM
+        X_wet = X_tr.loc[wet_mask]
+        y_wet_vals = y_p_tr.loc[wet_mask].values
+        q_raw_wet = np.clip(X_wet["nws_qpf_1hr_mm"].values, 0.0, None)
+        # Bounded log-ratio target preserves linear scaling into extreme Atmospheric River intensities
+        z_target = np.clip(np.log((y_wet_vals + 0.5) / (q_raw_wet + 0.5)), -1.2, 0.85)
         m_qpf = HistGradientBoostingRegressor(
-            loss="poisson", max_iter=300, learning_rate=0.04,
+            loss="squared_error", max_iter=300, learning_rate=0.04,
             max_leaf_nodes=20, min_samples_leaf=12, l2_regularization=2.5, random_state=42,
         )
         m_p90 = HistGradientBoostingRegressor(
             loss="quantile", quantile=0.90, max_iter=300, learning_rate=0.04,
             max_leaf_nodes=20, min_samples_leaf=12, l2_regularization=2.5, random_state=42,
         )
-        m_qpf.fit(X_tr.loc[wet_mask], y_p_tr.loc[wet_mask])
-        m_p90.fit(X_tr.loc[wet_mask], y_p_tr.loc[wet_mask])
+        m_qpf.fit(X_wet, z_target)
+        m_p90.fit(X_wet, z_target)
         return m_pop, m_qpf, m_p90
+
+    @staticmethod
+    def _augment_training_leads(X_tr: pd.DataFrame, y_tr: pd.Series, seed: int = 42):
+        """Fold-internal synthetic lead augmentation so Day 2-7 decayed features stay in-distribution."""
+        if len(X_tr) < 200:
+            return X_tr, y_tr
+        rng = np.random.default_rng(seed)
+        n_aug = min(len(X_tr), max(400, len(X_tr) // 3))
+        idx_aug = rng.choice(len(X_tr), size=n_aug, replace=False)
+        X_aug = X_tr.iloc[idx_aug].copy()
+        y_aug = y_tr.iloc[idx_aug].copy()
+        orig_lead = np.clip(X_aug["lead_time_hours"].values, 1.0, None)
+        syn_lead = rng.choice(np.array([18.0, 36.0, 72.0, 120.0]), size=n_aug)
+        X_aug["lead_time_hours"] = syn_lead
+        for col, tau in (
+            ("decayed_init_bias_c", 12.0),
+            ("pressure_trend_3hr_hpa", 12.0),
+            ("frontal_pressure_fall_hpa", 12.0),
+            ("decayed_coastal_inland_grad_c", 12.0),
+            ("decayed_canyon_confinement_c", 8.0),
+            ("issue_marine_layer_cap_idx", 10.0),
+            ("decayed_chews_precip_mm", 6.0),
+            ("decayed_ssw_spillover_precip_mm", 6.0),
+        ):
+            if col in X_aug.columns:
+                X_aug[col] = X_aug[col].values * np.exp(-(syn_lead - orig_lead) / tau)
+        if "issue_lapse_chews_c_km" in X_aug.columns:
+            X_aug["issue_lapse_chews_c_km"] = 6.5 + (
+                X_aug["issue_lapse_chews_c_km"].values - 6.5
+            ) * np.exp(-(syn_lead - orig_lead) / 12.0)
+        return pd.concat([X_tr, X_aug], ignore_index=True), pd.concat([y_tr, y_aug], ignore_index=True)
 
     def _blend_hydro_predictions(
         self, X_fut: pd.DataFrame, m_pop, m_qpf, m_p90
@@ -401,14 +450,19 @@ class TassajaraMOSCorrector:
         )
         p_wet_blend = mos_pop_pct / 100.0
 
-        cond_qpf = np.clip(m_qpf.predict(X_aligned), 0.0, None)
-        cond_p90 = np.maximum(cond_qpf, np.clip(m_p90.predict(X_aligned), 0.0, None))
-
         raw_qpf_arr = (
-            X_fut["nws_qpf_1hr_mm"].values
+            np.clip(X_fut["nws_qpf_1hr_mm"].values, 0.0, None)
             if "nws_qpf_1hr_mm" in X_fut.columns
             else np.zeros(len(X_fut))
         )
+        if getattr(self, "qpf_uses_log_ratio", False):
+            z_mean = np.clip(m_qpf.predict(X_aligned), -1.2, 0.85)
+            z_p90 = np.maximum(z_mean, np.clip(m_p90.predict(X_aligned), -1.2, 1.15))
+            cond_qpf = np.maximum(0.0, (raw_qpf_arr + 0.5) * np.exp(z_mean) - 0.5)
+            cond_p90 = np.maximum(cond_qpf, (raw_qpf_arr + 0.5) * np.exp(z_p90) - 0.5)
+        else:
+            cond_qpf = np.clip(m_qpf.predict(X_aligned), 0.0, None)
+            cond_p90 = np.maximum(cond_qpf, np.clip(m_p90.predict(X_aligned), 0.0, None))
         active_mask = (mos_pop_pct >= 15.0) | (raw_qpf_arr >= TIPPING_BUCKET_MM)
 
         # Mathematically exact hurdle expectation: E[Y] = P(wet) * E[Y | wet]
@@ -483,14 +537,17 @@ class TassajaraMOSCorrector:
         cqr_low_scores, cqr_high_scores = [], []
         oof_qpf_true, oof_qpf_raw, oof_qpf_mos = [], [], []
         oof_wet_true, oof_pop_raw, oof_pop_mos = [], [], []
+        oof_frames = []
+        last_fold_state = None
 
-        for train_idx, test_idx in tscv.split(X):
+        for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
             y_tr, y_te = y_err.iloc[train_idx], y_err.iloc[test_idx]
+            X_tr_aug, y_tr_aug = self._augment_training_leads(X_tr, y_tr, seed=42 + fold_i)
 
-            self.model_mean.fit(X_tr, y_tr)
-            self.model_p10.fit(X_tr, y_tr)
-            self.model_p90.fit(X_tr, y_tr)
+            self.model_mean.fit(X_tr_aug, y_tr_aug)
+            self.model_p10.fit(X_tr_aug, y_tr_aug)
+            self.model_p90.fit(X_tr_aug, y_tr_aug)
 
             pred_err = self.model_mean.predict(X_te)
             pred_p10 = np.minimum(self.model_p10.predict(X_te), pred_err - 0.35)
@@ -518,16 +575,64 @@ class TassajaraMOSCorrector:
             oof_pop_raw.extend((X_te["nws_pop_pct"].values / 100.0).clip(0.0, 1.0).tolist())
             oof_pop_mos.extend((h_oof["mos_pop_pct"].values / 100.0).clip(0.0, 1.0).tolist())
 
+            fold_df = df_sorted.iloc[test_idx][["issue_time_utc", "valid_time_utc", "nws_temp_c"]].copy()
+            fold_df["pred_temp_error_c"] = np.round(pred_err, 2)
+            fold_df["corrected_temp_c"] = np.round(mos_fc_te.values, 2)
+            fold_df["corrected_temp_p10_c"] = np.round(raw_fc_te.values + pred_p10, 2)
+            fold_df["corrected_temp_p90_c"] = np.round(raw_fc_te.values + pred_p90, 2)
+            fold_df["raw_nws_pop_pct"] = np.round(X_te["nws_pop_pct"].values, 1)
+            fold_df["mos_pop_pct"] = h_oof["mos_pop_pct"].values
+            fold_df["raw_nws_qpf_mm"] = np.round(X_te["nws_qpf_1hr_mm"].values, 3)
+            fold_df["mos_qpf_mm"] = h_oof["mos_qpf_mm"].values
+            fold_df["mos_qpf_p90_mm"] = h_oof["mos_qpf_p90_mm"].values
+            oof_frames.append(fold_df)
+            last_fold_state = (X_te.copy(), y_te.copy(), y_precip.iloc[test_idx].copy(), m_qpf_f)
+
+        self.oof_predictions_df = pd.concat(oof_frames, axis=0) if oof_frames else pd.DataFrame()
+
         # True OOF Conformalized Quantile Regression (CQR) asymmetric pads for 80% coverage
         self.conformal_pad_low_c = float(np.clip(np.percentile(cqr_low_scores, 90), -0.5, 2.5)) if cqr_low_scores else 0.0
         self.conformal_pad_high_c = float(np.clip(np.percentile(cqr_high_scores, 90), -0.5, 2.5)) if cqr_high_scores else 0.0
         self.q_scale_low = 1.0
         self.q_scale_high = 1.0
 
-        # Final full-sample refit
-        self.model_mean.fit(X, y_err)
-        self.model_p10.fit(X, y_err)
-        self.model_p90.fit(X, y_err)
+        # Compute Fold-5 OOF Permutation Importances BEFORE full-sample refit
+        try:
+            if last_fold_state is not None:
+                X_f5, y_err_f5, y_p_f5, m_qpf_f5 = last_fold_state
+                perm_t = permutation_importance(
+                    self.model_mean, X_f5, y_err_f5.values,
+                    scoring="neg_root_mean_squared_error", n_repeats=4, random_state=42,
+                )
+                t_raw = np.maximum(0.0, perm_t.importances_mean)
+                t_sum = float(t_raw.sum())
+                t_pct = (t_raw / t_sum * 100.0) if t_sum > 0 else np.zeros_like(t_raw)
+
+                wet_f5_idx = y_p_f5[y_p_f5 >= TIPPING_BUCKET_MM].index
+                if m_qpf_f5 is not None and len(wet_f5_idx) >= 20:
+                    q_raw_f5 = np.clip(X_f5.loc[wet_f5_idx, "nws_qpf_1hr_mm"].values, 0.0, None)
+                    z_f5 = np.clip(np.log((y_p_f5.loc[wet_f5_idx].values + 0.5) / (q_raw_f5 + 0.5)), -1.2, 0.85)
+                    perm_h = permutation_importance(
+                        m_qpf_f5, X_f5.loc[wet_f5_idx], z_f5,
+                        scoring="neg_root_mean_squared_error", n_repeats=4, random_state=42,
+                    )
+                    h_raw = np.maximum(0.0, perm_h.importances_mean)
+                else:
+                    h_raw = np.zeros_like(t_raw)
+                h_sum = float(h_raw.sum())
+                h_pct = (h_raw / h_sum * 100.0) if h_sum > 0 else np.zeros_like(h_raw)
+                self.precomputed_importances = {
+                    "thermal_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, t_pct)},
+                    "hydro_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, h_pct)},
+                }
+        except Exception:
+            self.precomputed_importances = {}
+
+        # Final full-sample refit (with lead-time augmentation)
+        X_full_aug, y_full_aug = self._augment_training_leads(X, y_err, seed=99)
+        self.model_mean.fit(X_full_aug, y_full_aug)
+        self.model_p10.fit(X_full_aug, y_full_aug)
+        self.model_p90.fit(X_full_aug, y_full_aug)
 
         m_pop, m_qpf, m_p90 = self._fit_hydro_models(X, y_precip)
         if m_pop is not None:
@@ -545,39 +650,7 @@ class TassajaraMOSCorrector:
         raw_brier = float(brier_score_loss(oof_wet_true, oof_pop_raw)) if has_oof_wet else 0.0
         mos_brier = float(brier_score_loss(oof_wet_true, oof_pop_mos)) if has_oof_wet else 0.0
 
-        # 3. Precompute Permutation Importances scored against ACTUAL observations (not blended predictions)
-        try:
-            sub_idx = X.tail(min(len(X), 4000)).index
-            X_sub = X.loc[sub_idx]
-            perm_t = permutation_importance(
-                self.model_mean, X_sub, y_err.loc[sub_idx].values,
-                scoring="neg_root_mean_squared_error", n_repeats=4, random_state=42,
-            )
-            t_raw = np.maximum(0.0, perm_t.importances_mean)
-            t_sum = float(t_raw.sum())
-            t_pct = (t_raw / t_sum * 100.0) if t_sum > 0 else np.zeros_like(t_raw)
-
-            if self.precip_ml_trained:
-                wet_sub_idx = y_precip.loc[sub_idx][y_precip.loc[sub_idx] >= TIPPING_BUCKET_MM].index
-                if len(wet_sub_idx) >= 20:
-                    perm_h = permutation_importance(
-                        self.model_qpf_mean, X.loc[wet_sub_idx], y_precip.loc[wet_sub_idx].values,
-                        scoring="neg_root_mean_squared_error", n_repeats=4, random_state=42,
-                    )
-                    h_raw = np.maximum(0.0, perm_h.importances_mean)
-                else:
-                    h_raw = np.zeros_like(t_raw)
-            else:
-                h_raw = np.zeros_like(t_raw)
-            h_sum = float(h_raw.sum())
-            h_pct = (h_raw / h_sum * 100.0) if h_sum > 0 else np.zeros_like(h_raw)
-
-            self.precomputed_importances = {
-                "thermal_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, t_pct)},
-                "hydro_pct": {f: round(float(v), 2) for f, v in zip(self.feature_names, h_pct)},
-            }
-        except Exception:
-            self.precomputed_importances = {}
+        # (Precomputed importances already scored strictly out-of-fold on Fold 5 above)
 
         mean_raw_rmse = float(np.mean(raw_rmse_list))
         mean_mos_rmse = float(np.mean(mos_rmse_list))
@@ -625,8 +698,10 @@ class TassajaraMOSCorrector:
 
         pad_low = float(getattr(self, "conformal_pad_low_c", 0.0))
         pad_high = float(getattr(self, "conformal_pad_high_c", 0.0))
-        half_low = np.maximum(0.35, (err_mean - err_p10) + pad_low)
-        half_high = np.maximum(0.35, (err_p90 - err_mean) + pad_high)
+        lead_hrs = X_full["lead_time_hours"].values if "lead_time_hours" in X_full.columns else np.full(len(X_full), 6.0)
+        lead_inflation = np.sqrt(1.0 + 0.012 * np.maximum(0.0, lead_hrs - 6.0))
+        half_low = np.maximum(0.35, ((err_mean - err_p10) + pad_low) * lead_inflation)
+        half_high = np.maximum(0.35, ((err_p90 - err_mean) + pad_high) * lead_inflation)
 
         hydro_df = self._predict_hydro(X_fut)
 

@@ -627,6 +627,13 @@ def _fetch_nws_station_latest(stid: str) -> Optional[Dict[str, Any]]:
             return None
         props = r.json().get("properties") or {}
         ts = props.get("timestamp")
+        if ts:
+            try:
+                obs_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+                if abs((datetime.now(timezone.utc) - obs_dt).total_seconds()) > 10800:
+                    return None
+            except Exception:
+                pass
 
         def _val(key: str) -> Optional[float]:
             node = props.get(key)
@@ -700,6 +707,13 @@ def _fetch_iem_station_latest(stid: str) -> Optional[Dict[str, Any]]:
         p_hr_in = _f("phour[in]")
         p_day_in = _f("precip_today[in]")
         ts = ob.get("utc_valid")
+        if ts:
+            try:
+                obs_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+                if abs((datetime.now(timezone.utc) - obs_dt).total_seconds()) > 10800:
+                    return None
+            except Exception:
+                pass
 
         if t_f is None and rh is None and p_day_in is None and p_hr_in is None:
             return None
@@ -945,9 +959,13 @@ def fetch_regional_reference_stations(
                 "precip_1hr_mm": om_rec["precip_1hr_mm"],
             }
 
-    # Backfill missing RH/wind on CHWC1/VTCC1 if temperature came from HADS/NWS without RH
+    # Backfill missing RH/wind only on non-IEM stations (never inject synthetic Open-Meteo into IEM_CA_DCP)
     for stid in stids:
-        if references[stid].get("online") and references[stid].get("rh_pct") is None:
+        if (
+            references[stid].get("online")
+            and references[stid].get("source") != "IEM_CA_DCP"
+            and references[stid].get("rh_pct") is None
+        ):
             om_fill = _fetch_openmeteo_reference_batch([stid]).get(stid)
             if om_fill and om_fill.get("rh_pct") is not None:
                 references[stid]["rh_pct"] = om_fill["rh_pct"]

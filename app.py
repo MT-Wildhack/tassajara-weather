@@ -148,6 +148,24 @@ st.markdown(
 
 DB_PATH = "tassajara_weather.db"
 MODEL_PATH = Path("models/tassajara_mos_v1.joblib")
+
+
+def _connect_ro(db_path: str = DB_PATH) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15)
+
+
+@st.cache_resource
+def _load_mos_model_cached(model_mtime: float):
+    try:
+        return joblib.load(MODEL_PATH), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def get_cached_mos_model():
+    if not MODEL_PATH.exists():
+        return None, "Model artifact not found"
+    return _load_mos_model_cached(MODEL_PATH.stat().st_mtime)
 LOCAL_TZ = "America/Los_Angeles"
 
 TASSAJARA_LAT = 36.2337
@@ -535,9 +553,9 @@ def attach_boundary_telemetry_for_mos(
     if math.isnan(vent_t) and not math.isnan(chews_t):
         vent_t = chews_t + 0.54
     if math.isnan(hast_t) and not math.isnan(arroyo_t):
-        hast_t = arroyo_t - 1.80
+        hast_t = arroyo_t - 2.01
     if math.isnan(arroyo_t) and not math.isnan(hast_t):
-        arroyo_t = hast_t + 1.80
+        arroyo_t = hast_t + 2.01
 
     out["pressure_trend_3hr_hpa"] = get_col(out, "pressure_trend_3hr_hpa", latest_ptrend)
     out["issue_tass_temp_c"] = get_col(
@@ -736,9 +754,9 @@ def apply_mos_inference_if_needed(
 
     fb = fallback_physics_mos(sub)
 
-    if MODEL_PATH.exists():
+    mos_model, _load_err = get_cached_mos_model()
+    if mos_model is not None:
         try:
-            mos_model = joblib.load(MODEL_PATH)
             preds = mos_model.predict(sub)
             for c in [
                 "pred_temp_error_c",
@@ -936,8 +954,6 @@ def backfill_missing_hindcast_verification(
 
         def _get_h_ref(stid: str, col: str, default_val: float) -> float:
             rec = ref_hist_map.get((issue_dt, stid))
-            if rec is None or pd.isna(rec.get(col)):
-                rec = ref_hist_map.get((hr_dt, stid))
             if rec is not None and pd.notna(rec.get(col)):
                 return float(rec[col])
             return float(default_val)
@@ -1043,15 +1059,15 @@ def load_all_dashboard_data():
     }
 
     if Path(DB_PATH).exists():
-        with sqlite3.connect(DB_PATH) as conn:
-            # 1. Recent Local Observations (14 days / 336 hours, matching hydro_risk_engine.py)
+        with _connect_ro(DB_PATH) as conn:
+            # 1. Recent Local Observations (30 days / 720 hours, matching hydro_risk_engine.py)
             try:
                 obs_df = pd.read_sql_query(
                     """
                     SELECT * FROM local_observations
                     WHERE temp_c IS NOT NULL
                     ORDER BY valid_time_utc DESC
-                    LIMIT 336
+                    LIMIT 720
                     """,
                     conn,
                 )
@@ -1064,7 +1080,7 @@ def load_all_dashboard_data():
                     """
                     SELECT * FROM reference_observations
                     ORDER BY valid_time_utc DESC
-                    LIMIT 1680
+                    LIMIT 3600
                     """,
                     conn,
                 )
@@ -1183,9 +1199,9 @@ def load_all_dashboard_data():
                 else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
             )
             hydro_coalesce_sql = (
-                "COALESCE(m_ex.mos_pop_pct, m_any.mos_pop_pct) AS mos_pop_pct, "
-                "COALESCE(m_ex.mos_qpf_mm, m_any.mos_qpf_mm) AS mos_qpf_mm, "
-                "COALESCE(m_ex.mos_qpf_p90_mm, m_any.mos_qpf_p90_mm) AS mos_qpf_p90_mm"
+                "m_ex.mos_pop_pct AS mos_pop_pct, "
+                "m_ex.mos_qpf_mm AS mos_qpf_mm, "
+                "m_ex.mos_qpf_p90_mm AS mos_qpf_p90_mm"
                 if has_hydro_cols
                 else "NULL AS mos_pop_pct, NULL AS mos_qpf_mm, NULL AS mos_qpf_p90_mm"
             )
@@ -1331,13 +1347,13 @@ def load_all_dashboard_data():
                             ),
                             0.0
                         ) AS issue_persistence_bias_c,
-                        COALESCE(m_ex.corrected_temp_c, m_any.corrected_temp_c) AS corrected_temp_c,
-                        COALESCE(m_ex.corrected_temp_p10_c, m_any.corrected_temp_p10_c) AS corrected_temp_p10_c,
-                        COALESCE(m_ex.corrected_temp_p90_c, m_any.corrected_temp_p90_c) AS corrected_temp_p90_c,
-                        COALESCE(m_ex.corrected_rh_pct, m_any.corrected_rh_pct) AS corrected_rh_pct,
-                        COALESCE(m_ex.corrected_wind_gust_ms, m_any.corrected_wind_gust_ms) AS corrected_wind_gust_ms,
+                        m_ex.corrected_temp_c AS corrected_temp_c,
+                        m_ex.corrected_temp_p10_c AS corrected_temp_p10_c,
+                        m_ex.corrected_temp_p90_c AS corrected_temp_p90_c,
+                        m_ex.corrected_rh_pct AS corrected_rh_pct,
+                        m_ex.corrected_wind_gust_ms AS corrected_wind_gust_ms,
                         {hydro_coalesce_sql},
-                        COALESCE(m_ex.model_version, m_any.model_version) AS model_version
+                        m_ex.model_version AS model_version
                     FROM local_observations o
                     INNER JOIN (
                         SELECT
@@ -1399,24 +1415,7 @@ def load_all_dashboard_data():
                         ON f.valid_time_utc = m_ex.valid_time_utc
                        AND f.issue_time_utc = m_ex.issue_time_utc
                        AND m_ex.rn = 1
-                    LEFT JOIN (
-                        SELECT
-                            valid_time_utc,
-                            corrected_temp_c,
-                            corrected_temp_p10_c,
-                            corrected_temp_p90_c,
-                            corrected_rh_pct,
-                            corrected_wind_gust_ms,
-                            {hydro_inner_sql},
-                            model_version,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY valid_time_utc
-                                ORDER BY
-                                    CASE WHEN model_version LIKE 'MOS_GBM%' THEN 0 ELSE 1 END ASC,
-                                    issue_time_utc DESC
-                            ) AS rn
-                        FROM mos_corrected_forecasts
-                    ) m_any ON o.valid_time_utc = m_any.valid_time_utc AND m_any.rn = 1
+                    -- m_any removed: exact (issue_time_utc, valid_time_utc) pairing only
                     WHERE o.temp_c IS NOT NULL
                       AND o.qc_flag = 'OK'
                       AND o.valid_time_utc < ?
@@ -1705,10 +1704,9 @@ def compute_model_diagnostics_and_importances(verify_df: pd.DataFrame):
         "imp_df": pd.DataFrame(),
     }
 
-    mos_obj = None
-    if MODEL_PATH.exists():
+    mos_obj, _load_err = get_cached_mos_model()
+    if mos_obj is not None:
         try:
-            mos_obj = joblib.load(MODEL_PATH)
             diag_out["model_loaded"] = True
             diag_out["precip_ml_trained"] = bool(getattr(mos_obj, "precip_ml_trained", False))
             diag_out["feature_names"] = list(getattr(mos_obj, "feature_names", []))
@@ -2691,10 +2689,15 @@ def render_layman_forecast_view(
                     f"🟠 **Tassajara Road & Creek Watch:** **{rain_72_in:.2f} in** forecast over 3 days "
                     f"(P90: **{p90_rain_72_in:.2f} in**). {h_road}"
                 )
-            elif h_code == "YELLOW" or rain_72_in >= 0.10 or max_pop_72 >= 40:
+            elif h_code == "YELLOW":
                 st.info(
                     f"🟡 **Wet Road Advisory (Next 3 Days):** **{rain_72_in:.2f} in** forecast "
                     f"({max_pop_72:.0f}% chance). Expect damp to muddy grades on Tassajara Rd."
+                )
+            elif rain_72_in >= 0.10 or max_pop_72 >= 40:
+                st.info(
+                    f"🚗 **Light-Rain Road Caution (Flood Risk: GREEN):** **{rain_72_in:.2f} in** forecast "
+                    f"({max_pop_72:.0f}% chance). Creek is stable, but clay grades on Tassajara Rd may turn slick for 2WD."
                 )
             else:
                 st.success(
@@ -3102,11 +3105,14 @@ hydro_bundle = compute_dashboard_hydro_state(
 
 solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_utc)
 
+_cached_mos_obj, _cached_mos_err = get_cached_mos_model()
 active_model_name = (
     "MOS_GBM_v3_HYDRO (5-Station Santa Lucia Spatial + Hurdle PoP/QPF)"
-    if MODEL_PATH.exists()
+    if model_diag["model_loaded"]
     else "TOPO_HYDRO_PHYSICS (Analytical Baseline)"
 )
+if MODEL_PATH.exists() and not model_diag["model_loaded"]:
+    st.warning(f"⚠️ MOS model artifact failed to load ({_cached_mos_err}); running analytical physics fallback.")
 
 with st.sidebar:
     st.markdown("### TZMC MOS Architecture")
@@ -3189,7 +3195,7 @@ ref_banner_str = (
             f"{c_to_f(safe_float(ref_dict.get(stid, {}).get('temp_c'), np.nan)):.0f}°F"
             + ("" if ref_dict.get(stid, {}).get("online") else "*")
             if pd.notna(ref_dict.get(stid, {}).get("temp_c"))
-            else "Fallback"
+            else ("Rain Gauge" if ref_dict.get(stid, {}).get("online") else "Fallback")
         )
         for stid, meta in REFERENCE_STATIONS.items()
     )
@@ -3423,7 +3429,7 @@ else:
         r1c4.metric(
             "Anemometer Wind Vector",
             f"{wind_spd_mph:.1f} mph ({wind_card})",
-            f"10m Peak Gust: {wind_gst_mph:.1f} mph",
+            f"10-Min Peak Gust: {wind_gst_mph:.1f} mph",
             delta_color="off",
             help="10-minute scalar average wind speed, prevailing direction, and peak gust at Stone Office.",
         )

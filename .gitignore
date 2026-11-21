@@ -8,3 +8,7 @@ logs/
 *.db-shm
 *.bak
 *.bak.py
+
+.DS_Store
+__pycache__/
+*.pyc

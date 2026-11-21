@@ -324,12 +324,7 @@ def fetch_weatherlink_history(
         }
 
         try:
-            resp = client.session.get(url, params=params, timeout=25)
-            if resp.status_code == 429:
-                logger.warning("Rate limited by WeatherLink API; sleeping 3 seconds...")
-                time.sleep(3.0)
-                continue
-            resp.raise_for_status()
+            resp = client._get_with_retry(url, params=params, timeout=25)
             payload = resp.json()
 
             # Station-level rain timestamp dedup prevents double-counting across multi-sensor packets
@@ -1136,7 +1131,9 @@ def main():
     metrics = corrector.fit_and_evaluate(train_df)
     corrector.save(str(MODEL_PATH))
 
-    populate_mos_verification_and_active_forecasts(corrector, train_df, DB_PATH)
+    populate_mos_verification_and_active_forecasts(
+        corrector, train_df, DB_PATH, oof_preds_df=getattr(corrector, "oof_predictions_df", None)
+    )
 
     logger.info("==========================================================")
     logger.info("TASSAJARA MOS PRODUCTION MODEL TRAINED SUCCESSFULLY!")

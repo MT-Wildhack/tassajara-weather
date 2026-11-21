@@ -455,7 +455,16 @@ def fetch_nws_gridpoints_dataframe(
                 except Exception:
                     continue
 
-    # 3. Open-Meteo NWP Supplement already loaded above in `om_map`
+    # 3. Guard against transient NDFD QPF dropout (high PoP + 0.0 mm NDFD while Open-Meteo >= 2 mm)
+    max_nws_pop = max([float(v) for v in grid_pop_map.values()] + [float(p.get("pop_pct") or 0.0) for p in hourly_periods_map.values()] + [0.0])
+    sum_nws_qpf = sum(float(v) for v in grid_qpf_map.values())
+    sum_om_qpf = sum(float(v.get("qpf_mm") or 0.0) for v in om_map.values())
+    if grid_qpf_map and max_nws_pop >= 65.0 and sum_nws_qpf <= 0.01 and sum_om_qpf >= 2.0:
+        logger.warning(
+            f"NDFD QPF dropout detected (max PoP={max_nws_pop:.0f}%, NDFD QPF={sum_nws_qpf:.2f}mm, "
+            f"Open-Meteo QPF={sum_om_qpf:.2f}mm); falling back to Open-Meteo QPF."
+        )
+        grid_qpf_map = {}
 
     if not grid_temp_map and not hourly_periods_map and not om_map:
         return pd.DataFrame()

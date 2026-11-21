@@ -11,6 +11,7 @@ Physical Context:
     Santa Lucia fractured crystalline/metamorphic chaparral & mixed oak-conifer terrain.
 """
 
+import re
 import math
 import sqlite3
 import logging
@@ -523,7 +524,7 @@ def evaluate_flood_and_road_tier(
         seen_cats = set()
         for msg in collected[best_code]:
             body = msg.split(": ", 1)[1] if ": " in msg else msg
-            cat = body.split("(")[0].strip()[:22]
+            cat = re.sub(r"\d+(?:\.\d+)?", "#", body).split("(")[0].strip()[:22]
             if cat not in seen_cats:
                 seen_cats.add(cat)
                 deduped.append(msg)
@@ -1155,7 +1156,7 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
             SELECT * FROM local_observations
             WHERE temp_c IS NOT NULL
             ORDER BY valid_time_utc DESC
-            LIMIT 336
+            LIMIT 720
             """,
             conn,
         )
@@ -1163,7 +1164,7 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
             """
             SELECT * FROM reference_observations
             ORDER BY valid_time_utc DESC
-            LIMIT 1680
+            LIMIT 3600
             """,
             conn,
         )
@@ -1295,9 +1296,29 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
                     str(h_meta["trigger_summary"]),
                 ))
             if recent_hist_rows:
+                older_rows = recent_hist_rows[:-6] if len(recent_hist_rows) > 6 else []
+                trailing_rows = recent_hist_rows[-6:]
+                if older_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO hydrological_risk_state (
+                            valid_time_utc, api_mm, api_in, decay_k, runoff_coeff_c,
+                            effective_precip_1hr_mm, precip_24hr_mm, precip_72hr_mm,
+                            upstream_spillover_mm, current_runoff_mm_hr,
+                            peak_runoff_6hr_mm_hr, peak_runoff_24hr_mm_hr,
+                            peak_qpf_1hr_24h_mm, peak_p90_1hr_24h_mm,
+                            forecast_qpf_24hr_mm, forecast_qpf_72hr_mm,
+                            discharge_index_cfs, peak_discharge_24hr_cfs,
+                            stream_stage_m, rate_of_rise_m_hr,
+                            alert_tier, alert_code, road_status, creek_status,
+                            recommended_action, trigger_summary
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        older_rows,
+                    )
                 conn.executemany(
                     """
-                    INSERT OR IGNORE INTO hydrological_risk_state (
+                    INSERT OR REPLACE INTO hydrological_risk_state (
                         valid_time_utc, api_mm, api_in, decay_k, runoff_coeff_c,
                         effective_precip_1hr_mm, precip_24hr_mm, precip_72hr_mm,
                         upstream_spillover_mm, current_runoff_mm_hr,
@@ -1310,7 +1331,7 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
                         recommended_action, trigger_summary
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    recent_hist_rows,
+                    trailing_rows,
                 )
 
         conn.execute(
