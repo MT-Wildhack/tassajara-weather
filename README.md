@@ -1,19 +1,21 @@
 # Tassajara Zen Mountain Center (TZMC) — Microclimate & Hydrological MOS Forecast Suite
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Streamlit App](https://img.shields.io/badge/Streamlit-Live%20Dashboard-FF4B4B.svg)](https://tzmc-weather.streamlit.app)
+[![Streamlit App](https://img.shields.io/badge/Streamlit-tassajara--weather.streamlit.app-FF4B4B.svg)](https://tassajara-weather.streamlit.app)
 [![Database](https://img.shields.io/badge/Database-SQLite%20WAL-003B57.svg)](https://sqlite.org)
-[![Model Architecture](https://img.shields.io/badge/MOS%20Engine-30--Feature%20GBDT%20%2B%20HAC%20OLS-orange.svg)](#5-mos-machine-learning-architecture)
-[![Hydrology](https://img.shields.io/badge/Hydrology-Two--Pathway%20API%20%2B%20CFS%20Router-0284C7.svg)](#6-early-flood--road-washout-warning-system)
-[![Offline Ready](https://img.shields.io/badge/Deployment-Cloud%20%2B%20Local%20VP2%20Cabled%20Resilient-16A34A.svg)](#9-local-on-premises-deployment-hardware-selection--offline-resilience)
+[![Model Architecture](https://img.shields.io/badge/Architecture-MOS__GBM__v3__HYDRO%20%2B%20HAC%20OLS-orange.svg)](#5-mos-machine-learning-architecture)
+[![Hydrology](https://img.shields.io/badge/Hydrology-Two--Pathway%20API%20Routing-0284C7.svg)](#6-early-flood--road-washout-warning-system)
 
 An operational, publication-grade meteorological **Model Output Statistics (MOS)** forecast suite and **Early Flood & Road Washout Warning System** custom-engineered for the **Tassajara Zen Mountain Center (TZMC)** in the Santa Lucia Mountains of Monterey County, California.
 
-This README serves as both the scientific reference and the complete **Maintainer Handover Manual**, covering cloud automation, database operations, model retraining, and dedicated local Mini PC / Raspberry Pi deployment wired to the Stone Office **Davis Vantage Pro2 Cabled Console** for uninterrupted storm-mode operation if internet connectivity drops.
+* **Live Cloud Dashboard:** [https://tassajara-weather.streamlit.app](https://tassajara-weather.streamlit.app)
+
+This README serves as both the scientific reference and the complete **Maintainer Handover Manual**, covering cloud automation, database operations, model retraining, and dedicated local Mini PC / Raspberry Pi deployment integrated with the Stone Office **Davis Vantage Pro2 Cabled Console** and its attached **WeatherLinkIP (`6555`) Ethernet Data Logger** for uninterrupted storm-mode operation if internet connectivity drops.
 
 ---
 
 ## Table of Contents
+
 1. [Geographic & Physical Context](#1-geographic--physical-context)
 2. [System Architecture & Repository Map](#2-system-architecture--repository-map)
 3. [Santa Lucia 5-Station Boundary Array & Fallback Cascade](#3-santa-lucia-5-station-boundary-array--fallback-cascade)
@@ -34,7 +36,7 @@ This README serves as both the scientific reference and the complete **Maintaine
 
 Tassajara Zen Mountain Center sits deep along the canyon floor of Tassajara Creek at **$485\text{ m}$ ($1,590\text{ ft}$) MSL** ($36.2337^\circ\text{N},\, 121.5501^\circ\text{W}$), surrounded by precipitous ridges rising above **$1,500\text{ m}$ ($5,000\text{ ft}$)** (Chews Ridge, Pine Ridge, Black Cone, and Ventana Cone). Access is governed exclusively by a rugged, unpaved 14-mile mountain road crossing the $1,536\text{ m}$ Chews Ridge summit from Jamesburg.
 
-```text
+```
 Elevation (m MSL)
 1600m ─── [CHWC1: Chews Ridge 1536m] ────────── [VTCC1: Ventana Cone 1453m (Rain Gauge)]
           \                                    /
@@ -43,11 +45,12 @@ Elevation (m MSL)
 800m  ───────\── Operational NWS/NWP Grid Reference Elevation (~880m MSL) ────
               \                                          /
 485m  ─────────\── [TZMC Stone Office Davis VP2 Cabled 485m] ─/ (Deep Canyon Cold-Pool)
-                \                                            /
+                \      └─ WeatherLinkIP (6555) Ethernet      /
 200m  ───────────\── [ASRC1: Arroyo Seco 268m] ───────────── [PPSC1: Big Sur 108m Coast]
 ```
 
 ### Microclimatic & Hydrological Complexities
+
 * **Topographic Shading:** The southern canyon wall (Black Cone Trail ridge, $32^\circ$ horizon) casts an early afternoon solar shadow, accelerating radiational cooling hours before astronomical sunset.
 * **Nocturnal Katabatic Drainage:** Cool air pooling along Tassajara Creek decouples the canyon floor from the free atmosphere, pushing overnight lows $5^\circ\text{F}$ to $15^\circ\text{F}$ colder than regional model grids.
 * **Orographic Spillover & Feeder-Seeder Rain:** Pacific atmospheric rivers intercept the coastal Santa Lucia crest, wringing out intense headwater rainfall that spills into upper Tassajara Creek tributaries while the valley floor sits in partial rain-shadow.
@@ -57,24 +60,25 @@ Elevation (m MSL)
 
 ## 2. System Architecture & Repository Map
 
-The suite runs on an automated hourly cycle (`:05` past each hour via GitHub Actions and/or a local `systemd` timer), pulling Stone Office telemetry from the **Davis Vantage Pro2 Cabled Console** (Station `36966`), 5-station boundary observations, and NWS `/gridpoints/MTR` hourly forecasts; running MOS inference and two-pathway hydrological routing; and persisting everything to a WAL-mode SQLite database consumed by the Streamlit UI.
+The suite runs on an automated hourly cycle (`:05` past each hour via GitHub Actions and/or a local `systemd` timer), pulling Stone Office telemetry from the **Davis Vantage Pro2 Cabled Console** (Station `36966`) via its attached **WeatherLinkIP (`6555`) Ethernet Data Logger**, 5-station boundary observations, and NWS `/gridpoints/MTR` hourly forecasts; executing MOS inference and two-pathway hydrological routing; and persisting everything to a WAL-mode SQLite database consumed by the Streamlit UI.
 
-```text
-                              ┌────────────────────────────────────────────────────────┐
-                              │  Stone Office Davis Vantage Pro2 Cabled Console (36966)│
-                              │  Cloud: WeatherLink v2 API (/v2/current + 48h historic)│
-                              │  Offline Local: USB/Serial (6510) OR WeatherLinkIP:22222│
-                              └───────────────────────────┬────────────────────────────┘
-                                                          │
-┌───────────────────────────────────────┐                 │             ┌──────────────────────────────────────────┐
-│ 5-Station Santa Lucia Boundary Array  │                 │             │ NWS Monterey /gridpoints/MTR Forecast    │
-│ Tier 1: Synoptic API (optional)       │                 │             │ 168-hr hourly NWP grid (~880m MSL)       │
-│ Tier 2A: NOAA/NWS Obs (NWS_OBS)       │                 │             │ (Open-Meteo top-up if NWS grid drops)    │
-│ Tier 2B: Free IEM CA_DCP (CHWC1/VTCC1)│                 │             └────────────────────┬─────────────────────┘
-│ Tier 3: Open-Meteo (flagged fallback) │                 │                                  │
-└──────────────────┬────────────────────┘                 │                                  │
-                   │                                      │                                  │
-                   ▼                                      ▼                                  ▼
+```
+                              ┌──────────────────────────────────────────────────────────┐
+                              │  Stone Office Davis Vantage Pro2 Cabled Console (36966)  │
+                              │  Attached Logger: Davis WeatherLinkIP (6555) Ethernet    │
+                              │  • Normal Mode: WeatherLink v2 Cloud API (current + 48h) │
+                              │  • Offline Mode: Direct LAN TCP Socket (Port 22222)      │
+                              └────────────────────────────┬─────────────────────────────┘
+                                                           │
+┌───────────────────────────────────────┐                  │             ┌──────────────────────────────────────────┐
+│ 5-Station Santa Lucia Boundary Array  │                  │             │ NWS Monterey /gridpoints/MTR Forecast    │
+│ Tier 1: Synoptic API (optional)       │                  │             │ 168-hr hourly NWP grid (~880m MSL)       │
+│ Tier 2A: NOAA/NWS Obs (NWS_OBS)       │                  │             │ (Open-Meteo top-up if NWS grid drops)    │
+│ Tier 2B: Free IEM CA_DCP (CHWC1/VTCC1)│                  │             └────────────────────┬─────────────────────┘
+│ Tier 3: Open-Meteo (flagged fallback) │                  │                                  │
+└──────────────────┬────────────────────┘                  │                                  │
+                   │                                       │                                  │
+                   ▼                                       ▼                                  ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                run_hourly_mos_pipeline.py (Hourly Orchestrator)                              │
 │  - 48-hr WeatherLink Pro WL_HISTORIC catch-up + monotonic rain_year_mm delta tracking (ingest_state)         │
@@ -110,7 +114,7 @@ The suite runs on an automated hourly cycle (`:05` past each hour via GitHub Act
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                          app.py (Streamlit Web Dashboard)                                    │
+│                app.py (Streamlit Web Dashboard — https://tassajara-weather.streamlit.app)                    │
 │  Mode 1: Everyday Forecast (Community & Guest View — plain-language cards, road/creek alerts, freeze lows)   │
 │  Mode 2: Scientific & Statistical MOS Suite (8-metric grid, 3-panel Plotly, verification scorecard, OLS)     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -127,7 +131,7 @@ The suite runs on an automated hourly cycle (`:05` past each hour via GitHub Act
 | `backfill_and_train.py` | Historical WeatherLink Pro backfill, model training on `vw_mos_training_dataset`, historical verification table population, and artifact serialization to `models/tassajara_mos_v1.joblib`. |
 | `app.py` | Dual-mode Streamlit dashboard (`Everyday Forecast` & `Scientific MOS Suite`), live SQLite + API hydration, interactive Plotly visualizations, and paired verification scorecard. |
 | `schema.sql` | SQLite WAL schema, indexes, and production views (`vw_mos_training_dataset`, `vw_creek_flood_monitor`). |
-| `models/tassajara_mos_v1.joblib` | Serialized production `MOS_GBM_v3_HYDRO` ensemble artifact trained on &#36;17,570$ verified Davis hours. |
+| `models/tassajara_mos_v1.joblib` | Serialized production `MOS_GBM_v3_HYDRO` ensemble artifact trained on $17,570$ verified Davis hours. |
 | `tassajara_weather.db` | Production SQLite database (WAL mode) storing observations, forecasts, hydro states, and monotonic `ingest_state` counters. |
 | `.github/workflows/` | Automated GitHub Actions workflows for hourly ingestion/inference (`hourly_weather.yml`) and scheduled weekly model retraining. |
 
@@ -139,20 +143,23 @@ The pipeline monitors five regional stations surrounding the Tassajara watershed
 
 | Station ID | Station Name | Elev (m / ft) | Primary Live Source | Sensor Suite | Boundary Role |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`CHWC1`** | Chews Ridge | &#36;1,536\text{ m}$ (&#36;5,039\text{ ft}$) | `IEM_CA_DCP` / `SYNOPTIC` | Temp, Rain (ALERT/RAWS) | **Interior Crest (NNW):** Primary crest lapse rate ($^\circ\text{C/km}$) and summit freeze monitoring. |
-| **`VTCC1`** | Ventana Cone | &#36;1,453\text{ m}$ (&#36;4,767\text{ ft}$) | `IEM_CA_DCP` | **Precipitation-Only** (MPWMD ALERT) | **Ventana Crest (WNW):** Windward headwater tipping-bucket gauge (`Online (Rain Gauge)`). |
-| **`CAHC1`** | Hastings Reserve | &#36;546\text{ m}$ (&#36;1,791\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Foothill Valley (N):** Regional inland valley thermal differential ($\Delta T$ in $^\circ\text{F}$). |
-| **`ASRC1`** | Arroyo Seco | &#36;268\text{ m}$ (&#36;879\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Gorge Outlet (6.3 km E):** Down-canyon drainage outlet and cold-pool confinement contrast. |
-| **`PPSC1`** | Big Sur State Park | &#36;108\text{ m}$ (&#36;354\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Coastal Slope (W):** Marine layer inversion cap and coastal-to-canyon thermal gradient. |
+| **`CHWC1`** | Chews Ridge | $1,536\text{ m}$ ($5,039\text{ ft}$) | `IEM_CA_DCP` / `SYNOPTIC` | Temp, Rain (ALERT/RAWS) | **Interior Crest (NNW):** Primary crest lapse rate ($^\circ\text{C/km}$) and summit freeze monitoring. |
+| **`VTCC1`** | Ventana Cone | $1,453\text{ m}$ ($4,767\text{ ft}$) | `IEM_CA_DCP` | **Precipitation-Only** (MPWMD ALERT) | **Ventana Crest (WNW):** Windward headwater tipping-bucket gauge (`Online (Rain Gauge)`). |
+| **`CAHC1`** | Hastings Reserve | $546\text{ m}$ ($1,791\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Foothill Valley (N):** Regional inland valley thermal differential ($\Delta T$ in $^\circ\text{F}$). |
+| **`ASRC1`** | Arroyo Seco | $268\text{ m}$ ($879\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Gorge Outlet (6.3 km E):** Down-canyon drainage outlet and cold-pool confinement contrast. |
+| **`PPSC1`** | Big Sur State Park | $108\text{ m}$ ($354\text{ ft}$) | `NWS_OBS` / `IEM_CA_DCP` | Temp, RH, Wind, Rain | **Coastal Slope (W):** Marine layer inversion cap and coastal-to-canyon thermal gradient. |
 
 ### Four-Tier Zero-Cost Resilient Ingestion Cascade
+
 To guarantee $5/5$ live telemetry without requiring a paid Synoptic subscription, `fetch_regional_reference_stations()` cascades automatically:
+
 1. **Tier 1 — Synoptic Data API (`SYNOPTIC`):** Attempted first if `SYNOPTIC_TOKEN` has active Weather Data API access.
 2. **Tier 2A — NOAA/NWS Observations API (`NWS_OBS`):** Free, no-key government endpoint providing live observations for `CAHC1`, `ASRC1`, and `PPSC1`.
 3. **Tier 2B — Iowa Environmental Mesonet (`IEM_CA_DCP`):** Free, no-key public RAWS/HADS/ALERT JSON feed (`https://mesonet.agron.iastate.edu/json/current.py?network=CA_DCP`) providing live observations for `CHWC1` and precipitation-only `VTCC1`. Computes RH from `dewpointtemp[F]` via the Magnus equation and tracks monotonic hourly rainfall increments from `precip_today[in]`.
 4. **Tier 3 — Open-Meteo Real-Time Boundary Analysis (`OPENMETEO_SYNTH`):** Used **only** if a station fails all three live feeds. Marked `online=False` (`Model Fallback / Stale`, flagged with `*` in the UI) and **strictly excluded** from hydrological headwater spillover so synthetic model precipitation never fabricates creek runoff.
 
 ### Special Handling for Ventana Cone (`VTCC1`)
+
 `VTCC1` is a Monterey County / MPWMD ALERT precipitation-only station and carries **no physical thermometer**. The pipeline and UI explicitly preserve its live status (`Online (Rain Gauge)`, `Temp: N/A`), protect it from Tier 3 Open-Meteo overwrites, track its live daily tipping-bucket accumulation, and prevent synthetic temperatures from contaminating the `Crest Lapse Rate` card (which reports genuine `CHWC1` lapse rates when `VTCC1` has no thermistor).
 
 ---
@@ -169,15 +176,17 @@ Production storm auditing uncovered and permanently eliminated several subtle te
 
 ## 5. MOS Machine Learning Architecture
 
-The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`**) is trained on **$17,570$ verified Davis Vantage Pro2 hourly pairs** spanning 2 full annual cycles (**$870$ observed wet hours**, **$51.62\text{ in}$** verified tipping-bucket rainfall) with **30 physical predictors**.
+The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`**) is trained on **$17,570$ verified Davis Vantage Pro2 hourly pairs** spanning 2 full annual cycles (**$870$ observed wet hours**, $51.62\text{ in}$ verified tipping-bucket rainfall) with **30 physical predictors**.
 
 ### Verified Production Benchmarks (Full 730-Day Purged 5-Fold Out-of-Fold CV)
+
 * **Raw Generic NWP Forecast RMSE:** $2.715^\circ\text{C}$ ($4.89^\circ\text{F}$)
 * **Tassajara MOS Corrected RMSE:** **$2.024^\circ\text{C}$ ($3.64^\circ\text{F}$)**
 * **Full-Cycle Thermal Skill Improvement:** **$+25.5\%$ RMSE reduction**
 * **HAC OLS Diagnostic Baseline ($n = 17,570$):** $R^2 = 0.419$, $\text{Adj } R^2 = 0.418$, matrix condition number $\kappa < 30$ (well-conditioned, zero severe multicollinearity).
 
 ### Subsystem Design
+
 1. **Thermal Subsystem (`HistGradientBoostingRegressor`):**
    * Mean error corrector (`loss='squared_error'`, L2-regularized) paired with dual quantile estimators ($\alpha = 0.10$ and $\alpha = 0.90$) generating conformal-calibrated 80% uncertainty bands ($P_{10}$ cold-pool floor to $P_{90}$ daytime ceiling).
    * Issue-time local anomalies (temperature persistence, lapse-rate anomaly, gorge confinement, and barometric pressure tendency) decay exponentially with forecast lead time:
@@ -197,77 +206,83 @@ The production statistical engine (`mos_model.py`, version **`MOS_GBM_v3_HYDRO`*
 Implemented in `hydro_risk_engine.py`, this module tracks continuous catchment soil saturation and routes runoff across the $72\text{ km}^2$ upper Tassajara Creek basin (Pine Ridge, Black Cone, Chews Ridge $\rightarrow$ Stone Office at $485\text{ m}$ MSL).
 
 ### 1. Dynamic Antecedent Precipitation Index ($API$)
+
 $$API_t = API_{t-1} \cdot k_{\text{hr}} + P_{\text{eff}, t}$$
+
 * **Evaporative Recession ($k_{\text{day}}$):** Modulated dynamically between $0.88$ and $0.94$ from observed Vapor Pressure Deficit (VPD) so saturated winter storms drain slower than dry autumn intervals:
   $$k_{\text{day}} = \text{clip}\!\left(0.935 - 0.025 \cdot \min(\text{VPD},\, 2.2),\, 0.88,\, 0.94\right)$$
 * **Effective Catchment Rain ($P_{\text{eff}}$):** Blends Stone Office tipping-bucket rain with **online-only** ridge stations (`CHWC1`, `VTCC1`, `PPSC1`), explicitly ignoring `OPENMETEO_SYNTH` / `OFFLINE` fallback rows.
 
 ### 2. Nonlinear Soil-Saturation Runoff Coefficient ($C$)
+
 $$C(API) = C_{\min} + \frac{C_{\max} - C_{\min}}{1 + \exp\!\left(-\dfrac{API + 0.18 \cdot P_{72\text{h}} - API_{\text{mid}}}{s}\right)}$$
+
 Where $C_{\min} = 0.08$ (dry fractured granite / duff abstraction) and $C_{\max} = 0.86$ (saturated bedrock/regolith sheetflow ceiling).
 
 ### 3. Mass-Conserving Two-Pathway Creek Hydrograph (CFS)
-Rather than snapping abruptly back to dry baseflow after rain pauses, effective runoff ($R_t = C_t \cdot P_{\text{eff}, t}$) over the $72\text{ km}^2$ catchment is partitioned across two physical pathways plus dry-weather spring baseflow ($Q_{\text{base}} = 6.5\text{ CFS}$):
-* **Fast Surface Quickflow ($18\%$ of net runoff):** Routed through a 4-hour steep-canyon unit hydrograph kernel to resolve acute storm-band surge peaks.
-* **Shallow Subsurface Interflow Reservoir ($57\%$ of net runoff, hourly recession $k_{\text{inter}} = 0.955$):** Sustains realistic elevated post-storm creek flow across $24\text{--}72\text{ hours}$ and transitions seamlessly across the historical-to-forecast `now` divider with zero step discontinuity.
 
-> **Ground-Truth Calibration Note:** Until a physical ultrasonic/radar stage gauge is commissioned at Tassajara Creek, routed `CFS` is a **catchment-scaled hydrological index**, not gauged USGS streamflow. After visually inspecting Tassajara Creek in daylight during a storm, a maintainer can tune `API_MIDPOINT_MM` or `INTERFLOW_FRACTION` in `hydro_risk_engine.py` to anchor modeled CFS directly to observed footbridge clearance.
+Rather than snapping abruptly back to dry baseflow after rain pauses, effective runoff ($R_t = C_t \cdot P_{\text{eff}, t}$) splits across two physical storage pathways over the $72\text{ km}^2$ watershed above a $6.5\text{ CFS}$ spring baseflow floor ($Q_{\text{base}} = 6.5\text{ CFS}$):
+
+* **Fast Surface Quickflow ($18\%$):** Routed via a steep-canyon 4-hour unit hydrograph kernel to capture rapid storm-band peaks.
+* **Shallow Subsurface Interflow ($57\%$):** Routed through a linear hillslope storage reservoir ($k_{\text{interflow}} = 0.955\text{ hr}^{-1}$) sustaining realistic multi-day post-storm creek recession across the `now` boundary with zero step discontinuity.
+
+> **Calibration Note:** Until a physical stream stage gauge is installed at the bathhouse footbridge, routed `CFS` is an uncalibrated catchment-scaled discharge index. Visual ground-truth logs at the footbridges during storms can be used to tune `API_MIDPOINT_MM` and `INTERFLOW_FRACTION` in `hydro_risk_engine.py`.
 
 ### 4. Four-Tier Operational Severity Matrix
 
-| Tier | Status Code | Soil Saturation, Rainfall & Routed Discharge Triggers | Tassajara Road Status (14-Mi Unpaved) | Tassajara Creek & Footbridges | Operational Protocol |
+| Tier | Status Code | Rain, Soil Saturation & Discharge Triggers | Tassajara Road (14-Mile Unpaved) | Tassajara Creek & Footbridges | Operational Protocol |
 | :---: | :---: | :--- | :--- | :--- | :--- |
-| **0** | **GREEN** | $API < 2.00"$, &#36;1\text{h} < 0.15"\text{/hr}$, &#36;24\text{h} < 1.00"$, &#36;72\text{h} < 1.50"$, $Q < 250\text{ CFS}$ | **Open / Dry to Damp**<br>Standard mountain precautions | **Stable Baseflow**<br>Footbridges clear and well above water | Routine canyon operations and normal high-clearance travel. |
-| **1** | **YELLOW** | $API \ge 2.00"$, OR imminent ($\le 6\text{h}$) &#36;1\text{h} \ge 0.15"\text{/hr}$, OR &#36;24\text{h} \ge 1.00"$, OR &#36;72\text{h} \ge 1.50"$ | **Advisory / Caution**<br>Muddy, slick clay summit grades; minor rockfall risk | **Elevated Flow**<br>Turbid water; moderate creek rise | 4WD required on Tassajara Road. Postpone low-clearance trips; monitor footbridges and culverts. |
-| **2** | **ORANGE** | Within &#36;24\text{h}$: &#36;1\text{h} \ge 0.50"\text{/hr}$ on primed soil ($API \ge 2.00"$), OR heavy multi-day rain on primed soil, **OR Routed Creek $Q \ge 250\text{ CFS}$** | **Hazardous / Watch**<br>Travel strongly discouraged (slipout, rutting & rockslide danger) | **Rapidly Rising**<br>High-velocity flow; woody debris mobilization likely | Suspend routine travel on Tassajara Road. Inspect lower footbridges for log damming; secure creek equipment; stage emergency radio net. |
-| **3** | **RED** | Imminent/active ($\le 6\text{h}$): &#36;1\text{h} \ge 1.00"\text{/hr}$ (or $P_{90} \ge 1.25"\text{/hr}$), **OR Routed Creek $Q \ge 500\text{ CFS}$** (or physical stage/rise trigger when installed) | **CLOSED / IMPASSABLE**<br>Severe washouts, debris flows, and road cuts | **BANKFULL / FLOOD STAGE**<br>Footbridge overtopping & structural surge hazard | **Immediate road closure.** Evacuate low creek-side structures; prohibit all bridge crossings; notify Monterey County OES as needed. |
+| **0** | **GREEN** | $API < 2.00"$, $1\text{h Rate} < 0.15"\text{/hr}$, $24\text{h Rain} < 1.00"$, $72\text{h Rain} < 1.50"$, $Q < 250\text{ CFS}$ | **Open / Dry to Damp**<br>Standard mountain precautions | **Stable Baseflow**<br>Footbridges clear | Routine canyon operations. Normal high-clearance travel. |
+| **1** | **YELLOW** | $API \ge 2.00"$ OR Imminent ($\le 6\text{h}$) Rate $\ge 0.15"\text{/hr}$ OR $24\text{h Rain} \ge 1.00"$ OR $72\text{h Rain} \ge 1.50"$ | **Advisory / Caution**<br>Muddy, slick clay grades over Chews Ridge; minor rockfall | **Elevated Flow**<br>Turbid water; moderate rise | 4WD required on Tassajara Road. Postpone non-essential low-clearance trips; clear culverts. |
+| **2** | **ORANGE** | Within $24\text{h}$: Rate $\ge 0.50"\text{/hr}$ on primed soil ($API \ge 2.00"$), OR multi-day storm total on saturated soil, **OR Routed Creek $Q \ge 250\text{ CFS}$** | **Hazardous / High Risk**<br>Travel strongly discouraged; slipout & rockslide danger | **Rapidly Rising**<br>High velocity; woody debris mobilization likely | Suspend routine travel on Tassajara Road. Inspect lower footbridges for log damming; stage emergency radio net. |
+| **3** | **RED** | Imminent/Active ($\le 6\text{h}$): Rate $\ge 1.00"\text{/hr}$ OR $P_{90} \ge 1.25"\text{/hr}$ on saturated soil, **OR Routed Creek $Q \ge 500\text{ CFS}$** | **CLOSED / IMPASSABLE**<br>Severe washouts, debris flows, road cuts | **BANKFULL / FLOOD STAGE**<br>Footbridge overtopping surge hazard | **Immediate road closure.** Evacuate low creek-side structures; prohibit all footbridge crossings. |
 
 ---
 
 ## 7. Database Schema & Production Views
 
-`tassajara_weather.db` runs in SQLite **Write-Ahead Logging (`WAL`)** mode (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`) so background ingestion scripts and the Streamlit web UI can read and write concurrently without lock timeouts.
+The SQLite database (`tassajara_weather.db`) runs in **Write-Ahead Logging (`WAL`)** mode so the hourly ingestion pipeline and Streamlit dashboard can read/write concurrently without locking errors:
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+```
 
 ### Core Tables
-* **`local_observations`:** Hourly Stone Office Davis Vantage Pro2 Cabled Console records (Station `36966`) with `source` provenance (`WL_HISTORIC`, `WL_LIVE`, or `VP2_LOCAL` when running offline).
-* **`reference_observations`:** Synchronized hourly records for `CHWC1`, `VTCC1`, `CAHC1`, `ASRC1`, `PPSC1` with `source` (`SYNOPTIC`, `NWS_OBS`, `IEM_CA_DCP`, `OPENMETEO_SYNTH`).
-* **`nws_forecasts`:** 168-hour NWS `/gridpoints/MTR` forecast batches stamped by `issue_time_utc` and `valid_time_utc`.
-* **`mos_corrected_forecasts`:** Operational and historical MOS predictions (`corrected_temp_c`, `P10`, `P90`, `mos_pop_pct`, `mos_qpf_1hr_mm`, `mos_qpf_p90_mm`, `model_version`).
-* **`hydrological_risk_state`:** Historical hourly $API$, $C$, effective runoff, routed discharge (CFS), and alert tier records.
-* **`hydrological_forecast_series`:** Forward 72-hour projected hydrograph, $API$, and $P_{90}$ surge envelope.
-* **`ingest_state`:** Key-value state table persisting monotonic console counters (`last_console_rain_year_mm`, `last_console_rain_day_mm`, `last_ref_rain_day_mm_<STID>`) to guarantee zero double-counting across restarts and midnight rollovers.
-* **`stream_gauge_observations`:** Pre-provisioned table awaiting physical creek stage sensor commissioning.
+
+* **`local_observations`:** Ground-truth Stone Office Davis Vantage Pro2 records (`WL_HISTORIC`, `WL_LIVE`). Stores temperature, dewpoint, wetbulb, MSLP, wind vector, solar radiation, and $0.254\text{ mm}$-quantum tipping-bucket rainfall (`precip_1hr_mm`).
+* **`reference_observations`:** Synchronized hourly records from the 5 Santa Lucia reference stations (`CHWC1`, `VTCC1`, `CAHC1`, `ASRC1`, `PPSC1`) with explicit `source` provenance (`SYNOPTIC`, `NWS_OBS`, `IEM_CA_DCP`).
+* **`nws_forecasts`:** Operational 168-hour NWS `/gridpoints/MTR` forecast grids stored by `issue_time_utc` and `valid_time_utc`.
+* **`mos_corrected_forecasts`:** Deduplicated `MOS_GBM_v3_HYDRO` hourly temperature, $P_{10}$/$P_{90}$ bounds, calibrated PoP (%), and expected/$P_{90}$ QPF rates.
+* **`hydrological_risk_state`:** Hourly archive of catchment saturation ($API$), runoff coefficient ($C$), peak runoff, routed creek discharge (CFS), and 4-tier alert status.
+* **`hydrological_forecast_series`:** Forward 72-hour projected hydrograph and $API$ trajectory.
+* **`ingest_state`:** Key-value state table holding monotonic rainfall counters (`last_console_rain_year_mm`, `last_console_rain_day_mm`, `last_ref_rain_day_mm_<STID>`) and `last_obs_hour_iso`.
+* **`stream_gauge_observations`:** Physical stream gauge telemetry table (pre-wired for future bathhouse footbridge sensor commissioning).
 
 ### Production Views
-* **`vw_mos_training_dataset`:** Deduplicated training view pairing genuine Davis observations (`source != 'OPENMETEO_SYNTH'`) with aligned NWP forecasts and issue-time spatial boundary predictors.
-* **`vw_creek_flood_monitor`:** Unified operational snapshot uniting live Stone Office meteorology, soil saturation, routed creek discharge, and active alert tier.
+
+* **`vw_mos_training_dataset`:** Deduplicated training view joining genuine Davis observations (`source != 'OPENMETEO_SYNTH'`) with aligned forecast grids and boundary reference telemetry.
+* **`vw_creek_flood_monitor`:** Operational summary view uniting live Stone Office conditions, catchment wetness ($API$), routed creek discharge, and active alert tiers.
 
 ---
 
 ## 8. Maintainer Handover: Setup, Secrets & Cloud Operations
 
-Everything required for a new technical steward to take over day-to-day operations is listed below.
+### 1. Required Accounts & Credentials Matrix
 
-### 1. Required Credentials & Where They Live
-**Never commit live API keys or secrets into Git.** Configure credentials in three places (only WeatherLink keys are strictly required; Synoptic is optional thanks to free `NWS_OBS` + `IEM_CA_DCP`):
+Never commit API keys, secrets, or physical Davis device `DID`/`KEY` credentials to Git. Configure them in **local shell/systemd `.env`**, **GitHub Repository Secrets**, and **Streamlit Cloud Secrets**:
 
-| Secret Name | Required? | Source / Purpose |
+| Variable | Required? | Where to Obtain / Notes |
 | :--- | :---: | :--- |
-| `WL_API_KEY` | **Required** | Davis WeatherLink v2 API Key (`weatherlink.com` $\rightarrow$ Account $\rightarrow$ API v2) for Station `36966` (Device Tier: Pro). |
-| `WL_API_SECRET` | **Required** | Davis WeatherLink v2 API Secret (used to compute v2 request signatures/headers). |
-| `SYNOPTIC_TOKEN` | Optional | Synoptic Data Public Token (`customer.synopticdata.com`). Leave unset or expired without issue—the pipeline seamlessly uses free `NWS_OBS` and `IEM_CA_DCP`. |
+| `WL_API_KEY` | **Yes** | Davis WeatherLink v2 API Key for Station `36966` (WeatherLink Pro account). |
+| `WL_API_SECRET` | **Yes** | Davis WeatherLink v2 API Secret paired with `WL_API_KEY`. |
+| `SYNOPTIC_TOKEN` | Optional | Synoptic Data Public Token. If omitted or returning `403`, `ingest_weather.py` automatically falls back to free `NWS_OBS` + `IEM_CA_DCP` for all 5 stations. |
+| `WLIP_LOCAL_IP` | Local Only | Static LAN IP of the Stone Office **Davis WeatherLinkIP (`6555`) Ethernet Data Logger** for direct TCP port `22222` offline failover (see Section 9). |
 
-Where to configure them:
-1. **GitHub Actions:** Repository $\rightarrow$ **Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions** $\rightarrow$ add `WL_API_KEY`, `WL_API_SECRET` (and optional `SYNOPTIC_TOKEN`).
-2. **Streamlit Community Cloud:** `share.streamlit.io` $\rightarrow$ App $\rightarrow$ **Settings** $\rightarrow$ **Secrets** (TOML format):
-   ```toml
-   WL_API_KEY = "your_weatherlink_v2_api_key"
-   WL_API_SECRET = "your_weatherlink_v2_api_secret"
-   SYNOPTIC_TOKEN = "optional_synoptic_token"
-   ```
-3. **Local Workstation / On-Premises Server:** Export in shell or store in a protected `.env` file (`chmod 600 .env`).
+> **Security Note on Physical Hardware Labels:** The WeatherLinkIP (`6555`) Ethernet dongle attached to the back of the Stone Office console carries a physical sticker showing its `DID` (MAC/Device ID) and `KEY`. Treat these as confidential credentials—record them only in the Stone Office IT password vault and never post photos of the label or paste the `DID`/`KEY` into public repositories.
 
-### 2. Local Development Setup
+### 2. Local Development & Manual Execution
+
 ```bash
 git clone https://github.com/MT-Wildhack/tassajara-weather.git
 cd tassajara-weather
@@ -277,312 +292,231 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Initialize a fresh database only if starting from scratch (otherwise use existing tassajara_weather.db):
-# sqlite3 tassajara_weather.db < schema.sql
-```
+# Export credentials (or load from a chmod 600 .env file)
+export WL_API_KEY="your_weatherlink_v2_api_key"
+export WL_API_SECRET="your_weatherlink_v2_api_secret"
+export SYNOPTIC_TOKEN="optional_synoptic_token"
 
-### 3. Essential Operational Commands
-```bash
-# Run full hourly ingestion, MOS inference, and hydrological risk update:
+# Run full hourly ingestion, MOS inference, and hydrological evaluation
 python3 run_hourly_mos_pipeline.py
 
-# Re-evaluate hydrological risk & 72h hydrograph independently from existing SQLite data:
+# Run standalone hydrological evaluation
 python3 hydro_risk_engine.py
 
-# Retrain MOS model on all genuine verified Davis data already in SQLite (no API backfill wait):
+# Retrain MOS model on existing SQLite archive (no re-fetch)
 python3 backfill_and_train.py --skip-fetch
 
-# Full 730-day WeatherLink Pro backfill + retrain (slow; run only for initial rebuilds):
-python3 backfill_and_train.py --days 730
-
-# Launch Streamlit dashboard locally:
+# Launch dashboard locally
 streamlit run app.py
 ```
 
-### 4. Handling Hourly GitHub Actions & SQLite Merge Conflicts
-Because `.github/workflows/hourly_weather.yml` runs at `:05` past every hour and commits updated `tassajara_weather.db` snapshots to `main`, pushing manual local edits to `tassajara_weather.db` can occasionally trigger a binary merge conflict:
-* **If you repaired or retrained `tassajara_weather.db` locally:** In GitHub Desktop (or Git CLI via `git checkout --ours tassajara_weather.db`), select **Use the modified (local) file**, commit the merge, and push.
-* **If you only edited Python code (`app.py`, `hydro_risk_engine.py`, etc.):** Keep `tassajara_weather.db` unchecked locally (or `git checkout --theirs tassajara_weather.db`) so you preserve the latest hourly GitHub Actions observations.
-* **Keep local scratch files out of Git:** Never stage `.DS_Store`, `__pycache__/`, `tassajara_weather.db-wal`, `tassajara_weather.db-shm`, or local `.env` files.
+### 3. Cloud Automation & Streamlit Cloud Operations
 
-### 5. Rebooting Streamlit Community Cloud After Model or Code Updates
-Streamlit Cloud caches Python modules and `.joblib` models in RAM. After pushing changes to `models/tassajara_mos_v1.joblib`, `hydro_risk_engine.py`, or `ingest_weather.py`:
-1. Open `https://tzmc-weather.streamlit.app`.
-2. Click **`< Manage app`** in the bottom-right corner.
-3. Click the **three-dot menu (`⋮`)** in the top-right of the management drawer and select **Reboot app**.
-4. Wait $30\text{--}60\text{ seconds}$ and confirm the sidebar displays the updated model sample size (`n=17570+`), `Archive Wet Hours`, and live `5/5` reference status.
+* **Hourly Pipeline (GitHub Actions):** `.github/workflows/hourly_weather.yml` runs at `:05` past every hour, executes `run_hourly_mos_pipeline.py`, and commits the updated `tassajara_weather.db` back to `main`. Verify green runs under the repository's **Actions** tab.
+* **Rebooting Streamlit Cloud (`https://tassajara-weather.streamlit.app`):** After pushing code, database repairs, or a newly retrained `models/tassajara_mos_v1.joblib`, Streamlit Cloud auto-redeploys within ~60 seconds. If cached modules or old model artifacts persist, click **`Manage app`** (bottom-right) $\rightarrow$ **`⋮`** $\rightarrow$ **`Reboot app`**.
+* **Handling `tassajara_weather.db` Merge Conflicts in GitHub Desktop:** Because GitHub Actions commits `tassajara_weather.db` hourly, pushing local edits may trigger a binary merge conflict:
+  * If you only edited Python files (`app.py`, `ingest_weather.py`, etc.), choose **Use the version from `main`** for `tassajara_weather.db` so you keep the latest automated observations.
+  * If you intentionally repaired rows or retrained locally, choose **Use the modified file** (your local `tassajara_weather.db`), click **Continue Merge**, and push.
 
 ---
 
 ## 9. Local On-Premises Deployment: Hardware Selection & Offline Resilience
 
-During severe Santa Lucia atmospheric rivers—**the exact moments when flood and road-washout guidance matters most**—Starlink, microwave backhaul, and grid power at Tassajara are most likely to fail simultaneously. Because Stone Office already operates a **Davis Vantage Pro2 Cabled Console** (wired directly to the outdoor Integrated Sensor Suite via a hardwired 4-conductor cable, immune to wireless RF dropout or solar capacitor depletion), pairing it with a dedicated local Linux node turns this suite into an **offline-resilient, campus-wide emergency warning appliance**.
+During severe Santa Lucia winter storms, Tassajara's satellite/WAN internet link and grid power are most likely to drop **at the exact moment flood and road-washout guidance is most critical**. Running a dedicated, hardened local appliance inside the Stone Office on the same UPS-backed LAN as the **Davis Vantage Pro2 Cabled Console** and its **WeatherLinkIP (`6555`) Ethernet Data Logger** guarantees 100% uptime for local staff and the Emergency Response team even during a complete internet blackout.
 
-### 1. Selecting the Optimal Hardware (Mini PC vs. Raspberry Pi)
+### 1. Recommended Hardware Comparison
 
-| Platform | Recommended Spec | Typical Cost | Power Draw | Pros & Cons for Tassajara Stone Office |
-| :--- | :--- | :---: | :---: | :--- |
-| **Fanless x86 Mini PC** *(Recommended Primary)* | Intel **N100 / N150** (4-core), **16 GB RAM**, **256–512 GB NVMe SSD**, Dual GbE, 3+ USB-A ports (e.g., Beelink EQ13/EQ14, Asus NUC Essential, or industrial fanless N100) | $\$160\text{--}\$250$ | &#36;6\text{--}12\text{ W}$ idle (15 W peak) | **Best overall reliability.** Standard `x86_64` wheels for `scikit-learn`/`statsmodels` (zero ARM compilation surprises), fast 730-day MOS retraining ($< 45\text{ s}$), native NVMe longevity for hourly SQLite WAL writes, native USB-serial support for Davis `6510USB` loggers, and fanless options resist canyon dust. |
-| **Raspberry Pi 5 + NVMe SSD** *(Recommended Ultra-Low-Power / DC Solar)* | **Raspberry Pi 5 (8 GB)** + Official Active Cooler + **M.2 NVMe HAT + 256 GB NVMe SSD** + Official 27 W USB-C PSU | $\$145\text{--}\$185$ | &#36;3\text{--}7\text{ W}$ idle (12 W peak) | **Best for DC/solar off-grid power budgets.** Direct USB-A connection to Davis `6510USB` logger plus easy GPIO/UART expansion later if connecting a local LoRaWAN or SDI-12 creek gauge. *Must boot from NVMe SSD—never run production SQLite on a microSD card.* |
-| **Raspberry Pi on microSD** *(Not Recommended)* | Pi 4 / Pi 5 booting solely from microSD | $\$70\text{--}\$110$ | &#36;3\text{--}6\text{ W}$ | **Avoid for life-safety telemetry.** Continuous hourly SQLite WAL writes and OS logs wear out consumer microSD cards within &#36;6\text{--}18$ months, risking database corruption mid-storm. |
+| Criterion | **Option A: Fanless Intel N100 / N150 Mini PC (Recommended)** | **Option B: Raspberry Pi 5 (8 GB) + NVMe Hat** |
+| :--- | :--- | :--- |
+| **Target Models** | Beelink EQ13/EQ14 (N100/N150), MeLE Quieter4C (fanless), Minisforum UN100P | Raspberry Pi 5 (8 GB) + Official Active Cooler + M.2 NVMe Base + 256 GB NVMe SSD |
+| **Storage Reliability** | Native M.2 NVMe SSD (high write endurance for hourly SQLite WAL commits) | **Mandatory NVMe SSD** (never run SQLite WAL 24/7 on a microSD card—cards fail within 6–12 months) |
+| **Power Draw** | $6\text{–}12\text{ W}$ idle, $15\text{–}20\text{ W}$ peak (easily backed by a small UPS) | $3\text{–}5\text{ W}$ idle, $10\text{–}12\text{ W}$ peak (best if running purely on off-grid DC solar/battery) |
+| **MOS Retraining Speed** | Full 730-day (`17,570`-row) 5-fold GBDT + OLS retrain in **~45–75 seconds** | Full 730-day retrain in ~2.5–4 minutes |
+| **Dust & Thermal Resilience** | Fanless aluminum chassis (e.g., MeLE Quieter4C) resists canyon dust and summer heat | Requires dust-filtered aluminum case + heatsink |
+| **Estimated Cost (w/ UPS)** | ~$220–$300 (Mini PC + 500–600 VA UPS) | ~$200–$260 (Pi 5 + NVMe Hat/SSD + PSU + Case + UPS) |
 
-#### Physical Protection, Power Backup (UPS) & Cabled Console Maintenance
-Because the cabled Vantage Pro2 ISS runs a physical copper line from outside directly into the Stone Office console, follow these four hardware safeguards:
-1. **Inline RJ-11 Surge Protector (Critical for Cabled ISS):** Install a grounded phone-line / RJ-11 surge protector (e.g., APC ProtectNet or Tripp Lite RJ-11 surge suppressor) between the outdoor ISS cable and the Vantage Pro2 Cabled Console to protect both the console and the connected Mini PC from nearby mountain lightning strikes.
-2. **Fresh Console Backup Batteries (Annual Check):** Keep **3 fresh C-cell alkaline or lithium batteries** inside the Vantage Pro2 Cabled Console (replace every October before winter rains). Even if both grid power and UPS exhaust completely, the cabled console continues powering the outdoor ISS and logging up to $2,560$ archive records internally until power returns.
-3. **Single Dedicated UPS:** Plug **all three** devices into one dedicated Uninterruptible Power Supply so telemetry and campus Wi-Fi survive generator transfers and outages:
-   * The Mini PC / Raspberry Pi 5.
-   * The **Davis Vantage Pro2 Cabled Console** AC power adapter.
-   * The Stone Office **LAN switch / Wi-Fi access point**.
-4. **UPS Sizing:**
-   * *AC Option:* Compact pure sine-wave UPS (e.g., APC Back-UPS Pro 600–1000VA or CyberPower CP1000PFCLCD, giving $4\text{--}8+$ hours of runtime at $\sim 20\text{--}25\text{ W}$ total load).
-   * *DC / Off-Grid Option:* A $12\text{ V}$ LiFePO4 battery ($20\text{--}50\text{ Ah}$) with a $12\text{ V}$ DC-UPS / buck converter powering a $12\text{ V}$ Mini PC + router + $5\text{ V}$ console supply directly for $24\text{--}48+$ hours with zero inverter losses.
+**Recommendation:** Deploy a **fanless Intel N100/N150 Mini PC (16 GB RAM, 256–512 GB NVMe SSD)** running **Ubuntu Server 24.04 LTS**, backed by a **600–850 VA Sine-Wave UPS** (e.g., APC Back-UPS Pro or CyberPower CP850PFCLCD). Plug all four critical components into the **Battery Backup** outlets of the same UPS:
+1. The Mini PC
+2. The Stone Office local Ethernet switch / Wi-Fi router
+3. The **Davis Vantage Pro2 Cabled Console** AC power adapter *(also keep **3× fresh C-cell alkaline/lithium backup batteries** installed inside the console—replaced every October—so the cabled console and outdoor ISS keep logging even if the UPS exhausts during a multi-day outage)*
+4. An **inline RJ-11 telephone/data surge protector** on the copper cable entering the Stone Office from the outdoor Davis ISS to protect the console and Ethernet logger against storm-induced surges
 
----
+### 2. Confirmed Hardware Integration: Davis Vantage Pro2 Cabled Console + WeatherLinkIP (`6555`) Ethernet
 
-### 2. Local Cabled Console Ingestion Protocols (Zero-Internet Storm Survival)
+The Stone Office **Davis Vantage Pro2 Cabled Console** is fitted with a **Davis WeatherLinkIP (`6555`) Ethernet Data Logger** plugged directly into the back expansion bay and patched into the Stone Office Ethernet network.
 
-Unlike a wireless WeatherLink Live (6100), a **Vantage Pro2 Cabled Console** communicates locally through the expansion-bay **Davis Data Logger** installed in the back of the console. Confirm which logger is currently plugged into the Stone Office console and follow the matching protocol:
+#### Network Setup (One-Time)
+1. Log into the Stone Office router/DHCP server and locate the WeatherLinkIP (`6555`) Ethernet logger by its MAC address (matching the `DID` printed on the Ethernet dongle label).
+2. Assign a **permanent Static DHCP Reservation** on the local LAN (for example, `192.168.1.50`) and record it as `WLIP_LOCAL_IP="192.168.1.50"` in `/opt/tassajara-weather/.env`.
+3. Verify local reachability from the Mini PC (with zero internet required):
+   ```bash
+   nc -zv -w 3 192.168.1.50 22222
+   ```
 
-#### Protocol A: WeatherLink USB (`6510USB`) or Serial (`6510SER`) Data Logger *(Highest Offline Reliability)*
-* **Physical Wiring:** Plug the USB cable from the back of the Vantage Pro2 Cabled Console directly into the local Mini PC / Raspberry Pi 5 (use a quality FTDI USB-to-RS232 adapter if using the `6510SER` serial model). Place the Mini PC within USB cable reach ($\le 15\text{ ft}$) of the Stone Office console.
-* **How Data Flows Offline & Online:**
-  * Run [**WeeWX**](https://weewx.com) (using its native `vantage` driver at `19200` baud) on the Mini PC as the single serial port owner—this prevents port contention, reads live `LOOP` packets every $2.5\text{ seconds}$, automatically downloads missed console archive records (`DMPAFT`) after any reboot, writes a local JSON/SQLite feed that `ingest_weather.py` reads directly with **zero internet**, and simultaneously uploads to WeatherLink.com when internet is up.
-  * *Alternative (No WeeWX):* If the console is not uploading via another PC, `ingest_weather.py` can query `/dev/serial/by-id/usb-Silicon_Labs_CP210x...` directly via `pyserial` (`TEST\n`, `LPS 2 1\n`, `DMPAFT`) on each hourly run.
-* **Linux Device Stability:** Never rely on `/dev/ttyUSB0` (which can shift to `ttyUSB1` on reboot). Always reference the persistent `/dev/serial/by-id/...` symlink and add the `tzmcweather` user to the `dialout` group.
+#### Critical WeatherLinkIP (`6555`) Single-Socket Protocol
+Unlike wireless WeatherLink Live hubs, the **WeatherLinkIP (`6555`) Ethernet logger only supports ONE active TCP socket on port `22222` at a time**. While any local client holds port `22222` open, the logger pauses its automatic uploads to `weatherlink.com`.
 
-#### Protocol B: WeatherLinkIP (`6555`) Ethernet Data Logger *(LAN TCP Port `22222`)*
-* **Physical Wiring:** The console's `6555` logger plugs via Ethernet directly into the Stone Office LAN switch (allowing the Mini PC to sit anywhere on the Stone Office LAN).
-* **Static DHCP Reservation:** Assign the `6555` logger's MAC address a fixed LAN IP on the Stone Office router (e.g., `192.168.1.50`).
-* **CRITICAL Single-Socket Protocol Rule:** The Davis `6555` WeatherLinkIP logger supports **only one active TCP connection at a time** and **pauses cloud uploads to WeatherLink.com while a local socket is open**. Therefore:
-  * **Normal Operation (Internet UP):** `ingest_weather.py` pulls from WeatherLink Cloud v2 API as usual and **does not hold port `22222` open**.
-  * **Failover Operation (Internet DOWN):** When WeatherLink Cloud v2 times out or returns a network error, the local node automatically opens a brief TCP socket to `<VP2_IP_HOST>:22222`, sends `LOOP 1\n` (to read live temp, RH, barometric pressure, wind, and monotonic `year_rain`), parses the 99-byte Davis `LOOP` packet, and **immediately closes the socket** (within $< 2\text{ seconds}$).
+To prevent disrupting cloud uploads while guaranteeing instant offline survival, follow this strict failover protocol:
+* **Normal Mode (Internet Up):** `run_hourly_mos_pipeline.py` pulls Stone Office data from the **WeatherLink v2 Cloud API** (`/v2/current` + 48-hour `/v2/historic`) without touching TCP port `22222`. Both the local appliance and `https://tassajara-weather.streamlit.app` stay continuously synchronized.
+* **Storm / Internet-Outage Failover Mode (Internet Down):** Only when the WeatherLink v2 Cloud API request times out or fails DNS resolution does the local appliance open a brief (`< 2 second`) TCP socket to `WLIP_LOCAL_IP:22222`, send the Davis serial wake-up (`\n`) + `LOOP 1\n` (or `DMPAFT` for buffered archive records), parse the binary Davis packet (temperature, RH, barometric pressure, wind, and monotonic `year_rain` clicks), and **immediately close the TCP socket**.
+* **Internal Archive Buffer:** The `6555` logger stores up to **2,560 archive records** onboard (over 17 days at 10-minute intervals, or > 53 days at 30-minute intervals). Even if both the internet and the Mini PC go down temporarily, no rainfall clicks are lost—as soon as connectivity returns, `WL_HISTORIC` catches up automatically.
 
-#### What Stays Alive During a Multi-Day Internet Blackout
-1. **Live Stone Office Telemetry:** Tipping-bucket rain clicks, temperature, RH, wind, and pressure continue updating every hour directly from the cabled console (via USB/Serial or LAN TCP `:22222`).
-2. **Cached 7-Day NWS & MOS Forecast Horizon:** Because `tassajara_weather.db` stores the full **168-hour** `nws_forecasts` and `mos_corrected_forecasts` batches locally, an internet outage mid-storm still leaves **days of valid hourly MOS QPF and $P_{90}$ forecasts** on disk. `hydro_risk_engine.py` continues updating $API_t$, runoff readiness $C$, routed creek discharge (CFS), and `GREEN / YELLOW / ORANGE / RED` escalations using **live cabled-console rain + cached MOS forecasts**.
-3. **Campus-Wide Local Dashboard (`http://tassajara-weather.local:8501`):** Streamlit binds to the Stone Office LAN (`0.0.0.0:8501`) via mDNS (`avahi-daemon`). Any phone, tablet, or laptop on Stone Office / Disaster Council Wi-Fi loads the full dashboard with **zero external internet**.
-4. **Automatic Re-Sync on Recovery:** The moment Starlink/ISP returns, the next hourly timer automatically pulls fresh NWS `/gridpoints/MTR` grids, 5-station IEM/NWS boundary telemetry, and 48-hour `WL_HISTORIC` verification rows.
+### 3. How the System Survives a Complete Internet Dropout
 
----
+| Capability | Internet Up (Normal) | Internet Down (Storm / Island Mode) |
+| :--- | :--- | :--- |
+| **Stone Office Live Telemetry** | WeatherLink v2 Cloud API (fed by `6555` Ethernet) | **100% Live** via brief local LAN TCP poll (`WLIP_LOCAL_IP:22222`) |
+| **Hydrological Soil Wetness ($API$) & Creek CFS** | Live Stone Office + 5-station crest spillover | **100% Live** from Stone Office tipping bucket + last cached 168h MOS QPF |
+| **Flood & Road Warning Tiers (`GREEN`–`RED`)** | Live real-time escalation | **100% Operational** (escalates immediately on local rain rates, $API$, and routed CFS) |
+| **Forecast Horizon (Temp, PoP, QPF)** | Refreshed hourly from NWS `/gridpoints/MTR` | **Continues smoothly for up to 7 days** from the last cached 168-hour `MOS_GBM_v3_HYDRO` batch in `tassajara_weather.db` |
+| **5-Station Regional Array** | Live (`NWS_OBS` + `IEM_CA_DCP`) | Gracefully marks remote stations stale (`age_hours > 3.5h`) without crashing or fabricating spillover |
+| **Dashboard Access for Staff** | `https://tassajara-weather.streamlit.app` + local LAN | **Local LAN / Wi-Fi:** `http://tassajara-weather.local:8501` (accessible from any phone/laptop on Stone Office Wi-Fi) |
 
-### 3. Step-by-Step Local Linux Setup (Ubuntu Server 24.04 LTS or Raspberry Pi OS Lite 64-bit)
+### 4. Hardened Local Linux Setup (Ubuntu Server 24.04 LTS)
 
-#### Step A: Base OS, Security Hardening & mDNS
+#### Step A: Base OS, Dedicated User, mDNS & Firewall
 ```bash
-# 1. Update OS and install core dependencies
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git python3 python3-venv python3-pip sqlite3 \
-                    avahi-daemon ufw unattended-upgrades util-linux netcat-openbsd
+sudo apt update && sudo apt install -y python3-venv python3-pip sqlite3 git ufw avahi-daemon netcat-openbsd
 
-# 2. Set hostname so campus devices can reach http://tassajara-weather.local:8501
+# Set local hostname so staff can browse to http://tassajara-weather.local:8501
 sudo hostnamectl set-hostname tassajara-weather
-sudo systemctl enable --now avahi-daemon
 
-# 3. Lock down firewall (LAN-only access — replace 192.168.1.0/24 with your Stone Office subnet)
+# Lock down firewall: allow SSH and Streamlit strictly from the local Stone Office LAN subnet
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp comment 'SSH from local LAN only'
-sudo ufw allow from 192.168.1.0/24 to any port 8501 proto tcp comment 'Streamlit Dashboard LAN only'
+sudo ufw allow from 192.168.0.0/16 to any port 22 proto tcp
+sudo ufw allow from 192.168.0.0/16 to any port 8501 proto tcp
 sudo ufw enable
 
-# 4. Enable automatic security updates
-sudo dpkg-reconfigure -plow unattended-upgrades
+# Create dedicated unprivileged service user
+sudo useradd -r -m -d /opt/tassajara-weather -s /bin/bash tzmc
+sudo -u tzmc git clone https://github.com/MT-Wildhack/tassajara-weather.git /opt/tassajara-weather/app
+cd /opt/tassajara-weather/app
+sudo -u tzmc python3 -m venv .venv
+sudo -u tzmc .venv/bin/pip install --upgrade pip -r requirements.txt
 ```
 
-*(Recommended SSH hardening: disable password login in `/etc/ssh/sshd_config` (`PasswordAuthentication no`, `PermitRootLogin no`) after copying your SSH public key via `ssh-copy-id`.)*
-
-#### Step B: Dedicated Service User, Serial Port Permissions & Protected `.env`
+#### Step B: Protected Environment File (`/opt/tassajara-weather/.env`)
 ```bash
-# Create non-root dedicated system user and grant USB/serial access (for 6510USB / 6510SER loggers)
-sudo useradd -m -s /bin/bash tzmcweather
-sudo usermod -aG dialout tzmcweather
-
-# Verify cabled console hardware link BEFORE switching user:
-# - If using WeatherLink USB (6510USB), note the persistent device path:
-ls -l /dev/serial/by-id/
-# - If using WeatherLinkIP (6555) Ethernet, verify TCP port 22222 responds on LAN:
-# nc -zv -w 3 192.168.1.50 22222
-
-sudo su - tzmcweather
-
-# Clone repository and install Python dependencies (+ pyserial for direct cabled USB/Serial reads)
-git clone https://github.com/MT-Wildhack/tassajara-weather.git
-cd tassajara-weather
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt pyserial
-
-# Create restricted environment file (readable ONLY by tzmcweather)
-cat <<'EOF' > /home/tzmcweather/tassajara-weather/.env
+sudo tee /opt/tassajara-weather/.env > /dev/null <<'EOF'
 WL_API_KEY=your_weatherlink_v2_api_key
 WL_API_SECRET=your_weatherlink_v2_api_secret
 SYNOPTIC_TOKEN=optional_synoptic_token
-
-# Local Cabled Vantage Pro2 Console Failover Settings (uncomment the one matching your logger):
-# Option A: WeatherLink USB (6510USB) / Serial (6510SER)
-# VP2_CONN_MODE=serial
-# VP2_SERIAL_PORT=/dev/serial/by-id/usb-Silicon_Labs_CP210x_UART_Bridge_Controller-if00-port0
-# VP2_BAUD_RATE=19200
-
-# Option B: WeatherLinkIP (6555) Ethernet Logger (LAN TCP failover only; closes socket immediately)
-# VP2_CONN_MODE=tcp
-# VP2_IP_HOST=192.168.1.50
-# VP2_IP_PORT=22222
+WLIP_LOCAL_IP=192.168.1.50
+WLIP_LOCAL_PORT=22222
 EOF
-chmod 600 /home/tzmcweather/tassajara-weather/.env
-exit
+sudo chown tzmc:tzmc /opt/tassajara-weather/.env
+sudo chmod 600 /opt/tassajara-weather/.env
 ```
 
-#### Step C: Always-On Local Streamlit Dashboard (`systemd` Service)
-Create `/etc/systemd/system/tzmc-dashboard.service` so the dashboard starts automatically on power-up and restarts if it ever crashes:
-
+#### Step C: Persistent Streamlit Dashboard Service (`/etc/systemd/system/tzmc-dashboard.service`)
 ```ini
 [Unit]
-Description=TZMC Microclimate & Flood Warning Streamlit Dashboard
+Description=Tassajara Weather & Flood MOS Streamlit Dashboard
 After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-User=tzmcweather
-WorkingDirectory=/home/tzmcweather/tassajara-weather
-EnvironmentFile=/home/tzmcweather/tassajara-weather/.env
-ExecStart=/home/tzmcweather/tassajara-weather/.venv/bin/streamlit run app.py \
-    --server.address 0.0.0.0 \
-    --server.port 8501 \
-    --server.headless true \
-    --browser.gatherUsageStats false
+User=tzmc
+WorkingDirectory=/opt/tassajara-weather/app
+EnvironmentFile=/opt/tassajara-weather/.env
+ExecStart=/opt/tassajara-weather/app/.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
 Restart=always
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-#### Step D: Hourly Ingestion & Inference Timer (`systemd` Timer with `flock` Lock)
-Using a `systemd` timer instead of bare `cron` provides structured `journalctl` logs, automatic catch-up (`Persistent=true`), and `flock` overlap protection so two runs never collide on SQLite or the cabled console serial/TCP port.
-
+#### Step D: Hourly Pipeline Service & Timer (with `flock` Concurrency Protection)
 Create `/etc/systemd/system/tzmc-pipeline.service`:
 ```ini
 [Unit]
-Description=TZMC Hourly Weather Ingestion, MOS Inference & Flood Risk Pipeline
+Description=Tassajara Hourly MOS & Hydrological Pipeline
 After=network-online.target
 
 [Service]
 Type=oneshot
-User=tzmcweather
-WorkingDirectory=/home/tzmcweather/tassajara-weather
-EnvironmentFile=/home/tzmcweather/tassajara-weather/.env
-ExecStart=/usr/bin/flock -n /tmp/tzmc_pipeline.lock \
-    /home/tzmcweather/tassajara-weather/.venv/bin/python3 \
-    /home/tzmcweather/tassajara-weather/run_hourly_mos_pipeline.py
+User=tzmc
+WorkingDirectory=/opt/tassajara-weather/app
+EnvironmentFile=/opt/tassajara-weather/.env
+ExecStart=/usr/bin/flock -n /tmp/tzmc_pipeline.lock /opt/tassajara-weather/app/.venv/bin/python3 run_hourly_mos_pipeline.py
 ```
 
 Create `/etc/systemd/system/tzmc-pipeline.timer`:
 ```ini
 [Unit]
-Description=Run TZMC Hourly MOS Pipeline at :05 past every hour
+Description=Run Tassajara Hourly MOS Pipeline at :05 past every hour
 
 [Timer]
 OnCalendar=*:05:00
 Persistent=true
-RandomizedDelaySec=15
 
 [Install]
 WantedBy=timers.target
 ```
 
-Create a weekly retraining timer (`/etc/systemd/system/tzmc-retrain.service` & `tzmc-retrain.timer`, running Sundays at `03:30` local time using `backfill_and_train.py --skip-fetch`), then enable everything:
-
+Enable and start both services:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now tzmc-dashboard.service
-sudo systemctl enable --now tzmc-pipeline.timer
-
-# Verify live status and logs
-systemctl status tzmc-dashboard.service
-systemctl list-timers --all | grep tzmc
-journalctl -u tzmc-pipeline.service -n 50 --no-pager
+sudo systemctl enable --now tzmc-dashboard.service tzmc-pipeline.timer
+sudo systemctl status tzmc-dashboard.service tzmc-pipeline.timer
 ```
 
-#### Step E: Automated Safe SQLite WAL Backups
-Never back up a live WAL-mode SQLite file with plain `cp` (which can produce a torn copy during a write). Schedule a daily safe snapshot using SQLite's online backup API to a secondary USB flash drive or Stone Office NAS:
-
+#### Step E: Safe Daily WAL SQLite Backups
+Never copy a live WAL-mode SQLite file with `cp` (which can produce a corrupted snapshot). Schedule a nightly online backup using SQLite's native `.backup` command to a mounted USB drive or NAS:
 ```bash
-# Example daily backup command (run at 04:00 via systemd timer or tzmcweather crontab)
-mkdir -p /home/tzmcweather/backups
-sqlite3 /home/tzmcweather/tassajara-weather/tassajara_weather.db \
-    ".backup '/home/tzmcweather/backups/tassajara_weather_$(date +\%Y\%m\%d).db'"
-find /home/tzmcweather/backups -name "tassajara_weather_*.db" -mtime +30 -delete
+sqlite3 /opt/tassajara-weather/app/tassajara_weather.db ".backup '/mnt/backup/tassajara_weather_$(date +%F).db'"
 ```
 
-#### Step F: Dual-Mode Cloud + Local Topology (Recommended)
-For maximum resilience with zero single point of failure:
-* **Local Mini PC wired/LAN-linked to the VP2 Cabled Console (Primary Life-Safety Source inside Canyon):** Serves `http://tassajara-weather.local:8501` over Stone Office Wi-Fi continuously—immune to Starlink/ISP dropouts.
-* **GitHub Actions + Streamlit Cloud (Public / Off-Site Mirror):** Continues serving `https://tzmc-weather.streamlit.app` for staff traveling on Tassajara Road, SFZC City Center, and Jamesburg guests. Because both ingest independently from WeatherLink Cloud, NWS, and IEM `CA_DCP`, neither blocks the other.
+#### Step F: BIOS Auto-Power-On After Extended Blackout
+In the Mini PC's UEFI/BIOS settings, enable **Restore on AC Power Loss $\rightarrow$ Power On**. If a multi-day storm drains the UPS completely, the appliance will automatically boot, restart the dashboard and hourly timer, and resume flood monitoring the moment generator or grid power returns.
 
 ---
 
 ## 10. Streamlit Dashboard UI
 
-Launch locally via `streamlit run app.py` or view online at `https://tzmc-weather.streamlit.app`.
+Hosted live at **[https://tassajara-weather.streamlit.app](https://tassajara-weather.streamlit.app)** (or locally at `http://tassajara-weather.local:8501`), the interface provides two dedicated modes:
 
-### Mode 1: Everyday Forecast (Community & Guest View)
-* **Synchronized 4-Tier Flood & Road Warning Banner:** Plain-language guidance for Tassajara Road travel, lower footbridges, and operational actions.
-* **Canyon Current Conditions & Topographic Shading Badge:** Real-time temperature, humidity, 24h rain, and solar state (Direct Sunlight, Black Cone Shadow, Active Storm Overcast, or Nocturnal Katabatic Drainage).
-* **Freeze Warning & Creek Cold-Pool Alerts:** Flags nights where $P_{10} \le 32^\circ\text{F}$ to protect exposed pipes and garden beds.
-* **24-Hour (3-Hour Cards) & 7-Day Planner:** Day/night-aware weather icons (`🌧️` at night vs. `🌦️` daytime), `100%` PoP badge for today's already-wet hours, and a clean 7-day planner table.
-* **Interactive Creek Runoff & Road Passability Preview:** Soil wetness gauge, 72-hour routed hydrograph, and collapsible 4-tier severity matrix.
+### 1. Everyday Forecast (Community & Guest View)
+* **Synchronized Flood & Road Warning Banner:** Color-coded operational guidance (`GREEN`, `YELLOW`, `ORANGE`, `RED`) covering Tassajara Road passability, footbridge debris risk, and actionable emergency steps.
+* **Topographic Shading & Current Conditions Card:** Plain-language canyon conditions (`Active Storm Overcast`, `Canyon Wall Shadow`, `Clear Canyon Night`), 24-hour extremes, and rolling 24-hour rain.
+* **Freeze & Trail Advisories:** Automated freeze alerts when cold-pool $P_{10}$ dips to $\le 32^\circ\text{F}$, plus 3-hour outlook cards (with day/night-aware icons) and a 7-day planner table.
+* **Interactive Creek Runoff & Hydrograph Outlook:** Displays catchment saturation ($API$), runoff readiness ($C$), and routed creek discharge alongside the 4-tier severity matrix.
 
-### Mode 2: Scientific & Statistical MOS Suite
-* **8-Metric Telemetry Grid:** Dry-bulb, RH/dewpoint, Stull wet-bulb/VPD, 485 m wind vector, MSLP + 3h tendency, 24h rain + 72h MOS QPF, true crest lapse rate (`CHWC1` $^\circ\text{C/km}$), and gorge/coastal thermal gradients (`ASRC1`, `CAHC1`, `PPSC1` in $^\circ\text{F}$).
-* **5-Station Boundary Network Inspector:** Live status (`Online`, `Online (Rain Gauge)` for `VTCC1`, or `Model Fallback / Stale`) with elevation-appropriate gradients.
-* **3-Panel Verification & Operational Time Series:**
-  * *Panel 1:* Observed Stone Office temperature vs. MOS Quantile Fan ($P_{10}\text{--}P_{90}$) vs. Raw NWS grid.
-  * *Panel 2:* Observed canyon gusts ($485\text{ m}$) cleanly separated from forecast ridge gusts ($880\text{ m}$) + RH (%).
-  * *Panel 3:* MOS calibrated QPF, $P_{90}$ extreme rates, observed tipping bucket, and calibrated PoP (%).
-* **Deduplicated Verification Scorecard (`Past 72 Hours` / `Full Historical Archive`):** Raw NWS vs. MOS MAE/RMSE, RMSE Skill Score, Hourly Win Rate, $P_{10}\text{--}P_{90}$ Empirical Coverage (nominal $80.0\%$), Hydrological Brier Score, and paired residual table.
-* **Model Interpretability & HAC OLS Diagnostics:** Permutation feature importances and full standardized Newey-West HAC OLS coefficient table ($R^2$, Wald $F$, $\kappa$, 95% CIs).
+### 2. Scientific & Statistical MOS Suite
+* **8-Metric Boundary-Layer Telemetry Grid:** Live dry-bulb, RH/dewpoint, Stull wet-bulb/Tetens VPD, anemometer vector, MSLP + 3-hour barometric tendency, 24h rain + 72h MOS QPF, crest lapse rate ($^\circ\text{C/km}$ for crest stations $\Delta z \ge 0.30\text{ km}$), and gorge/coastal differentials ($\Delta T$ in $^\circ\text{F}$).
+* **5-Station Santa Lucia Network Table:** Live status (`Online`, `Online (Rain Gauge)` for `VTCC1`, or `Model Fallback / Stale`), temperature, RH, wind/gust, hourly rain, and vertical/horizontal gradient vs. Stone Office.
+* **3-Panel Interactive Plotly Suite:**
+  * *Panel 1:* Observed temperature actuals vs. MOS Quantile Fan ($P_{10}$–$P_{90}$) vs. Raw NWS forecast.
+  * *Panel 2:* Observed canyon gusts ($485\text{ m}$) cleanly separated from forecast ridge-grid gusts ($880\text{ m}$) + RH (%).
+  * *Panel 3:* MOS calibrated QPF, $P_{90}$ extreme downpour rates, observed tipping-bucket rain, and PoP (%).
+* **Deduplicated Forecast Accuracy Verification Scorecard:** Evaluates exact paired hours (72h or Full Archive) for Raw NWS vs. MOS MAE/RMSE, RMSE Skill Score (%), Hourly Win Frequency, $P_{10}$–$P_{90}$ empirical coverage, and hydrological Brier Score & QPF bias.
+* **Model Interpretability & HAC OLS Diagnostics:** Permutation feature importances and standardized Newey-West HAC OLS regression summary ($R^2$, $F$-stat, $\kappa$, $95\%$ CIs).
 
 ---
 
 ## 11. Hardware Roadmap & Pending Physical Stream Telemetry
 
-The database schema (`stream_gauge_observations`, `vw_creek_flood_monitor`) and `hydro_risk_engine.py` are pre-engineered for a physical non-contact creek stage sensor at Tassajara Creek (e.g., downstream stringer of the old bathhouse footbridge):
+The database schema (`stream_gauge_observations` and `vw_creek_flood_monitor`) and `hydro_risk_engine.py` are pre-wired for a physical stream-stage sensor at the **Tassajara Creek Bathhouse Footbridge**:
 
-```text
-                       CURRENT PRODUCTION MODE (Virtual Two-Pathway Routing)
-┌──────────────────────────────────────────────┐
-│  Stone Office Davis VP2 Cabled (ISS 36966)   │───────► [hydro_risk_engine.py] ───► Routed Creek Index
-│  + Live Crest Spillover (CHWC1 / VTCC1)      │          (API + 2-Pathway Router)   (discharge_index_cfs)
-└──────────────────────────────────────────────┘
-
-                       PHASE 2 HARDWARE ROADMAP (Physical Ground Truth)
-┌──────────────────────────────────────────────┐
-│  Non-Contact Radar / Ultrasonic Level Gauge  │───────► [stream_gauge_observations]
-│  (e.g., Campbell CS475A / MaxBotix + LoRa)   │          - stream_stage_m / rate_of_rise_m_hr
-└──────────────────────────────────────────────┘          - water_temp_c / battery_v
-```
-
-### Automatic Physical Failover Already Coded
-When physical telemetry begins populating `stream_gauge_observations`, `evaluate_flood_and_road_tier()` automatically activates physical stage thresholds ($0.75\text{ m}$, $1.15\text{ m}$, $1.60\text{ m}$) and rapid-surge triggers ($\ge 0.40\text{ m/hr}$) alongside the rainfall and discharge triggers without requiring dashboard rewrites.
+* **Current Mode:** `UNINSTALLED (MOS + Tipping Bucket Mode)` — `stream_stage_m`, `rate_of_rise_m_hr`, `water_temp_c`, and `battery_v` remain `NULL`.
+* **Target Hardware:** Non-contact SDI-12 / Modbus Radar or Ultrasonic Level Sensor (e.g., Campbell Scientific CS475A) paired with a solar-powered ESP32 / LoRaWAN node transmitting 5-minute stage readings to the Stone Office Mini PC.
+* **Automatic Integration:** Once rows populate `stream_gauge_observations`, `evaluate_flood_and_road_tier()` automatically activates physical stage height and surge-rate ($\text{m/hr}$) escalation rules alongside the existing $API$ and `250 / 500 CFS` triggers without requiring code rewrites.
 
 ---
 
 ## 12. Future Directions & Methodological Improvements
 
-1. **Cloud-Attenuated Midday Insolation (`v2` MOS Feature):** During persistent dense midday rainstorms ($>90\%$ RH, active precipitation), clear-sky geometric insolation can still introduce a warm daytime overshoot. Weighting geometric insolation by forecast cloud cover / RH / PoP will tighten storm-day high temperatures.
-2. **Chews Ridge Summit Icing Advisory:** `CHWC1` ($5,039\text{ ft}$) routinely drops near or below $32^\circ\text{F}$ during passing cold fronts while the canyon floor sits in the $40\text{s}$. Adding a dedicated summit freeze/black-ice badge when `CHWC1` $\le 33^\circ\text{F}$ during wet road conditions will further improve Tassajara Road travel safety.
-3. **Physical Creek Rating Curve Calibration:** Logging visual footbridge stage observations during winter storms (and eventually installing a radar level gauge) will convert the synthetic `CFS` index into a site-calibrated stage-discharge rating curve.
-4. **Native Cabled Vantage Pro2 Local Failover (`pyserial` / TCP `:22222` / WeeWX Bridge):** Extending `ingest_weather.py` to automatically parse Davis 99-byte `LOOP` packets over USB/Serial (`6510USB`/`6510SER`) or LAN TCP port `22222` (`6555` WeatherLinkIP) whenever WeatherLink Cloud v2 is unreachable—making local Mini PC storm operation 100% immune to WAN outages out of the box.
-5. **Probabilistic Ensemble Forcing (HREF / GEFS) & Burn-Scar Hydrology:** Integrating high-resolution ensemble QPF probabilities and dynamic post-wildfire BAER soil burn severity scaling ($C_{\max}$ adjustment) for long-term watershed resilience.
+1. **Cloud-Attenuated Insolation (`v2` MOS Retrain):** Attenuating the clear-sky geometric insolation predictor using forecast cloud cover / RH / PoP will eliminate midday warm overshoots during dense winter storm overcast.
+2. **Visual Creek Calibration:** Logging observed water depth, turbidity, and bankfull percentage at the footbridges during storms to calibrate `API_MIDPOINT_MM` and `INTERFLOW_FRACTION` against real canyon hydraulics.
+3. **Chews Ridge Summit Icing Advisory:** Adding a dedicated road-icing badge when live `CHWC1` ($5,039\text{ ft}$) drops to $\le 33^\circ\text{F}$ during wet road conditions (`API >= 2.00 in`).
+4. **Post-Fire Hydrological Scaling:** Ingesting BAER soil burn severity layers if future wildfires impact the upper Ventana Wilderness catchment to dynamically adjust $C_{\max}$ for hydrophobic debris-flow risk.
 
 ---
 
 ## 13. License & Operational Disclaimer
 
-Maintained for the safety and operational resilience of the **Tassajara Zen Mountain Center (San Francisco Zen Center)** community, staff, students, and guests. Distributed under the **MIT License**.
+Maintained for the safety and operational resilience of the **Tassajara Zen Mountain Center (San Francisco Zen Center)** community, staff, students, and guests. Licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
 
-**Operational Disclaimer:** Forecasts, hydrological indices, and alert tiers (`GREEN`, `YELLOW`, `ORANGE`, `RED`) generated by this software serve strictly as **local advisory decision-support guidance**. They do not constitute an official government warning and never supersede physical ground verification, visual inspection of Tassajara Road and creek footbridges, or official directives issued by the **National Weather Service (NWS Monterey)**, **Monterey County Office of Emergency Services (OES)**, **US Forest Service (USFS)**, or the **TZMC Disaster Council**.
+**Operational Disclaimer:** The computations, forecasts, discharge indices, and alert tiers (`GREEN`, `YELLOW`, `ORANGE`, `RED`) generated by this software serve strictly as **advisory decision-support guidance**. They do not constitute an official government warning and do not supersede direct visual inspection of Tassajara Road and Tassajara Creek or official directives issued by the **National Weather Service (NWS Monterey)**, **Monterey County Office of Emergency Services (OES)**, **US Forest Service (USFS)**, or the **TZMC Disaster Council**.
