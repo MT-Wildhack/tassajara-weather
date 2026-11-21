@@ -735,24 +735,12 @@ def project_forward_hydro_series(
         # P90 surge runoff evaluates P90 burst intensity over storm-envelope wetness
         r_p90 = compute_hourly_effective_runoff_mm(q_p90, 0.5 * (c_exp + c_p90))
 
-        hr_code, _ = evaluate_single_hour_tier(
-            api_mm=api_exp,
-            precip_1hr_mm=q_exp,
-            p90_1hr_mm=q_p90,
-            runoff_mm_hr=r_exp,
-            rolling_24h_mm=float(rolling_24h_arr[idx]),
-            rolling_72h_mm=float(rolling_72h_arr[idx]),
-            allow_red=(idx < 6),
-            allow_orange=(idx < 24),
-        )
-
         proj_api_mm.append(api_exp)
         proj_api_p90_mm.append(api_p90)
         proj_c.append(c_exp)
         proj_c_p90.append(c_p90)
         proj_r_mm.append(r_exp)
         proj_r_p90_mm.append(r_p90)
-        proj_tiers.append(hr_code)
 
     # Seed last 3 historical runoff hours AND historical interflow storage for seamless continuity
     seed_hist = list((recent_runoff_history_mm_hr or [])[-3:])
@@ -777,6 +765,21 @@ def project_forward_hydro_series(
 
     routed_exp = _route_forward_with_seed(proj_r_mm)
     routed_p90 = _route_forward_with_seed(proj_r_p90_mm)
+
+    # Classify coincident hourly tiers AFTER routing so 250 / 500 CFS safeguards apply
+    for idx in range(len(fc)):
+        hr_code, _ = evaluate_single_hour_tier(
+            api_mm=proj_api_mm[idx],
+            precip_1hr_mm=float(mos_qpf.iloc[idx]),
+            p90_1hr_mm=float(mos_p90.iloc[idx]),
+            runoff_mm_hr=proj_r_mm[idx],
+            rolling_24h_mm=float(rolling_24h_arr[idx]),
+            rolling_72h_mm=float(rolling_72h_arr[idx]),
+            allow_red=(idx < 6),
+            allow_orange=(idx < 24),
+            discharge_cfs=routed_exp[idx],
+        )
+        proj_tiers.append(hr_code)
 
     fc["mos_qpf_mm"] = mos_qpf.round(3).values
     fc["mos_qpf_p90_mm"] = np.round(mos_p90, 3)
@@ -943,9 +946,13 @@ def compute_dashboard_hydro_state(
         latest_row = hist_hydro_df.iloc[-1]
         valid_time_utc = str(latest_row["valid_time_utc"])
         tass_p_1hr = float(latest_row.get("precip_1hr_mm") or 0.0)
-        eff_p_now, spill_now = compute_effective_catchment_precip_mm(
+        hist_eff_p = float(latest_row.get("effective_precip_1hr_mm") or 0.0)
+        hist_spill = float(latest_row.get("upstream_spillover_mm") or 0.0)
+        live_eff_p, live_spill = compute_effective_catchment_precip_mm(
             tass_p_1hr, chews_p_now, vent_p_now, bigsur_p_now
         )
+        eff_p_now = max(hist_eff_p, live_eff_p)
+        spill_now = max(hist_spill, live_spill)
         prev_api = float(hist_hydro_df.iloc[-2]["api_mm"]) if len(hist_hydro_df) >= 2 else 0.0
         decay_k = float(latest_row.get("decay_k") or API_HOURLY_K_DEFAULT)
         api_mm = max(float(latest_row["api_mm"]), compute_api_step(prev_api, eff_p_now, k_hr=decay_k))
@@ -994,8 +1001,20 @@ def compute_dashboard_hydro_state(
         else []
     )
 
+    # Strictly route hours AFTER the last observed hour so `now` is never double-counted
+    fc_strict_future = future_fc_df
+    if (
+        not hist_hydro_df.empty
+        and future_fc_df is not None
+        and not future_fc_df.empty
+        and "valid_time_utc" in future_fc_df.columns
+    ):
+        last_obs_dt = pd.to_datetime(valid_time_utc, utc=True).floor("h")
+        fc_dt = pd.to_datetime(future_fc_df["valid_time_utc"], utc=True, errors="coerce").dt.floor("h")
+        fc_strict_future = future_fc_df.loc[fc_dt > last_obs_dt].copy()
+
     proj_fc_df = project_forward_hydro_series(
-        future_fc_df=future_fc_df,
+        future_fc_df=fc_strict_future,
         initial_api_mm=api_mm,
         recent_runoff_history_mm_hr=recent_runoff_list,
         initial_interflow_storage_mm=final_interflow_mm,
@@ -1150,9 +1169,21 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
         )
 
         ref_dict: Dict[str, Any] = {}
+        anchor_dt = (
+            pd.to_datetime(obs_df.iloc[0]["valid_time_utc"], utc=True)
+            if not obs_df.empty
+            else pd.Timestamp(datetime.now(timezone.utc))
+        )
         if not ref_hist_df.empty:
-            for stid, grp in ref_hist_df.groupby("station_id"):
-                ref_dict[str(stid)] = grp.iloc[0].to_dict()
+            r_live = ref_hist_df.copy()
+            if "source" in r_live.columns:
+                r_live = r_live[~r_live["source"].isin(["OPENMETEO_SYNTH", "OFFLINE"])].copy()
+            r_live["_dt"] = pd.to_datetime(r_live["valid_time_utc"], utc=True, errors="coerce")
+            r_live = r_live.dropna(subset=["_dt"]).sort_values("_dt", ascending=False)
+            for stid, grp in r_live.groupby("station_id"):
+                row_d = grp.iloc[0].to_dict()
+                row_d["online"] = bool(abs((anchor_dt - row_d["_dt"]).total_seconds()) / 3600.0 <= 3.5)
+                ref_dict[str(stid)] = row_d
 
         gauge_row = conn.execute(
             """
@@ -1233,6 +1264,7 @@ def evaluate_and_store_hydro_risk(db_path: str = "tassajara_weather.db") -> Dict
                     precip_24hr_mm=float(h_row["precip_24hr_rolling_mm"]),
                     precip_72hr_mm=float(h_row["precip_72hr_rolling_mm"]),
                     current_runoff_mm_hr=float(h_row["runoff_mm_hr"]),
+                    current_discharge_cfs=float(h_row["discharge_index_cfs"]),
                 )
                 recent_hist_rows.append((
                     h_ts,

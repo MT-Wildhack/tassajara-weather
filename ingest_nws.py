@@ -478,7 +478,7 @@ def fetch_nws_gridpoints_dataframe(
 
     for v_dt in hr_list:
         v_iso = v_dt.isoformat()
-        lead_hrs = max(1, int(round((v_dt - now_hour_utc).total_seconds() / 3600.0)))
+        lead_hrs = int(round((v_dt - now_hour_utc).total_seconds() / 3600.0))
         hp = hourly_periods_map.get(v_iso, {})
         om = om_map.get(v_iso, {})
 
@@ -636,7 +636,7 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
     now_hr_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     df_fc = fetch_nws_gridpoints_dataframe(
         now_hour_utc=now_hr_utc,
-        include_past_hours=24,
+        include_past_hours=0,
         prefer_open_meteo_primary=False,
     )
     if df_fc.empty:
@@ -709,6 +709,7 @@ def prune_old_forecasts(db_path: str = "tassajara_weather.db", keep_days: int = 
                                  PARTITION BY valid_time_utc
                                  ORDER BY
                                      CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                                     CASE WHEN lead_time_hours >= 1 AND issue_time_utc < valid_time_utc THEN 0 ELSE 1 END ASC,
                                      ABS(lead_time_hours - 6) ASC,
                                      issue_time_utc DESC
                              ) AS rn

@@ -324,7 +324,7 @@ class WeatherLinkV2Client:
             "precip_storm_mm": 0.0,
             "rain_storm_start_utc": None,
             "precip_month_mm": 0.0,
-            "precip_year_mm": 0.0,
+            "precip_year_mm": None,
             "precip_rate_mm_hr": 0.0,
             "solar_rad_wm2": None,
             "uv_index": None,
@@ -497,7 +497,9 @@ class WeatherLinkV2Client:
                 in_to_mm(first_not_none(latest.get("rainfall_year_in"), latest.get("rain_year_in"))),
             )
             if rain_year_mm is not None:
-                parsed["precip_year_mm"] = max(parsed.get("precip_year_mm", 0.0), round(float(rain_year_mm), 3))
+                prev_yr = parsed.get("precip_year_mm")
+                yr_val = round(float(rain_year_mm), 3)
+                parsed["precip_year_mm"] = yr_val if prev_yr is None else max(prev_yr, yr_val)
 
             rain_storm_mm = first_not_none(
                 latest.get("rain_storm_mm"),

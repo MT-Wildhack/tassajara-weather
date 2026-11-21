@@ -149,7 +149,7 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 raw_nws_qpf_mm REAL,
                 mos_qpf_mm REAL,
                 mos_qpf_p90_mm REAL,
-                PRIMARY KEY (issue_time_utc, valid_time_utc)
+                PRIMARY KEY (issue_time_utc, valid_time_utc, model_version)
             );
             """
         )
@@ -209,6 +209,7 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 FROM nws_forecasts
                 WHERE nws_temp_c IS NOT NULL
                   AND lead_time_hours >= 1
+                  AND issue_time_utc < valid_time_utc
             )
             SELECT
                 f.issue_time_utc,
@@ -837,28 +838,54 @@ def populate_mos_verification_and_active_forecasts(
     corrector: TassajaraMOSCorrector,
     train_df: pd.DataFrame,
     db_path: str = DB_PATH,
+    oof_preds_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Populates all 15 thermal + hydrological columns in mos_corrected_forecasts across:
-    1. All paired historical verification timestamps in train_df, and
-    2. The latest complete operational NWS 7-day forecast batch using the 5-station array.
+    1. Historical verification timestamps (strictly INSERT OR IGNORE; never overwrites
+       genuine live operational rows; prefers out-of-fold CV predictions when available), and
+    2. Future hours (>= now_utc) of the latest operational NWS 7-day forecast batch.
     """
-    hist_preds = _ensure_hydro_pred_cols(corrector.predict(train_df), train_df)
+    now_iso = (
+        datetime.now(timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+        .isoformat()
+    )
+    use_oof = isinstance(oof_preds_df, pd.DataFrame) and not oof_preds_df.empty
+    if use_oof:
+        hist_preds = oof_preds_df.reset_index(drop=True)
+        hist_src = train_df.loc[oof_preds_df.index].reset_index(drop=True)
+        hist_model_ver = "MOS_GBM_v3_OOF"
+    else:
+        hist_preds = _ensure_hydro_pred_cols(corrector.predict(train_df), train_df)
+        hist_src = train_df.reset_index(drop=True)
+        hist_model_ver = "MOS_GBM_v3_HYDRO"
+
+    with sqlite3.connect(db_path) as conn:
+        existing_op_pairs = set(
+            conn.execute(
+                """
+                SELECT issue_time_utc, valid_time_utc
+                FROM mos_corrected_forecasts
+                WHERE model_version != 'MOS_GBM_v3_OOF'
+                """
+            ).fetchall()
+        )
     hist_rows = [
         (
             str(r["issue_time_utc"]),
             str(r["valid_time_utc"]),
-            "MOS_GBM_v3_HYDRO",
+            hist_model_ver,
             float(r["nws_temp_c"]),
             float(r["pred_temp_error_c"]),
             float(r["corrected_temp_c"]),
             float(r["corrected_temp_p10_c"]),
             float(r["corrected_temp_p90_c"]),
-            clean_num(train_df.loc[idx, "nws_rh_pct"], 50.0),
+            clean_num(hist_src.loc[idx, "nws_rh_pct"], 50.0),
             round(
                 max(
-                    clean_num(train_df.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0,
-                    (clean_num(train_df.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35,
+                    clean_num(hist_src.loc[idx, "nws_wind_gust_ms"], 0.0) or 0.0,
+                    (clean_num(hist_src.loc[idx, "nws_wind_speed_ms"], 0.0) or 0.0) * 1.35,
                 ),
                 2,
             ),
@@ -869,21 +896,25 @@ def populate_mos_verification_and_active_forecasts(
             clean_num(r.get("mos_qpf_p90_mm"), 0.0),
         )
         for idx, r in hist_preds.iterrows()
+        if (str(r["issue_time_utc"]), str(r["valid_time_utc"])) not in existing_op_pairs
     ]
 
     with sqlite3.connect(db_path) as conn:
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO mos_corrected_forecasts (
-                issue_time_utc, valid_time_utc, model_version,
-                raw_nws_temp_c, pred_temp_error_c, corrected_temp_c,
-                corrected_temp_p10_c, corrected_temp_p90_c,
-                corrected_rh_pct, corrected_wind_gust_ms,
-                raw_nws_pop_pct, mos_pop_pct,
-                raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            hist_rows,
+        if use_oof:
+            conn.execute("DELETE FROM mos_corrected_forecasts WHERE model_version = 'MOS_GBM_v3_OOF'")
+        if hist_rows:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO mos_corrected_forecasts (
+                    issue_time_utc, valid_time_utc, model_version,
+                    raw_nws_temp_c, pred_temp_error_c, corrected_temp_c,
+                    corrected_temp_p10_c, corrected_temp_p90_c,
+                    corrected_rh_pct, corrected_wind_gust_ms,
+                    raw_nws_pop_pct, mos_pop_pct,
+                    raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                hist_rows,
         )
 
         latest_fc_df = pd.read_sql_query(
@@ -898,9 +929,11 @@ def populate_mos_verification_and_active_forecasts(
                 ORDER BY issue_time_utc DESC
                 LIMIT 1
             )
+              AND valid_time_utc >= ?
             ORDER BY valid_time_utc ASC
             """,
             conn,
+            params=(now_iso,),
         )
         if not latest_fc_df.empty:
             obs_latest = pd.read_sql_query(

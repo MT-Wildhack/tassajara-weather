@@ -1390,7 +1390,9 @@ def load_all_dashboard_data():
                             model_version,
                             ROW_NUMBER() OVER (
                                 PARTITION BY valid_time_utc, issue_time_utc
-                                ORDER BY model_version DESC
+                                ORDER BY
+                                    CASE WHEN model_version = 'MOS_GBM_v3_HYDRO' THEN 0 ELSE 1 END ASC,
+                                    model_version DESC
                             ) AS rn
                         FROM mos_corrected_forecasts
                     ) m_ex
@@ -1415,10 +1417,14 @@ def load_all_dashboard_data():
                             ) AS rn
                         FROM mos_corrected_forecasts
                     ) m_any ON o.valid_time_utc = m_any.valid_time_utc AND m_any.rn = 1
-                    WHERE o.temp_c IS NOT NULL AND o.qc_flag = 'OK'
+                    WHERE o.temp_c IS NOT NULL
+                      AND o.qc_flag = 'OK'
+                      AND o.valid_time_utc < ?
+                      AND COALESCE(o.source, 'WL_LIVE') != 'OPENMETEO_SYNTH'
                     ORDER BY o.valid_time_utc ASC
                     """,
                     conn,
+                    params=(now_hour_iso,),
                 )
                 if not verify_df.empty:
                     verify_df = (
@@ -1476,10 +1482,60 @@ def load_all_dashboard_data():
             else:
                 ptrend_live = float(ptrend_live)
 
+            _, today_mid_iso, _ = get_local_day_boundaries_utc(now_hour_utc)
             existing_hr_rain = 0.0
-            if not obs_df.empty and str(obs_df.iloc[0].get("valid_time_utc")) == now_hour_iso:
-                existing_hr_rain = safe_float(obs_df.iloc[0].get("precip_1hr_mm"), 0.0)
-            rain_1h_live = max(existing_hr_rain, safe_float(live_obs.get("precip_1hr_mm"), 0.0))
+            db_prior_today_mm = 0.0
+            if not obs_df.empty and "valid_time_utc" in obs_df.columns:
+                cur_mask = obs_df["valid_time_utc"] == now_hour_iso
+                if cur_mask.any():
+                    existing_hr_rain = safe_float(obs_df.loc[cur_mask, "precip_1hr_mm"].iloc[0], 0.0)
+                prior_mask = (
+                    (obs_df["valid_time_utc"] >= today_mid_iso)
+                    & (obs_df["valid_time_utc"] < now_hour_iso)
+                )
+                if prior_mask.any():
+                    db_prior_today_mm = float(get_col(obs_df.loc[prior_mask], "precip_1hr_mm", 0.0).sum())
+
+            live_day_mm = safe_float(live_obs.get("precip_day_mm"), 0.0)
+            live_yr_raw = live_obs.get("precip_year_mm")
+            live_yr_mm = safe_float(live_yr_raw, np.nan) if live_yr_raw is not None else np.nan
+            console_not_reset_at_midnight = False
+            prev_day_val = 0.0
+            if now_hour_iso == today_mid_iso and Path(DB_PATH).exists():
+                try:
+                    with sqlite3.connect(DB_PATH) as conn_st:
+                        st_rows = {
+                            r[0]: (r[1], r[2])
+                            for r in conn_st.execute(
+                                "SELECT key, val_text, val_num FROM ingest_state "
+                                "WHERE key IN ('last_console_rain_year_mm', 'last_console_rain_day_mm')"
+                            ).fetchall()
+                        }
+                    prev_day_mid, prev_day_num = st_rows.get("last_console_rain_day_mm", (None, None))
+                    _, prev_yr_num = st_rows.get("last_console_rain_year_mm", (None, None))
+                    delta_yr = (
+                        round(live_yr_mm - float(prev_yr_num), 3)
+                        if (not math.isnan(live_yr_mm) and prev_yr_num is not None and live_yr_mm >= float(prev_yr_num))
+                        else None
+                    )
+                    if (
+                        prev_day_mid is not None
+                        and prev_day_mid != today_mid_iso
+                        and prev_day_num is not None
+                        and float(prev_day_num) > 0.0
+                        and live_day_mm >= float(prev_day_num)
+                        and (delta_yr is None or delta_yr < (live_day_mm - 0.01))
+                    ):
+                        console_not_reset_at_midnight = True
+                        prev_day_val = float(prev_day_num)
+                except Exception:
+                    pass
+
+            if console_not_reset_at_midnight:
+                console_this_hr_mm = round(max(0.0, live_day_mm - prev_day_val), 3)
+            else:
+                console_this_hr_mm = round(max(0.0, live_day_mm - db_prior_today_mm), 3)
+            rain_1h_live = round(max(existing_hr_rain, console_this_hr_mm), 3)
 
             live_row_dict = {
                 "valid_time_utc": now_hour_iso,
@@ -1515,30 +1571,7 @@ def load_all_dashboard_data():
                 obs_df = obs_df[obs_df["valid_time_utc"] != now_hour_iso].copy()
                 obs_df = pd.concat([pd.DataFrame([live_row_dict]), obs_df], ignore_index=True)
 
-            # Safe monotonic live rainfall delta since last SQLite sync (immune to midnight rollover)
-            if Path(DB_PATH).exists() and not obs_df.empty:
-                try:
-                    with sqlite3.connect(DB_PATH) as conn_st:
-                        st_rows = dict(
-                            conn_st.execute(
-                                "SELECT key, val_num FROM ingest_state WHERE key IN ('last_console_rain_year_mm', 'last_console_rain_day_mm')"
-                            ).fetchall()
-                        )
-                    live_yr = safe_float(live_obs.get("precip_year_mm"), 0.0)
-                    live_day = safe_float(live_obs.get("precip_day_mm"), 0.0)
-                    prev_yr = st_rows.get("last_console_rain_year_mm")
-                    prev_day = st_rows.get("last_console_rain_day_mm")
-                    delta_live = 0.0
-                    if live_yr > 0.0 and prev_yr is not None and live_yr >= float(prev_yr):
-                        delta_live = round(live_yr - float(prev_yr), 3)
-                    elif prev_day is not None:
-                        delta_live = round(live_day - float(prev_day), 3) if live_day >= float(prev_day) else round(live_day, 3)
-                    if delta_live >= 0.254:
-                        obs_df.loc[0, "precip_1hr_mm"] = round(
-                            safe_float(obs_df.loc[0, "precip_1hr_mm"], 0.0) + delta_live, 3
-                        )
-                except Exception:
-                    pass
+
     except Exception:
         pass
 
@@ -2212,10 +2245,23 @@ def render_hydro_risk_section(
 
         if not p_sub.empty:
             p_sub["valid_local"] = pd.to_datetime(p_sub["valid_time_utc"], utc=True).dt.tz_convert(LOCAL_TZ)
+            p_line = p_sub
+            if not h_sub.empty and p_line["valid_local"].iloc[0] > h_sub["valid_local"].iloc[-1]:
+                h_last = h_sub.iloc[-1]
+                anchor_df = pd.DataFrame([{
+                    "valid_local": h_last["valid_local"],
+                    "projected_api_in": h_last["api_in"],
+                    "projected_api_p90_in": h_last["api_in"],
+                    "projected_runoff_coeff": h_last["runoff_coeff_c"],
+                    "projected_discharge_cfs": h_last["discharge_index_cfs"],
+                    "projected_discharge_p90_cfs": h_last["discharge_index_cfs"],
+                }])
+                p_line = pd.concat([anchor_df, p_sub], ignore_index=True, sort=False)
+
             fig_hydro.add_trace(
                 go.Scatter(
-                    x=p_sub["valid_local"],
-                    y=p_sub["projected_api_p90_in"],
+                    x=p_line["valid_local"],
+                    y=p_line["projected_api_p90_in"],
                     mode="lines",
                     line=dict(color="rgba(220, 38, 38, 0.75)", width=1.6, dash="dash"),
                     name="Projected P90 Storm API (in)",
@@ -2226,8 +2272,8 @@ def render_hydro_risk_section(
             )
             fig_hydro.add_trace(
                 go.Scatter(
-                    x=p_sub["valid_local"],
-                    y=p_sub["projected_api_in"],
+                    x=p_line["valid_local"],
+                    y=p_line["projected_api_in"],
                     mode="lines",
                     line=dict(color="#0284c7", width=2.6),
                     name="Projected Expected API (in)",
@@ -2238,8 +2284,8 @@ def render_hydro_risk_section(
             )
             fig_hydro.add_trace(
                 go.Scatter(
-                    x=p_sub["valid_local"],
-                    y=(p_sub["projected_runoff_coeff"] * 100.0).round(1),
+                    x=p_line["valid_local"],
+                    y=(p_line["projected_runoff_coeff"] * 100.0).round(1),
                     mode="lines",
                     line=dict(color="#9333ea", width=1.8, dash="dot"),
                     name="Runoff Coeff C (%)",
@@ -2252,8 +2298,8 @@ def render_hydro_risk_section(
 
             fig_hydro.add_trace(
                 go.Scatter(
-                    x=p_sub["valid_local"],
-                    y=p_sub["projected_discharge_p90_cfs"],
+                    x=p_line["valid_local"],
+                    y=p_line["projected_discharge_p90_cfs"],
                     mode="lines",
                     fill="tozeroy",
                     fillcolor="rgba(239, 68, 68, 0.12)",
@@ -2266,8 +2312,8 @@ def render_hydro_risk_section(
             )
             fig_hydro.add_trace(
                 go.Scatter(
-                    x=p_sub["valid_local"],
-                    y=p_sub["projected_discharge_cfs"],
+                    x=p_line["valid_local"],
+                    y=p_line["projected_discharge_cfs"],
                     mode="lines",
                     line=dict(color="#0284c7", width=2.6),
                     name="Projected Expected Creek Q (CFS)",

@@ -148,35 +148,52 @@ def ingest_live_observations_and_references(db_path: str = DB_PATH) -> Dict[str,
         cur_rh = clean_num(tass_obs.get("rh_pct"), hist_rh)
         cur_mslp = clean_num(tass_obs.get("mslp_hpa"), hist_mslp or 1013.25)
 
-        # Monotonic counter rain delta (immune to console midnight rollover / clock offset)
+        # Conservation-of-mass clock-hour rain (WL_HISTORIC base + post-archive tips only;
+        # never uses rolling rainfall_last_60_min_mm across hour boundaries)
         _, today_mid_iso, _ = get_local_day_boundaries_utc(
             pd.to_datetime(obs_hour_iso, utc=True).to_pydatetime()
         )
         console_day_mm = clean_num(tass_obs.get("precip_day_mm"), 0.0) or 0.0
-        console_year_mm = clean_num(tass_obs.get("precip_year_mm"), 0.0) or 0.0
-        _, prev_console_day_mm = _get_state_num(conn, "last_console_rain_day_mm")
+        raw_console_year_mm = clean_num(tass_obs.get("precip_year_mm"), None)
+        prev_day_mid_iso, prev_console_day_mm = _get_state_num(conn, "last_console_rain_day_mm")
         _, prev_console_year_mm = _get_state_num(conn, "last_console_rain_year_mm")
-        prev_obs_iso, _ = _get_state_num(conn, "last_obs_hour_iso")
 
-        delta_console_mm = 0.0
-        if console_year_mm > 0.0 and prev_console_year_mm is not None and console_year_mm >= prev_console_year_mm:
-            delta_console_mm = round(console_year_mm - prev_console_year_mm, 3)
-        elif prev_console_day_mm is not None:
-            # Never assume midnight reset: only treat as reset when console counter actually drops
-            if console_day_mm >= prev_console_day_mm:
-                delta_console_mm = round(console_day_mm - prev_console_day_mm, 3)
-            else:
-                delta_console_mm = round(console_day_mm, 3)
+        prior_today_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(precip_1hr_mm), 0.0)
+            FROM local_observations
+            WHERE valid_time_utc >= ?
+              AND valid_time_utc < ?
+            """,
+            (today_mid_iso, obs_hour_iso),
+        ).fetchone()
+        db_prior_today_mm = float(prior_today_row[0] or 0.0) if prior_today_row else 0.0
 
-        live_60m_mm = clean_num(tass_obs.get("precip_1hr_mm"), 0.0) or 0.0
-        if prev_obs_iso == obs_hour_iso:
-            cur_hr_rain = round(max(hist_hr_rain + delta_console_mm, live_60m_mm), 3)
+        delta_year_mm = (
+            round(raw_console_year_mm - prev_console_year_mm, 3)
+            if (raw_console_year_mm is not None and prev_console_year_mm is not None and raw_console_year_mm >= prev_console_year_mm)
+            else None
+        )
+        # Guard against console clock lagging past local midnight before rain_day resets
+        console_not_reset_at_midnight = (
+            obs_hour_iso == today_mid_iso
+            and prev_day_mid_iso is not None
+            and prev_day_mid_iso != today_mid_iso
+            and prev_console_day_mm is not None
+            and prev_console_day_mm > 0.0
+            and console_day_mm >= prev_console_day_mm
+            and (delta_year_mm is None or delta_year_mm < (console_day_mm - 0.01))
+        )
+        if console_not_reset_at_midnight:
+            console_this_hr_mm = round(max(0.0, console_day_mm - prev_console_day_mm), 3)
         else:
-            cur_hr_rain = round(max(hist_hr_rain, delta_console_mm, live_60m_mm), 3)
+            console_this_hr_mm = round(max(0.0, console_day_mm - db_prior_today_mm), 3)
+
+        cur_hr_rain = round(max(hist_hr_rain, console_this_hr_mm), 3)
 
         _set_state(conn, "last_console_rain_day_mm", today_mid_iso, console_day_mm, obs_hour_iso)
-        if console_year_mm > 0.0:
-            _set_state(conn, "last_console_rain_year_mm", obs_hour_iso, console_year_mm, obs_hour_iso)
+        if raw_console_year_mm is not None:
+            _set_state(conn, "last_console_rain_year_mm", obs_hour_iso, raw_console_year_mm, obs_hour_iso)
         _set_state(conn, "last_obs_hour_iso", obs_hour_iso, None, obs_hour_iso)
 
         cur_wspd = max(hist_hr_wspd, clean_num(tass_obs.get("wind_speed_ms"), 0.0) or 0.0)

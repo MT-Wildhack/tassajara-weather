@@ -1,0 +1,344 @@
+
+============================================================
+1. GIT RECENT COMMITS
+============================================================
+fbd68d5 Merge branch 'main' of https://github.com/MT-Wildhack/tassajara-weather
+40fa415 Delete README.md
+42654c8 Fix formatting issues in README.md
+783b20a Refine README formatting and symbols
+4fa8dd5 chore(telemetry): update tassajara_weather.db and MOS weights [2026-11-21T18:49:44Z] [skip ci]
+1dc04f8 Revise MOS model details and operational disclaimer
+b0c99ce Improve Markdown formatting in README.md
+beeb84e chore(telemetry): update tassajara_weather.db and MOS weights [2026-11-21T17:45:22Z] [skip ci]
+eb9296a Merge branch 'main' of https://github.com/MT-Wildhack/tassajara-weather
+17a4a4f Create LICENSE.txt
+
+============================================================
+2. SQLITE SCHEMA
+============================================================
+CREATE INDEX idx_hydro_fc_issue ON hydrological_forecast_series(issue_time_utc);
+CREATE INDEX idx_hydro_fc_valid ON hydrological_forecast_series(valid_time_utc);
+CREATE INDEX idx_hydro_risk_code ON hydrological_risk_state(alert_code, valid_time_utc);
+CREATE INDEX idx_hydro_risk_time ON hydrological_risk_state(valid_time_utc);
+CREATE INDEX idx_local_obs_time ON local_observations(valid_time_utc);
+CREATE INDEX idx_mos_fc_issue ON mos_corrected_forecasts(issue_time_utc);
+CREATE INDEX idx_mos_fc_valid ON mos_corrected_forecasts(valid_time_utc);
+CREATE INDEX idx_nws_fc_issue ON nws_forecasts(issue_time_utc);
+CREATE INDEX idx_nws_fc_valid ON nws_forecasts(valid_time_utc);
+CREATE INDEX idx_nws_valid_time ON nws_forecasts(valid_time_utc);
+CREATE INDEX idx_ref_obs_stid_time ON reference_observations(station_id, valid_time_utc);
+CREATE INDEX idx_stream_gauge_time ON stream_gauge_observations(valid_time_utc);
+CREATE TABLE facility_alert_log (
+    alert_id                INTEGER PRIMARY KEY AUTOINCREMENT, -- Use SERIAL in PostgreSQL
+    triggered_at_utc        TIMESTAMP NOT NULL,
+    valid_time_utc          TIMESTAMP NOT NULL,
+    alert_category          TEXT NOT NULL, -- 'FIRE_WEATHER', 'HARD_FREEZE', 'HIGH_WIND', 'HARDWARE_QC'
+    severity                TEXT NOT NULL, -- 'ADVISORY', 'WARNING', 'CRITICAL'
+    metric_value            REAL,
+    threshold_value         REAL,
+    message                 TEXT NOT NULL,
+    dispatched_channels     TEXT
+);
+CREATE TABLE hydrological_forecast_series (
+    issue_time_utc TEXT,
+    valid_time_utc TEXT,
+    lead_time_hours INTEGER,
+    mos_qpf_mm REAL DEFAULT 0.0,
+    mos_qpf_p90_mm REAL DEFAULT 0.0,
+    projected_api_mm REAL DEFAULT 0.0,
+    projected_api_p90_mm REAL DEFAULT 0.0,
+    projected_runoff_coeff REAL DEFAULT 0.08,
+    projected_runoff_mm_hr REAL DEFAULT 0.0,
+    projected_runoff_p90_mm_hr REAL DEFAULT 0.0,
+    projected_discharge_cfs REAL DEFAULT 5.0,
+    projected_discharge_p90_cfs REAL DEFAULT 5.0,
+    projected_tier TEXT DEFAULT 'GREEN',
+    PRIMARY KEY (issue_time_utc, valid_time_utc)
+);
+CREATE TABLE hydrological_risk_state (
+    valid_time_utc TEXT PRIMARY KEY,
+    api_mm REAL NOT NULL DEFAULT 0.0,
+    api_in REAL NOT NULL DEFAULT 0.0,
+    decay_k REAL NOT NULL DEFAULT 0.91,
+    runoff_coeff_c REAL NOT NULL DEFAULT 0.08,
+    effective_precip_1hr_mm REAL DEFAULT 0.0,
+    precip_24hr_mm REAL DEFAULT 0.0,
+    precip_72hr_mm REAL DEFAULT 0.0,
+    upstream_spillover_mm REAL DEFAULT 0.0,
+    current_runoff_mm_hr REAL DEFAULT 0.0,
+    peak_runoff_6hr_mm_hr REAL DEFAULT 0.0,
+    peak_runoff_24hr_mm_hr REAL DEFAULT 0.0,
+    peak_qpf_1hr_24h_mm REAL DEFAULT 0.0,
+    peak_p90_1hr_24h_mm REAL DEFAULT 0.0,
+    forecast_qpf_24hr_mm REAL DEFAULT 0.0,
+    forecast_qpf_72hr_mm REAL DEFAULT 0.0,
+    discharge_index_cfs REAL DEFAULT 5.0,
+    peak_discharge_24hr_cfs REAL DEFAULT 5.0,
+    stream_stage_m REAL,
+    rate_of_rise_m_hr REAL,
+    alert_tier INTEGER NOT NULL DEFAULT 0,
+    alert_code TEXT NOT NULL DEFAULT 'GREEN',
+    road_status TEXT,
+    creek_status TEXT,
+    recommended_action TEXT,
+    trigger_summary TEXT
+);
+CREATE TABLE ingest_state (
+            key TEXT PRIMARY KEY,
+            val_text TEXT,
+            val_num REAL,
+            updated_utc TEXT
+        );
+CREATE TABLE local_observations (
+    valid_time_utc          TIMESTAMP NOT NULL PRIMARY KEY,
+    station_id              TEXT NOT NULL REFERENCES stations_metadata(station_id),
+    temp_c                  REAL,
+    dewpoint_c              REAL,
+    wetbulb_c               REAL,
+    rh_pct                  REAL,
+    wind_speed_ms           REAL,
+    wind_gust_ms            REAL,
+    wind_dir_deg            REAL,
+    mslp_hpa                REAL,
+    pressure_trend_3hr_hpa  REAL,
+    precip_1hr_mm           REAL DEFAULT 0.0,
+    solar_rad_wm2           REAL,
+    uv_index                REAL,
+    qc_flag                 TEXT DEFAULT 'OK'
+, source TEXT DEFAULT 'WL_LIVE');
+CREATE TABLE mos_corrected_forecasts (
+    issue_time_utc          TIMESTAMP NOT NULL,
+    valid_time_utc          TIMESTAMP NOT NULL,
+    model_version           TEXT NOT NULL,
+    raw_nws_temp_c          REAL NOT NULL,
+    pred_temp_error_c       REAL NOT NULL,
+    corrected_temp_c        REAL NOT NULL,
+    corrected_temp_p10_c    REAL,  -- 10th percentile lower bound (freeze risk)
+    corrected_temp_p90_c    REAL,  -- 90th percentile upper bound (heat/fire risk)
+    corrected_rh_pct        REAL,
+    corrected_wind_gust_ms  REAL, raw_nws_pop_pct REAL DEFAULT 0.0, mos_pop_pct REAL DEFAULT 0.0, raw_nws_qpf_mm REAL DEFAULT 0.0, mos_qpf_mm REAL DEFAULT 0.0, mos_qpf_p90_mm REAL DEFAULT 0.0,
+    PRIMARY KEY (issue_time_utc, valid_time_utc, model_version)
+);
+CREATE TABLE nws_forecasts (
+    issue_time_utc          TIMESTAMP NOT NULL,
+    valid_time_utc          TIMESTAMP NOT NULL,
+    lead_time_hours         INTEGER NOT NULL,
+    nws_temp_c              REAL NOT NULL,
+    nws_dewpoint_c          REAL,
+    nws_rh_pct              REAL,
+    nws_wind_speed_ms       REAL,
+    nws_wind_gust_ms        REAL,
+    nws_wind_dir_deg        REAL,
+    nws_pop_pct             REAL,
+    nws_qpf_1hr_mm          REAL DEFAULT 0.0,
+    nws_sky_cover_pct       REAL,
+    short_forecast          TEXT,
+    PRIMARY KEY (issue_time_utc, valid_time_utc)
+);
+CREATE TABLE reference_observations (
+    valid_time_utc          TIMESTAMP NOT NULL,
+    station_id              TEXT NOT NULL REFERENCES stations_metadata(station_id),
+    temp_c                  REAL,
+    rh_pct                  REAL,
+    wind_speed_ms           REAL,
+    wind_gust_ms            REAL,
+    wind_dir_deg            REAL,
+    precip_1hr_mm           REAL DEFAULT 0.0, source TEXT DEFAULT 'RAWS_SYNOPTIC',
+    PRIMARY KEY (valid_time_utc, station_id)
+);
+CREATE TABLE sqlite_sequence(name,seq);
+CREATE TABLE stations_metadata (
+    station_id          TEXT PRIMARY KEY,
+    station_name        TEXT NOT NULL,
+    latitude            REAL NOT NULL,
+    longitude           REAL NOT NULL,
+    elevation_m         REAL NOT NULL,
+    sensor_height_agl_m REAL NOT NULL,
+    wmo_siting_class    INTEGER DEFAULT 5,
+    notes               TEXT
+);
+CREATE TABLE stream_gauge_observations (
+    valid_time_utc TEXT,
+    gauge_id TEXT DEFAULT 'TASS_CREEK_FOOTBRIDGE',
+    stream_stage_m REAL,
+    stream_stage_ft REAL,
+    rate_of_rise_m_hr REAL DEFAULT 0.0,
+    estimated_discharge_cfs REAL,
+    water_temp_c REAL,
+    battery_v REAL,
+    sensor_health TEXT DEFAULT 'OK',
+    qc_flag TEXT DEFAULT 'OK',
+    PRIMARY KEY (valid_time_utc, gauge_id)
+);
+CREATE VIEW vw_creek_flood_monitor AS
+            SELECT
+                h.valid_time_utc,
+                h.alert_tier,
+                h.alert_code,
+                h.api_mm,
+                h.api_in,
+                h.runoff_coeff_c,
+                h.effective_precip_1hr_mm,
+                h.precip_24hr_mm,
+                h.precip_72hr_mm,
+                h.upstream_spillover_mm,
+                h.current_runoff_mm_hr,
+                h.peak_runoff_6hr_mm_hr,
+                h.peak_runoff_24hr_mm_hr,
+                h.discharge_index_cfs,
+                h.peak_discharge_24hr_cfs,
+                COALESCE(g.stream_stage_m, h.stream_stage_m) AS stream_stage_m,
+                COALESCE(g.rate_of_rise_m_hr, h.rate_of_rise_m_hr) AS rate_of_rise_m_hr,
+                g.sensor_health AS gauge_sensor_health,
+                h.road_status,
+                h.creek_status,
+                h.recommended_action,
+                h.trigger_summary,
+                o.temp_c,
+                o.rh_pct,
+                o.wind_gust_ms,
+                o.mslp_hpa,
+                o.pressure_trend_3hr_hpa
+            FROM hydrological_risk_state h
+            LEFT JOIN local_observations o
+                ON h.valid_time_utc = o.valid_time_utc
+            LEFT JOIN stream_gauge_observations g
+                ON h.valid_time_utc = g.valid_time_utc
+               AND g.gauge_id = 'TASS_CREEK_FOOTBRIDGE'
+            ORDER BY h.valid_time_utc DESC;
+CREATE VIEW vw_mos_training_dataset AS
+            WITH canonical_fc AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY valid_time_utc
+                        ORDER BY
+                            CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                            ABS(lead_time_hours - 6) ASC,
+                            issue_time_utc DESC
+                    ) AS rn
+                FROM nws_forecasts
+                WHERE nws_temp_c IS NOT NULL
+                  AND lead_time_hours >= 1
+            )
+            SELECT
+                f.issue_time_utc,
+                f.valid_time_utc,
+                f.lead_time_hours,
+                f.nws_temp_c,
+                f.nws_dewpoint_c,
+                f.nws_rh_pct,
+                f.nws_wind_speed_ms,
+                COALESCE(f.nws_wind_gust_ms, f.nws_wind_speed_ms * 1.35) AS nws_wind_gust_ms,
+                f.nws_wind_dir_deg,
+                COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
+                COALESCE(f.nws_pop_pct, 0.0) AS nws_pop_pct,
+                COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
+                o.temp_c AS actual_temp_c,
+                o.rh_pct AS actual_rh_pct,
+                o.wind_speed_ms AS actual_wind_speed_ms,
+                o.wind_gust_ms AS actual_wind_gust_ms,
+                o.wind_dir_deg AS actual_wind_dir_deg,
+                o.mslp_hpa AS actual_mslp_hpa,
+                -- LEAK-FREE: barometric tendency at forecast ISSUE time, never target valid_time_utc
+                COALESCE(o_issue.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
+                COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
+                (o.temp_c - f.nws_temp_c) AS temp_error_c,
+                (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
+                -- CHWC1: Chews Ridge (1,536m Interior Crest)
+                COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
+                COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
+                COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
+                -- CAHC1: Hastings Reservation (546m Foothill Valley)
+                COALESCE(r_hast.temp_c, r_arroyo.temp_c - 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) - 0.60) AS issue_hastings_temp_c,
+                -- ASRC1: Arroyo Seco RAWS (268m Gorge Outlet)
+                COALESCE(r_arroyo.temp_c, r_hast.temp_c + 2.01, COALESCE(o_issue.temp_c, f.nws_temp_c) + 1.41) AS issue_arroyo_temp_c,
+                COALESCE(r_arroyo.rh_pct, r_hast.rh_pct, f.nws_rh_pct) AS issue_arroyo_rh_pct,
+                -- PPSC1: Big Sur RAWS (108m Coastal Slope)
+                COALESCE(r_bigsur.temp_c, COALESCE(o_issue.temp_c, f.nws_temp_c) + 2.45) AS issue_bigsur_temp_c,
+                COALESCE(r_bigsur.rh_pct, f.nws_rh_pct) AS issue_bigsur_rh_pct,
+                COALESCE(r_bigsur.precip_1hr_mm, 0.0) AS issue_bigsur_precip_mm,
+                -- VTCC1: Ventana Cone (1,453m Windward Crest)
+                COALESCE(r_vent.temp_c, r_chews.temp_c + 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.29) AS issue_ventana_temp_c,
+                COALESCE(r_vent.precip_1hr_mm, r_chews.precip_1hr_mm, 0.0) AS issue_ventana_precip_mm,
+                -- Local Stone Office Initialization State (strictly causal forecast at issue_time_utc)
+                COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
+                COALESCE(
+                    o_issue.temp_c - (
+                        SELECT fi.nws_temp_c FROM nws_forecasts fi
+                        WHERE fi.valid_time_utc = f.issue_time_utc
+                          AND fi.issue_time_utc <= f.issue_time_utc
+                        ORDER BY fi.issue_time_utc DESC LIMIT 1
+                    ),
+                    0.0
+                ) AS issue_persistence_bias_c
+            FROM canonical_fc f
+            INNER JOIN local_observations o
+                ON f.valid_time_utc = o.valid_time_utc
+            LEFT JOIN local_observations o_issue
+                ON f.issue_time_utc = o_issue.valid_time_utc
+            LEFT JOIN reference_observations r_chews
+                ON f.issue_time_utc = r_chews.valid_time_utc AND r_chews.station_id = 'CHWC1'
+            LEFT JOIN reference_observations r_hast
+                ON f.issue_time_utc = r_hast.valid_time_utc AND r_hast.station_id = 'CAHC1'
+            LEFT JOIN reference_observations r_arroyo
+                ON f.issue_time_utc = r_arroyo.valid_time_utc AND r_arroyo.station_id = 'ASRC1'
+            LEFT JOIN reference_observations r_bigsur
+                ON f.issue_time_utc = r_bigsur.valid_time_utc AND r_bigsur.station_id = 'PPSC1'
+            LEFT JOIN reference_observations r_vent
+                ON f.issue_time_utc = r_vent.valid_time_utc AND r_vent.station_id = 'VTCC1'
+            WHERE f.rn = 1
+              AND o.qc_flag = 'OK'
+              AND COALESCE(o.source, 'WL_LIVE') != 'OPENMETEO_SYNTH'
+              AND o.temp_c IS NOT NULL;
+
+============================================================
+3. TABLE ROW COUNTS & DATE RANGES
+============================================================
+local_observations         | rows= 17602 | 2024-11-18T00:00:00+00:00 .. 2026-11-21T18:00:00+00:00
+reference_observations     | rows= 90023 | 2024-10-26T00:00:00+00:00 .. 2026-11-21T18:00:00+00:00
+nws_forecasts              | rows= 29977 | 2024-10-26T00:00:00+00:00 .. 2026-11-28T17:00:00+00:00
+mos_corrected_forecasts    | rows= 29487 | 2024-11-18T00:00:00+00:00 .. 2026-11-28T17:00:00+00:00
+hydrological_risk_state    | rows=   179 | 2026-11-13T20:00:00+00:00 .. 2026-11-21T18:00:00+00:00
+
+============================================================
+4. LOCAL_OBSERVATIONS PROVENANCE
+============================================================
+  WL_HISTORIC      | hrs=14101 | wet_hrs= 743 | rain_in=43.65
+  WL_LIVE          | hrs= 3501 | wet_hrs= 133 | rain_in=7.74
+
+============================================================
+5. LATEST 5-STATION REFERENCE ROWS
+============================================================
+  ('ASRC1', '2026-11-21T18:00:00+00:00', 'NWS_OBS', 8.89, 74.0, 0.0, 0.0)
+  ('CAHC1', '2026-11-21T18:00:00+00:00', 'IEM_CA_DCP', 10.0, 61.0, 0.89, 0.0)
+  ('CHWC1', '2026-11-21T18:00:00+00:00', 'IEM_CA_DCP', None, 83.0, 3.23, 0.0)
+  ('PPSC1', '2026-11-21T18:00:00+00:00', 'NWS_OBS', 11.67, 57.0, 0.45, 0.0)
+  ('VTCC1', '2026-11-21T18:00:00+00:00', 'IEM_CA_DCP', None, 98.0, 3.2, 0.0)
+
+============================================================
+6. LATEST 6 HYDROLOGICAL RISK STATES
+============================================================
+  COLUMNS: valid_time_utc, api_mm, api_in, decay_k, runoff_coeff_c, effective_precip_1hr_mm, precip_24hr_mm, precip_72hr_mm, upstream_spillover_mm, current_runoff_mm_hr, peak_runoff_6hr_mm_hr, peak_runoff_24hr_mm_hr, peak_qpf_1hr_24h_mm, peak_p90_1hr_24h_mm, forecast_qpf_24hr_mm, forecast_qpf_72hr_mm, discharge_index_cfs, peak_discharge_24hr_cfs, stream_stage_m, rate_of_rise_m_hr, alert_tier, alert_code, road_status, creek_status, recommended_action, trigger_summary
+  {'valid_time_utc': '2026-11-21T18:00:00+00:00', 'api_mm': 116.28, 'api_in': 4.58, 'decay_k': 0.99717, 'runoff_coeff_c': 0.285, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.27, 'precip_72hr_mm': 94.74, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.29, 'peak_p90_1hr_24h_mm': 0.6, 'forecast_qpf_24hr_mm': 0.29, 'forecast_qpf_72hr_mm': 3.26, 'discharge_index_cfs': 19.4, 'peak_discharge_24hr_cfs': 19.4, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.58 in >= 2.00 in) | 72h storm total 3.73 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.58 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.35 in (>= 1.50 in) softening road grades'}
+  {'valid_time_utc': '2026-11-21T17:00:00+00:00', 'api_mm': 116.61, 'api_in': 4.59, 'decay_k': 0.99718, 'runoff_coeff_c': 0.288, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.27, 'precip_72hr_mm': 99.06, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.08, 'peak_p90_1hr_24h_mm': 0.24, 'forecast_qpf_24hr_mm': 0.17, 'forecast_qpf_72hr_mm': 3.25, 'discharge_index_cfs': 20.1, 'peak_discharge_24hr_cfs': 20.1, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.59 in >= 2.00 in) | 72h storm total 3.90 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.73 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.58 in (>= 1.50 in) softening road grades'}
+  {'valid_time_utc': '2026-11-21T16:00:00+00:00', 'api_mm': 116.94, 'api_in': 4.6, 'decay_k': 0.99717, 'runoff_coeff_c': 0.29, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.27, 'precip_72hr_mm': 100.84, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.08, 'peak_p90_1hr_24h_mm': 0.23, 'forecast_qpf_24hr_mm': 0.14, 'forecast_qpf_72hr_mm': 3.28, 'discharge_index_cfs': 20.7, 'peak_discharge_24hr_cfs': 20.7, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.60 in >= 2.00 in) | 72h storm total 3.97 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.90 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.73 in (>= 1.50 in) softening road grades'}
+  {'valid_time_utc': '2026-11-21T15:00:00+00:00', 'api_mm': 117.27, 'api_in': 4.62, 'decay_k': 0.99718, 'runoff_coeff_c': 0.293, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.27, 'precip_72hr_mm': 105.41, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.06, 'peak_p90_1hr_24h_mm': 0.24, 'forecast_qpf_24hr_mm': 0.06, 'forecast_qpf_72hr_mm': 3.26, 'discharge_index_cfs': 21.4, 'peak_discharge_24hr_cfs': 21.4, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.62 in >= 2.00 in) | 72h storm total 4.15 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.97 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.90 in (>= 1.50 in) softening road grades'}
+  {'valid_time_utc': '2026-11-21T14:00:00+00:00', 'api_mm': 117.6, 'api_in': 4.63, 'decay_k': 0.99718, 'runoff_coeff_c': 0.294, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.27, 'precip_72hr_mm': 106.43, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.0, 'peak_p90_1hr_24h_mm': 0.0, 'forecast_qpf_24hr_mm': 0.0, 'forecast_qpf_72hr_mm': 3.23, 'discharge_index_cfs': 22.1, 'peak_discharge_24hr_cfs': 22.1, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.63 in >= 2.00 in) | 72h storm total 4.19 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 4.15 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 3.97 in (>= 1.50 in) softening road grades'}
+  {'valid_time_utc': '2026-11-21T12:00:00+00:00', 'api_mm': 120.5, 'api_in': 4.74, 'decay_k': 0.99718, 'runoff_coeff_c': 0.309, 'effective_precip_1hr_mm': 0.0, 'precip_24hr_mm': 1.52, 'precip_72hr_mm': 108.97, 'upstream_spillover_mm': 0.0, 'current_runoff_mm_hr': 0.0, 'peak_runoff_6hr_mm_hr': 0.0, 'peak_runoff_24hr_mm_hr': 0.0, 'peak_qpf_1hr_24h_mm': 0.0, 'peak_p90_1hr_24h_mm': 0.0, 'forecast_qpf_24hr_mm': 0.0, 'forecast_qpf_72hr_mm': 3.41, 'discharge_index_cfs': 25.5, 'peak_discharge_24hr_cfs': 25.5, 'stream_stage_m': None, 'rate_of_rise_m_hr': None, 'alert_tier': 1, 'alert_code': 'YELLOW', 'road_status': 'Caution — Muddy, slick clay grades over Chews Ridge summit; minor rockfall risk', 'creek_status': 'Elevated Flow — Turbid water and moderate rise in Tassajara Creek', 'recommended_action': '4WD required on Tassajara Road; postpone non-essential low-clearance trips. Monitor creek footbridges.', 'trigger_summary': 'Wetted catchment soil (API 4.74 in >= 2.00 in) | 72h storm total 4.29 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 4.25 in (>= 1.50 in) softening road grades | Imminent (<=6h): 72h storm total 4.07 in (>= 1.50 in) softening road grades'}
+
+============================================================
+7. INGEST_STATE KEYS
+============================================================
+  ('last_console_rain_day_mm', '2026-11-21T08:00:00+00:00', 0.254, '2026-11-21T18:00:00+00:00')
+  ('last_console_rain_year_mm', '2026-11-21T18:00:00+00:00', 168.91, '2026-11-21T18:00:00+00:00')
+  ('last_obs_hour_iso', '2026-11-21T18:00:00+00:00', None, '2026-11-21T18:00:00+00:00')
+  ('last_ref_rain_day_mm_ASRC1', '2026-11-21T15:00:00+00:00', 0.25, '2026-11-21T15:00:00+00:00')
+  ('last_ref_rain_day_mm_CAHC1', '2026-11-21T18:00:00+00:00', 0.0, '2026-11-21T18:00:00+00:00')
+  ('last_ref_rain_day_mm_CHWC1', '2026-11-21T18:00:00+00:00', 0.0, '2026-11-21T18:00:00+00:00')
+  ('last_ref_rain_day_mm_PPSC1', '2026-11-20T11:00:00+00:00', 0.25, '2026-11-20T11:00:00+00:00')
+  ('last_ref_rain_day_mm_VTCC1', '2026-11-21T18:00:00+00:00', 0.0, '2026-11-21T18:00:00+00:00')
+
+============================================================
+8. MODEL ARTIFACT METADATA
+============================================================
