@@ -340,8 +340,10 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
             if not refs_latest_df.empty else {}
         )
 
-        base_nws_t = float(latest_fc_df["nws_temp_c"].iloc[0])
-        base_nws_rh = clean_num(latest_fc_df["nws_rh_pct"].iloc[0], 50.0) or 50.0
+        _om_t0 = clean_num(latest_fc_df["om_temp_c"].iloc[0], None) if "om_temp_c" in latest_fc_df.columns else None
+        _om_rh0 = clean_num(latest_fc_df["om_rh_pct"].iloc[0], None) if "om_rh_pct" in latest_fc_df.columns else None
+        base_nws_t = _om_t0 if _om_t0 is not None else float(latest_fc_df["nws_temp_c"].iloc[0])
+        base_nws_rh = _om_rh0 if _om_rh0 is not None else (clean_num(latest_fc_df["nws_rh_pct"].iloc[0], 50.0) or 50.0)
         tass_t = float(obs_latest.iloc[0]["temp_c"]) if not obs_latest.empty else base_nws_t
         ptrend = (
             clean_num(obs_latest.iloc[0].get("pressure_trend_3hr_hpa"), 0.0)

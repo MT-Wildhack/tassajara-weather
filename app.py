@@ -525,9 +525,14 @@ def attach_boundary_telemetry_for_mos(
         latest_tass_t = safe_float(obs_df.iloc[0].get("temp_c"), np.nan)
         latest_ptrend = safe_float(obs_df.iloc[0].get("pressure_trend_3hr_hpa"), 0.0)
 
-    first_nws_t = float(base_t.iloc[0]) if not base_t.empty else 15.0
+    om_t_s = get_col(out, "om_temp_c", np.nan)
+    first_model_t = (
+        float(om_t_s.iloc[0])
+        if (not om_t_s.empty and pd.notna(om_t_s.iloc[0]))
+        else (float(base_t.iloc[0]) if not base_t.empty else 15.0)
+    )
     init_bias_c = (
-        float(latest_tass_t - first_nws_t) if not math.isnan(latest_tass_t) else 0.0
+        float(latest_tass_t - first_model_t) if not math.isnan(latest_tass_t) else 0.0
     )
 
     def _ref_val(stid: str, key: str, default_val=np.nan):
@@ -1194,7 +1199,27 @@ def load_all_dashboard_data():
             except Exception:
                 ref_dict = {}
 
-            # Inspect mos_corrected_forecasts columns for backward-compatible SQL queries
+            # Inspect nws_forecasts & mos_corrected_forecasts columns for backward-compatible SQL queries
+            nws_cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(nws_forecasts)").fetchall()
+            }
+            has_om_cols = "om_temp_c" in nws_cols
+            om_select_sql = (
+                "f.om_temp_c, f.om_dewpoint_c, f.om_rh_pct, "
+                "f.om_wind_speed_ms, f.om_wind_gust_ms, f.om_wind_dir_deg, f.om_sky_cover_pct,"
+                if has_om_cols
+                else "NULL AS om_temp_c, NULL AS om_dewpoint_c, NULL AS om_rh_pct, "
+                     "NULL AS om_wind_speed_ms, NULL AS om_wind_gust_ms, NULL AS om_wind_dir_deg, NULL AS om_sky_cover_pct,"
+            )
+            om_sub_sql = (
+                "om_temp_c, om_dewpoint_c, om_rh_pct, "
+                "om_wind_speed_ms, om_wind_gust_ms, om_wind_dir_deg, om_sky_cover_pct,"
+                if has_om_cols
+                else "NULL AS om_temp_c, NULL AS om_dewpoint_c, NULL AS om_rh_pct, "
+                     "NULL AS om_wind_speed_ms, NULL AS om_wind_gust_ms, NULL AS om_wind_dir_deg, NULL AS om_sky_cover_pct,"
+            )
+            om_init_expr = "COALESCE(fi.om_temp_c, fi.nws_temp_c)" if has_om_cols else "fi.nws_temp_c"
             mos_cols = {
                 r[1]
                 for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()
@@ -1268,6 +1293,7 @@ def load_all_dashboard_data():
                             f.nws_qpf_1hr_mm,
                             f.nws_sky_cover_pct,
                             f.short_forecast,
+                            {om_select_sql}
                             m.model_version,
                             m.pred_temp_error_c,
                             m.corrected_temp_c,
@@ -1338,6 +1364,7 @@ def load_all_dashboard_data():
                         COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
                         COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
                         f.short_forecast,
+                        {om_select_sql}
                         COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
                         COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
                         COALESCE(r_chews.precip_1hr_mm, 0.0) AS issue_chews_precip_mm,
@@ -1352,7 +1379,7 @@ def load_all_dashboard_data():
                         COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
                         COALESCE(
                             o_issue.temp_c - (
-                                SELECT fi.nws_temp_c FROM nws_forecasts fi
+                                SELECT {om_init_expr} FROM nws_forecasts fi
                                 WHERE fi.valid_time_utc = f.issue_time_utc
                                   AND fi.issue_time_utc <= f.issue_time_utc
                                 ORDER BY fi.issue_time_utc DESC LIMIT 1
@@ -1382,6 +1409,7 @@ def load_all_dashboard_data():
                             COALESCE(nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
                             nws_sky_cover_pct,
                             short_forecast,
+                            {om_sub_sql}
                             ROW_NUMBER() OVER (
                                 PARTITION BY valid_time_utc
                                 ORDER BY

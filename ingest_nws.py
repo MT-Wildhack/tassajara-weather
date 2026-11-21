@@ -617,6 +617,12 @@ def fetch_nws_gridpoints_dataframe(
         sky_pct = float(np.clip(sky_pct, 0.0, 100.0))
         last_sky_pct = sky_pct
 
+        def _om_opt(key: str, ndigits: int = 2):
+            v = om.get(key)
+            if v is None or pd.isna(v):
+                return None
+            return round(float(v), ndigits)
+
         rows.append({
             "issue_time_utc": issue_iso,
             "valid_time_utc": v_iso,
@@ -632,6 +638,13 @@ def fetch_nws_gridpoints_dataframe(
             "nws_qpf_1hr_mm": round(qpf_1hr_mm, 3),
             "nws_sky_cover_pct": round(sky_pct, 1),
             "short_forecast": short_fc,
+            "om_temp_c": _om_opt("temp_c", 2),
+            "om_dewpoint_c": _om_opt("dewpoint_c", 2),
+            "om_rh_pct": _om_opt("rh_pct", 1),
+            "om_wind_speed_ms": _om_opt("wspd_ms", 2),
+            "om_wind_gust_ms": _om_opt("wgst_ms", 2),
+            "om_wind_dir_deg": _om_opt("wdir_deg", 1),
+            "om_sky_cover_pct": _om_opt("sky_pct", 1),
         })
 
     return pd.DataFrame(rows)
@@ -670,19 +683,35 @@ def fetch_and_store_nws_hourly(db_path: str = "tassajara_weather.db") -> int:
             float(r["nws_qpf_1hr_mm"]),
             float(r["nws_sky_cover_pct"]),
             str(r["short_forecast"]),
+            float(r["om_temp_c"]) if pd.notna(r.get("om_temp_c")) else None,
+            float(r["om_dewpoint_c"]) if pd.notna(r.get("om_dewpoint_c")) else None,
+            float(r["om_rh_pct"]) if pd.notna(r.get("om_rh_pct")) else None,
+            float(r["om_wind_speed_ms"]) if pd.notna(r.get("om_wind_speed_ms")) else None,
+            float(r["om_wind_gust_ms"]) if pd.notna(r.get("om_wind_gust_ms")) else None,
+            float(r["om_wind_dir_deg"]) if pd.notna(r.get("om_wind_dir_deg")) else None,
+            float(r["om_sky_cover_pct"]) if pd.notna(r.get("om_sky_cover_pct")) else None,
         )
         for _, r in df_future.iterrows()
     ]
 
     with sqlite3.connect(db_path, timeout=30) as conn:
+        existing_cols = {c[1] for c in conn.execute("PRAGMA table_info(nws_forecasts)").fetchall()}
+        for om_col in (
+            "om_temp_c", "om_dewpoint_c", "om_rh_pct",
+            "om_wind_speed_ms", "om_wind_gust_ms", "om_wind_dir_deg", "om_sky_cover_pct",
+        ):
+            if om_col not in existing_cols:
+                conn.execute(f"ALTER TABLE nws_forecasts ADD COLUMN {om_col} REAL;")
         conn.executemany(
             """
             INSERT OR REPLACE INTO nws_forecasts (
                 issue_time_utc, valid_time_utc, lead_time_hours,
                 nws_temp_c, nws_dewpoint_c, nws_rh_pct,
                 nws_wind_speed_ms, nws_wind_gust_ms, nws_wind_dir_deg,
-                nws_pop_pct, nws_qpf_1hr_mm, nws_sky_cover_pct, short_forecast
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                nws_pop_pct, nws_qpf_1hr_mm, nws_sky_cover_pct, short_forecast,
+                om_temp_c, om_dewpoint_c, om_rh_pct,
+                om_wind_speed_ms, om_wind_gust_ms, om_wind_dir_deg, om_sky_cover_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows_to_insert,
         )

@@ -85,6 +85,14 @@ def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     return pd.Series(default, index=df.index, dtype="float64")
 
 
+def _num_series_prefer(df: pd.DataFrame, primary: str, fallback: str, default: float = 0.0) -> pd.Series:
+    fb = _num_series(df, fallback, default)
+    if primary in df.columns:
+        pri = pd.to_numeric(df[primary], errors="coerce")
+        return pri.combine_first(fb)
+    return fb
+
+
 def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Builds 30 physical, cyclical, topographic, 5-station spatial gradient,
@@ -110,14 +118,25 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["effective_insolation"] = solar_df["effective_insolation"]
 
     lead_hrs = _num_series(df, "lead_time_hours", 6.0).clip(lower=1.0)
-    t_c = _num_series(df, "nws_temp_c", _num_series(df, "raw_nws_temp_c", 15.0))
-    rh_pct = _num_series(df, "nws_rh_pct", 50.0).clip(1.0, 100.0)
-    dew_c = _num_series(df, "nws_dewpoint_c", np.nan)
+    nws_t_fb = _num_series(df, "nws_temp_c", _num_series(df, "raw_nws_temp_c", 15.0))
+    t_c = (
+        pd.to_numeric(df["om_temp_c"], errors="coerce").combine_first(nws_t_fb)
+        if "om_temp_c" in df.columns
+        else nws_t_fb
+    )
+    rh_pct = _num_series_prefer(df, "om_rh_pct", "nws_rh_pct", 50.0).clip(1.0, 100.0)
+    dew_fb = _num_series(df, "nws_dewpoint_c", np.nan)
+    dew_c = (
+        pd.to_numeric(df["om_dewpoint_c"], errors="coerce").combine_first(dew_fb)
+        if "om_dewpoint_c" in df.columns
+        else dew_fb
+    )
     dew_c = dew_c.fillna(t_c - ((100.0 - rh_pct) / 5.0))
 
+    # Keep official NOAA NWS PoP/QPF for hydrological hurdle
     pop_pct = _num_series(df, "nws_pop_pct", 0.0).clip(0.0, 100.0)
     qpf_mm = _num_series(df, "nws_qpf_1hr_mm", 0.0).clip(lower=0.0)
-    sky_pct = _num_series(df, "nws_sky_cover_pct", 20.0).clip(0.0, 100.0)
+    sky_pct = _num_series_prefer(df, "om_sky_cover_pct", "nws_sky_cover_pct", 20.0).clip(0.0, 100.0)
 
     out["lead_time_hours"] = lead_hrs
     out["nws_temp_c"] = t_c
@@ -126,7 +145,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["nws_qpf_1hr_mm"] = qpf_mm
     out["nws_sky_cover_pct"] = sky_pct
 
-    w_spd = _num_series(df, "nws_wind_speed_ms", 0.0).clip(lower=0.0)
+    w_spd = _num_series_prefer(df, "om_wind_speed_ms", "nws_wind_speed_ms", 0.0).clip(lower=0.0)
     cloud_frac = np.clip(sky_pct / 100.0, 0.0, 1.0)
     cloud_trans = 1.0 - 0.75 * (cloud_frac ** 3.4)
     rain_atten = np.exp(-0.35 * qpf_mm)
@@ -138,7 +157,7 @@ def engineer_mos_features(df: pd.DataFrame) -> pd.DataFrame:
     out["clear_nocturnal_cooling_idx"] = (
         is_dark_or_shade * (1.0 - 0.75 * (cloud_frac ** 2)) * np.exp(-w_spd / 3.0)
     )
-    w_dir_rad = np.radians(_num_series(df, "nws_wind_dir_deg", 0.0))
+    w_dir_rad = np.radians(_num_series_prefer(df, "om_wind_dir_deg", "nws_wind_dir_deg", 0.0))
     out["wind_along_canyon_ms"] = w_spd * np.cos(w_dir_rad - CANYON_AXIS_RAD)
     out["wind_cross_canyon_ms"] = w_spd * np.sin(w_dir_rad - CANYON_AXIS_RAD)
     upslope_wind_ms = np.maximum(0.0, w_spd * np.cos(w_dir_rad - OROGRAPHIC_UPSLOPE_RAD))
@@ -720,8 +739,14 @@ class TassajaraMOSCorrector:
         hydro_df = self._predict_hydro(X_fut)
 
         res = df_future[["issue_time_utc", "valid_time_utc", "nws_temp_c"]].copy()
-        corr_c = res["nws_temp_c"] + err_mean
-        res["pred_temp_error_c"] = np.round(err_mean, 2)
+        base_model_t = X_full["nws_temp_c"].values
+        corr_c = base_model_t + err_mean
+        official_nws_t = (
+            pd.to_numeric(res["nws_temp_c"], errors="coerce")
+            .fillna(pd.Series(base_model_t, index=res.index))
+            .values
+        )
+        res["pred_temp_error_c"] = np.round(corr_c - official_nws_t, 2)
         res["corrected_temp_c"] = np.round(corr_c, 2)
         res["corrected_temp_p10_c"] = np.round(corr_c - half_low, 2)
         res["corrected_temp_p90_c"] = np.round(corr_c + half_high, 2)

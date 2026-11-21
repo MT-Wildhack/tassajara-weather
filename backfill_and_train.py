@@ -130,6 +130,13 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 nws_qpf_1hr_mm REAL DEFAULT 0.0,
                 nws_sky_cover_pct REAL DEFAULT 20.0,
                 short_forecast TEXT,
+                om_temp_c REAL,
+                om_dewpoint_c REAL,
+                om_rh_pct REAL,
+                om_wind_speed_ms REAL,
+                om_wind_gust_ms REAL,
+                om_wind_dir_deg REAL,
+                om_sky_cover_pct REAL,
                 PRIMARY KEY (issue_time_utc, valid_time_utc)
             );
 
@@ -182,6 +189,17 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 conn.execute(
                     f"ALTER TABLE nws_forecasts ADD COLUMN {col_name} REAL DEFAULT {dflt};"
                 )
+        for om_col in (
+            "om_temp_c",
+            "om_dewpoint_c",
+            "om_rh_pct",
+            "om_wind_speed_ms",
+            "om_wind_gust_ms",
+            "om_wind_dir_deg",
+            "om_sky_cover_pct",
+        ):
+            if om_col not in nws_cols:
+                conn.execute(f"ALTER TABLE nws_forecasts ADD COLUMN {om_col} REAL;")
 
         # Idempotent provenance column migrations for existing databases
         for tbl, default_src in (
@@ -199,7 +217,19 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
             CREATE VIEW vw_mos_training_dataset AS
             WITH canonical_fc AS (
                 SELECT
-                    *,
+                    issue_time_utc,
+                    valid_time_utc,
+                    lead_time_hours,
+                    COALESCE(om_temp_c, nws_temp_c) AS nws_temp_c,
+                    COALESCE(om_dewpoint_c, nws_dewpoint_c) AS nws_dewpoint_c,
+                    COALESCE(om_rh_pct, nws_rh_pct) AS nws_rh_pct,
+                    COALESCE(om_wind_speed_ms, nws_wind_speed_ms) AS nws_wind_speed_ms,
+                    COALESCE(om_wind_gust_ms, nws_wind_gust_ms) AS nws_wind_gust_ms,
+                    COALESCE(om_wind_dir_deg, nws_wind_dir_deg) AS nws_wind_dir_deg,
+                    COALESCE(om_sky_cover_pct, nws_sky_cover_pct) AS nws_sky_cover_pct,
+                    nws_pop_pct,
+                    nws_qpf_1hr_mm,
+                    short_forecast,
                     ROW_NUMBER() OVER (
                         PARTITION BY valid_time_utc
                         ORDER BY
@@ -211,6 +241,7 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 WHERE nws_temp_c IS NOT NULL
                   AND lead_time_hours >= 1
                   AND issue_time_utc < valid_time_utc
+                  AND (short_forecast = 'Archived NWP Grid' OR om_temp_c IS NOT NULL)
             )
             SELECT
                 f.issue_time_utc,
@@ -256,9 +287,10 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 COALESCE(o_issue.temp_c, f.nws_temp_c) AS issue_tass_temp_c,
                 COALESCE(
                     o_issue.temp_c - (
-                        SELECT fi.nws_temp_c FROM nws_forecasts fi
+                        SELECT COALESCE(fi.om_temp_c, fi.nws_temp_c) FROM nws_forecasts fi
                         WHERE fi.valid_time_utc = f.issue_time_utc
                           AND fi.issue_time_utc <= f.issue_time_utc
+                          AND (fi.short_forecast = 'Archived NWP Grid' OR fi.om_temp_c IS NOT NULL)
                         ORDER BY fi.issue_time_utc DESC LIMIT 1
                     ),
                     0.0
@@ -966,8 +998,10 @@ def populate_mos_verification_and_active_forecasts(
                 else {}
             )
 
-            base_nws_t = float(latest_fc_df["nws_temp_c"].iloc[0])
-            base_nws_rh = clean_num(latest_fc_df["nws_rh_pct"].iloc[0], 50.0) or 50.0
+            _om_t0 = clean_num(latest_fc_df["om_temp_c"].iloc[0], None) if "om_temp_c" in latest_fc_df.columns else None
+            _om_rh0 = clean_num(latest_fc_df["om_rh_pct"].iloc[0], None) if "om_rh_pct" in latest_fc_df.columns else None
+            base_nws_t = _om_t0 if _om_t0 is not None else float(latest_fc_df["nws_temp_c"].iloc[0])
+            base_nws_rh = _om_rh0 if _om_rh0 is not None else (clean_num(latest_fc_df["nws_rh_pct"].iloc[0], 50.0) or 50.0)
             tass_t = (
                 float(obs_latest.iloc[0]["temp_c"])
                 if not obs_latest.empty
