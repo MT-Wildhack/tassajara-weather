@@ -260,10 +260,20 @@ def fetch_open_meteo_nwp_map(past_days: int = 1, forecast_days: int = 8) -> Dict
     data = _get_json_with_retries(
         "https://api.open-meteo.com/v1/forecast",
         params=params,
-        timeout=12,
-        retries=2,
+        timeout=18,
+        retries=3,
     )
     if not isinstance(data, dict) and past_days > 0:
+        # Retry Open-Meteo /v1/forecast without past_days to preserve full 8-day forecast horizon
+        fc_only_params = {k: v for k, v in params.items() if k != "past_days"}
+        data = _get_json_with_retries(
+            "https://api.open-meteo.com/v1/forecast",
+            params=fc_only_params,
+            timeout=18,
+            retries=2,
+        )
+    if not isinstance(data, dict) and past_days > 0:
+        logger.warning("Open-Meteo /v1/forecast failed; falling back to historical-forecast-api (Days 3-7 will omit om_*).")
         hist_params = {
             "latitude": TASS_LAT,
             "longitude": TASS_LON,
@@ -372,7 +382,7 @@ def fetch_nws_gridpoints_dataframe(
     grid_url, hourly_url = resolve_nws_endpoints(TASS_LAT, TASS_LON)
 
     # 0. Fetch Open-Meteo 1-Hour NWP Supplement first so its hourly profile can disaggregate PT6H NWS QPF blocks
-    past_days_om = max(1, int(np.ceil(include_past_hours / 24.0)) + 1) if include_past_hours > 0 else 1
+    past_days_om = max(1, int(np.ceil(include_past_hours / 24.0)) + 1) if include_past_hours > 0 else 0
     om_map = fetch_open_meteo_nwp_map(past_days=past_days_om, forecast_days=8)
 
     # 1. Fetch Raw NWS Gridpoint Arrays (/gridpoints/MTR/...)

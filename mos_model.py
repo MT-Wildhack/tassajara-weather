@@ -914,7 +914,7 @@ def predict_dual_baseline_with_ewma(
     half_high = np.maximum(0.35, preds_om["corrected_temp_p90_c"].values - mos_om_c)
 
     w_om = float(np.clip(om_weight, 0.0, 1.0))
-    blended_c = np.where(has_om.values, w_om * mos_om_c + (1.0 - w_om) * raw_nws_t, mos_om_c)
+    blended_c = np.where(has_om.values, w_om * mos_om_c + (1.0 - w_om) * raw_nws_t, raw_nws_t)
 
     dt_loc = pd.to_datetime(df_future["valid_time_utc"], utc=True).dt.tz_convert("America/Los_Angeles")
     blocks = (dt_loc.dt.hour // 4).values
