@@ -2,8 +2,8 @@ name: Tassajara Hourly Microclimate & MOS Pipeline
 
 on:
   schedule:
-    # Minute 05 every hour UTC (after top-of-hour Davis VP2 & RAWS logger commits)
-    - cron: "5 * * * *"
+    # Minute 17 every hour UTC (off-peak to avoid top-of-hour GitHub scheduler throttling) (after top-of-hour Davis VP2 & RAWS logger commits)
+    - cron: "17 * * * *"
     # Weekly Sunday 11:25 UTC (03:25 AM PST / 04:25 AM PDT) MOS retraining
     - cron: "25 11 * * 0"
   workflow_dispatch:

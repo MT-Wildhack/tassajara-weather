@@ -39,6 +39,8 @@ from mos_model import (
     engineer_mos_features,
     analytical_hydro_hurdle_fallback,
     build_well_conditioned_ols_matrix,
+    compute_diurnal_ewma_bias,
+    predict_dual_baseline_with_ewma,
 )
 from hydro_risk_engine import (
     MM_PER_INCH,
@@ -580,7 +582,22 @@ def attach_boundary_telemetry_for_mos(
         "issue_tass_temp_c",
         latest_tass_t if not math.isnan(latest_tass_t) else base_t,
     )
-    out["issue_persistence_bias_c"] = get_col(out, "issue_persistence_bias_c", init_bias_c)
+    _valid_dt_bias = pd.to_datetime(out["valid_time_utc"], utc=True, errors="coerce")
+    _base_t_bias = get_col(out, "nws_temp_c", 15.0)
+    _first_nws_t = float(_base_t_bias.iloc[0]) if not _base_t_bias.empty else 15.0
+    _latest_tass_t = safe_float(obs_df.iloc[0].get("temp_c"), np.nan) if (obs_df is not None and not obs_df.empty) else np.nan
+    _obs_fresh = False
+    if obs_df is not None and not obs_df.empty and not _valid_dt_bias.empty and pd.notna(_valid_dt_bias.iloc[0]):
+        _obs_dt0 = pd.to_datetime(obs_df.iloc[0].get("valid_time_utc"), utc=True, errors="coerce")
+        if pd.notna(_obs_dt0):
+            _obs_fresh = abs((_valid_dt_bias.iloc[0] - _obs_dt0).total_seconds()) <= 7200.0
+    _safe_nws_bias_c = float(_latest_tass_t - _first_nws_t) if (_obs_fresh and not math.isnan(_latest_tass_t)) else 0.0
+    _first_om_t = _first_nws_t
+    if "om_temp_c" in out.columns and pd.to_numeric(out["om_temp_c"], errors="coerce").notna().any():
+        _first_om_t = float(pd.to_numeric(out["om_temp_c"], errors="coerce").dropna().iloc[0])
+    _safe_om_bias_c = float(_latest_tass_t - _first_om_t) if (_obs_fresh and not math.isnan(_latest_tass_t)) else 0.0
+    out["issue_persistence_bias_c"] = get_col(out, "issue_persistence_bias_c", _safe_nws_bias_c)
+    out["issue_om_persistence_bias_c"] = get_col(out, "issue_om_persistence_bias_c", _safe_om_bias_c)
 
     ref_anchor_t = out["issue_tass_temp_c"]
     out["issue_chews_temp_c"] = get_col(
@@ -774,7 +791,18 @@ def apply_mos_inference_if_needed(
     mos_model, _load_err = get_cached_mos_model()
     if mos_model is not None:
         try:
-            preds = mos_model.predict(sub)
+            use_dual = "om_temp_c" in sub.columns and pd.to_numeric(sub["om_temp_c"], errors="coerce").notna().any()
+            if use_dual:
+                ewma_map = {}
+                if Path(DB_PATH).exists():
+                    try:
+                        with _connect_ro(DB_PATH) as _conn_e:
+                            ewma_map = compute_diurnal_ewma_bias(_conn_e, datetime.now(timezone.utc).isoformat())
+                    except Exception:
+                        ewma_map = {}
+                preds = predict_dual_baseline_with_ewma(mos_model, sub, ewma_bias_by_block=ewma_map, om_weight=0.50)
+            else:
+                preds = mos_model.predict(sub)
             for c in [
                 "pred_temp_error_c",
                 "corrected_temp_c",
@@ -1447,7 +1475,7 @@ def load_all_dashboard_data():
                             ROW_NUMBER() OVER (
                                 PARTITION BY valid_time_utc, issue_time_utc
                                 ORDER BY
-                                    CASE WHEN model_version = 'MOS_GBM_v3_HYDRO' THEN 0 ELSE 1 END ASC,
+                                    CASE WHEN model_version != 'MOS_GBM_v3_OOF' THEN 0 ELSE 1 END ASC,
                                     model_version DESC
                             ) AS rn
                         FROM mos_corrected_forecasts
@@ -3171,7 +3199,7 @@ solar_state, solar_el, solar_az, horizon_elev = compute_canyon_solar_state(now_u
 
 _cached_mos_obj, _cached_mos_err = get_cached_mos_model()
 active_model_name = (
-    "MOS_GBM_v3_HYDRO (5-Station Santa Lucia Spatial + Hurdle PoP/QPF)"
+    "MOS_GBM_v4_DUAL (Open-Meteo 880m MOS + NWS MTR Blend + Diurnal EWMA)"
     if model_diag["model_loaded"]
     else "TOPO_HYDRO_PHYSICS (Analytical Baseline)"
 )

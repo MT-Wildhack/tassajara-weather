@@ -37,6 +37,8 @@ from mos_model import (
     TassajaraMOSCorrector,
     engineer_mos_features,
     analytical_hydro_hurdle_fallback,
+    compute_diurnal_ewma_bias,
+    predict_dual_baseline_with_ewma,
 )
 
 logging.basicConfig(
@@ -171,10 +173,12 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
             "raw_nws_qpf_mm",
             "mos_qpf_mm",
             "mos_qpf_p90_mm",
+            "ewma_bias_applied_c",
         ):
             if col_name not in mos_cols:
+                dflt_sql = " DEFAULT 0.0" if col_name == "ewma_bias_applied_c" else ""
                 conn.execute(
-                    f"ALTER TABLE mos_corrected_forecasts ADD COLUMN {col_name} REAL;"
+                    f"ALTER TABLE mos_corrected_forecasts ADD COLUMN {col_name} REAL{dflt_sql};"
                 )
 
         nws_cols = {
@@ -217,23 +221,15 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
             CREATE VIEW vw_mos_training_dataset AS
             WITH canonical_fc AS (
                 SELECT
-                    issue_time_utc,
-                    valid_time_utc,
-                    lead_time_hours,
-                    COALESCE(om_temp_c, nws_temp_c) AS nws_temp_c,
-                    COALESCE(om_dewpoint_c, nws_dewpoint_c) AS nws_dewpoint_c,
-                    COALESCE(om_rh_pct, nws_rh_pct) AS nws_rh_pct,
-                    COALESCE(om_wind_speed_ms, nws_wind_speed_ms) AS nws_wind_speed_ms,
-                    COALESCE(om_wind_gust_ms, nws_wind_gust_ms) AS nws_wind_gust_ms,
-                    COALESCE(om_wind_dir_deg, nws_wind_dir_deg) AS nws_wind_dir_deg,
-                    COALESCE(om_sky_cover_pct, nws_sky_cover_pct) AS nws_sky_cover_pct,
-                    nws_pop_pct,
-                    nws_qpf_1hr_mm,
-                    short_forecast,
+                    *,
                     ROW_NUMBER() OVER (
                         PARTITION BY valid_time_utc
                         ORDER BY
-                            CASE WHEN short_forecast != 'Archived NWP Grid' THEN 0 ELSE 1 END ASC,
+                            CASE
+                                WHEN om_temp_c IS NOT NULL THEN 0
+                                WHEN short_forecast = 'Archived NWP Grid' THEN 1
+                                ELSE 2
+                            END ASC,
                             ABS(lead_time_hours - 6) ASC,
                             issue_time_utc DESC
                     ) AS rn
@@ -241,19 +237,18 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 WHERE nws_temp_c IS NOT NULL
                   AND lead_time_hours >= 1
                   AND issue_time_utc < valid_time_utc
-                  AND (short_forecast = 'Archived NWP Grid' OR om_temp_c IS NOT NULL)
             )
             SELECT
                 f.issue_time_utc,
                 f.valid_time_utc,
                 f.lead_time_hours,
-                f.nws_temp_c,
-                f.nws_dewpoint_c,
-                f.nws_rh_pct,
-                f.nws_wind_speed_ms,
-                COALESCE(f.nws_wind_gust_ms, f.nws_wind_speed_ms * 1.35) AS nws_wind_gust_ms,
-                f.nws_wind_dir_deg,
-                COALESCE(f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
+                COALESCE(f.om_temp_c, f.nws_temp_c) AS nws_temp_c,
+                COALESCE(f.om_dewpoint_c, f.nws_dewpoint_c) AS nws_dewpoint_c,
+                COALESCE(f.om_rh_pct, f.nws_rh_pct) AS nws_rh_pct,
+                COALESCE(f.om_wind_speed_ms, f.nws_wind_speed_ms) AS nws_wind_speed_ms,
+                COALESCE(f.nws_wind_gust_ms, COALESCE(f.om_wind_speed_ms, f.nws_wind_speed_ms) * 1.35) AS nws_wind_gust_ms,
+                COALESCE(f.om_wind_dir_deg, f.nws_wind_dir_deg) AS nws_wind_dir_deg,
+                COALESCE(f.om_sky_cover_pct, f.nws_sky_cover_pct, 20.0) AS nws_sky_cover_pct,
                 COALESCE(f.nws_pop_pct, 0.0) AS nws_pop_pct,
                 COALESCE(f.nws_qpf_1hr_mm, 0.0) AS nws_qpf_1hr_mm,
                 o.temp_c AS actual_temp_c,
@@ -265,8 +260,8 @@ def ensure_schema_and_view(db_path: str = DB_PATH) -> None:
                 -- LEAK-FREE: barometric tendency at forecast ISSUE time, never target valid_time_utc
                 COALESCE(o_issue.pressure_trend_3hr_hpa, 0.0) AS pressure_trend_3hr_hpa,
                 COALESCE(o.precip_1hr_mm, 0.0) AS actual_precip_mm,
-                (o.temp_c - f.nws_temp_c) AS temp_error_c,
-                (o.rh_pct - f.nws_rh_pct) AS rh_error_pct,
+                (o.temp_c - COALESCE(f.om_temp_c, f.nws_temp_c)) AS temp_error_c,
+                (o.rh_pct - COALESCE(f.om_rh_pct, f.nws_rh_pct)) AS rh_error_pct,
                 -- CHWC1: Chews Ridge (1,536m Interior Crest)
                 COALESCE(r_chews.temp_c, r_vent.temp_c - 0.54, COALESCE(o_issue.temp_c, f.nws_temp_c) - 6.83) AS issue_chews_temp_c,
                 COALESCE(r_chews.rh_pct, f.nws_rh_pct) AS issue_chews_rh_pct,
@@ -1050,17 +1045,29 @@ def populate_mos_verification_and_active_forecasts(
             latest_fc_df["issue_bigsur_precip_mm"] = bigsur_p
             latest_fc_df["issue_ventana_temp_c"] = vent_t
             latest_fc_df["issue_ventana_precip_mm"] = vent_p
+            obs_gap_hrs = 999.0
+            if not obs_latest.empty:
+                obs_gap_hrs = abs(
+                    (
+                        pd.to_datetime(latest_fc_df["valid_time_utc"].iloc[0], utc=True)
+                        - pd.to_datetime(anchor_ts, utc=True)
+                    ).total_seconds()
+                ) / 3600.0
+            base_om_t = clean_num(latest_fc_df["om_temp_c"].iloc[0], base_nws_t) if "om_temp_c" in latest_fc_df.columns else base_nws_t
             latest_fc_df["issue_tass_temp_c"] = tass_t
-            latest_fc_df["issue_persistence_bias_c"] = tass_t - base_nws_t
+            latest_fc_df["issue_persistence_bias_c"] = (tass_t - base_nws_t) if obs_gap_hrs <= 2.0 else 0.0
+            latest_fc_df["issue_om_persistence_bias_c"] = (tass_t - base_om_t) if obs_gap_hrs <= 2.0 else 0.0
 
+            ewma_map = compute_diurnal_ewma_bias(conn, anchor_ts)
             fut_preds = _ensure_hydro_pred_cols(
-                corrector.predict(latest_fc_df), latest_fc_df
+                predict_dual_baseline_with_ewma(corrector, latest_fc_df, ewma_bias_by_block=ewma_map, om_weight=0.50),
+                latest_fc_df,
             )
             fut_rows = [
                 (
                     str(r["issue_time_utc"]),
                     str(r["valid_time_utc"]),
-                    "MOS_GBM_v3_HYDRO",
+                    "MOS_GBM_v4_DUAL",
                     float(r["nws_temp_c"]),
                     float(r["pred_temp_error_c"]),
                     float(r["corrected_temp_c"]),
@@ -1079,6 +1086,7 @@ def populate_mos_verification_and_active_forecasts(
                     clean_num(r.get("raw_nws_qpf_mm"), 0.0),
                     clean_num(r.get("mos_qpf_mm"), 0.0),
                     clean_num(r.get("mos_qpf_p90_mm"), 0.0),
+                    clean_num(r.get("ewma_bias_applied_c"), 0.0),
                 )
                 for idx, r in fut_preds.iterrows()
             ]
@@ -1090,8 +1098,9 @@ def populate_mos_verification_and_active_forecasts(
                     corrected_temp_p10_c, corrected_temp_p90_c,
                     corrected_rh_pct, corrected_wind_gust_ms,
                     raw_nws_pop_pct, mos_pop_pct,
-                    raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm,
+                    ewma_bias_applied_c
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 fut_rows,
             )

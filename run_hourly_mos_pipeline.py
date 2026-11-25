@@ -28,6 +28,8 @@ from mos_model import (
     TassajaraMOSCorrector,
     engineer_mos_features,
     analytical_hydro_hurdle_fallback,
+    compute_diurnal_ewma_bias,
+    predict_dual_baseline_with_ewma,
 )
 from hydro_risk_engine import (
     ensure_hydro_schema,
@@ -387,13 +389,26 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
         latest_fc_df["issue_bigsur_precip_mm"] = bigsur_p
         latest_fc_df["issue_ventana_temp_c"] = vent_t
         latest_fc_df["issue_ventana_precip_mm"] = vent_p
+        obs_gap_hrs = 999.0
+        if not obs_latest.empty:
+            obs_gap_hrs = abs(
+                (
+                    pd.to_datetime(latest_fc_df["valid_time_utc"].iloc[0], utc=True)
+                    - pd.to_datetime(anchor_ts, utc=True)
+                ).total_seconds()
+            ) / 3600.0
+        base_om_t = clean_num(latest_fc_df["om_temp_c"].iloc[0], base_nws_t) if "om_temp_c" in latest_fc_df.columns else base_nws_t
         latest_fc_df["issue_tass_temp_c"] = tass_t
-        latest_fc_df["issue_persistence_bias_c"] = tass_t - base_nws_t
+        latest_fc_df["issue_persistence_bias_c"] = (tass_t - base_nws_t) if obs_gap_hrs <= 2.0 else 0.0
+        latest_fc_df["issue_om_persistence_bias_c"] = (tass_t - base_om_t) if obs_gap_hrs <= 2.0 else 0.0
 
+        ewma_map = compute_diurnal_ewma_bias(conn, anchor_ts)
         if MODEL_PATH.exists():
             corrector: TassajaraMOSCorrector = joblib.load(MODEL_PATH)
-            preds = corrector.predict(latest_fc_df)
-            model_ver = "MOS_GBM_v3_HYDRO"
+            preds = predict_dual_baseline_with_ewma(
+                corrector, latest_fc_df, ewma_bias_by_block=ewma_map, om_weight=0.50
+            )
+            model_ver = "MOS_GBM_v4_DUAL"
         else:
             X_f = engineer_mos_features(latest_fc_df)
             h_fb = analytical_hydro_hurdle_fallback(X_f)
@@ -407,6 +422,7 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
             preds["raw_nws_qpf_mm"] = X_f["nws_qpf_1hr_mm"].round(3).values
             preds["mos_qpf_mm"] = h_fb["mos_qpf_mm"].values
             preds["mos_qpf_p90_mm"] = h_fb["mos_qpf_p90_mm"].values
+            preds["ewma_bias_applied_c"] = 0.0
             model_ver = "TOPO_HYDRO_PHYSICS"
 
         fut_rows = [
@@ -426,6 +442,7 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
                 clean_num(r.get("raw_nws_qpf_mm"), 0.0),
                 clean_num(r.get("mos_qpf_mm"), 0.0),
                 clean_num(r.get("mos_qpf_p90_mm"), 0.0),
+                clean_num(r.get("ewma_bias_applied_c"), 0.0),
             )
             for idx, r in preds.iterrows()
         ]
@@ -438,11 +455,14 @@ def generate_operational_mos_forecasts(db_path: str = DB_PATH) -> int:
                 corrected_temp_p10_c, corrected_temp_p90_c,
                 corrected_rh_pct, corrected_wind_gust_ms,
                 raw_nws_pop_pct, mos_pop_pct,
-                raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                raw_nws_qpf_mm, mos_qpf_mm, mos_qpf_p90_mm,
+                ewma_bias_applied_c
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             fut_rows,
         )
+        if ewma_map:
+            logger.info(f"Applied 14d Diurnal EWMA bias (C by 4h PST block): {ewma_map}")
         conn.commit()
 
     logger.info(f"Stored {len(fut_rows)} operational MOS forecast hours ({model_ver}).")

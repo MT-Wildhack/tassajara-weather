@@ -437,10 +437,15 @@ class TassajaraMOSCorrector:
         return m_pop, m_qpf, m_p90
 
     @staticmethod
-    def _augment_training_leads(X_tr: pd.DataFrame, y_tr: pd.Series, seed: int = 42):
+    def _augment_training_leads(
+        X_tr: pd.DataFrame,
+        y_tr: pd.Series,
+        seed: int = 42,
+        sample_weight: np.ndarray = None,
+    ):
         """Fold-internal synthetic lead augmentation so Day 2-7 decayed features stay in-distribution."""
         if len(X_tr) < 200:
-            return X_tr, y_tr
+            return (X_tr, y_tr, sample_weight) if sample_weight is not None else (X_tr, y_tr)
         rng = np.random.default_rng(seed)
         n_aug = min(len(X_tr), max(400, len(X_tr) // 3))
         idx_aug = rng.choice(len(X_tr), size=n_aug, replace=False)
@@ -465,7 +470,12 @@ class TassajaraMOSCorrector:
             X_aug["issue_lapse_chews_c_km"] = 6.5 + (
                 X_aug["issue_lapse_chews_c_km"].values - 6.5
             ) * np.exp(-(syn_lead - orig_lead) / 12.0)
-        return pd.concat([X_tr, X_aug], ignore_index=True), pd.concat([y_tr, y_aug], ignore_index=True)
+        X_out = pd.concat([X_tr, X_aug], ignore_index=True)
+        y_out = pd.concat([y_tr, y_aug], ignore_index=True)
+        if sample_weight is not None:
+            w_out = np.concatenate([sample_weight, sample_weight[idx_aug]])
+            return X_out, y_out, w_out
+        return X_out, y_out
 
     def _blend_hydro_predictions(
         self, X_fut: pd.DataFrame, m_pop, m_qpf, m_p90
@@ -573,14 +583,19 @@ class TassajaraMOSCorrector:
         oof_frames = []
         last_fold_state = None
 
+        dt_valid_all = pd.to_datetime(df_sorted["valid_time_utc"], utc=True)
         for fold_i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
             y_tr, y_te = y_err.iloc[train_idx], y_err.iloc[test_idx]
-            X_tr_aug, y_tr_aug = self._augment_training_leads(X_tr, y_tr, seed=42 + fold_i)
+            age_days_tr = (dt_valid_all.iloc[train_idx].max() - dt_valid_all.iloc[train_idx]).dt.total_seconds().values / 86400.0
+            w_tr = np.maximum(0.30, np.exp(-age_days_tr / 270.0))
+            X_tr_aug, y_tr_aug, w_tr_aug = self._augment_training_leads(
+                X_tr, y_tr, seed=42 + fold_i, sample_weight=w_tr
+            )
 
-            self.model_mean.fit(X_tr_aug, y_tr_aug)
-            self.model_p10.fit(X_tr_aug, y_tr_aug)
-            self.model_p90.fit(X_tr_aug, y_tr_aug)
+            self.model_mean.fit(X_tr_aug, y_tr_aug, sample_weight=w_tr_aug)
+            self.model_p10.fit(X_tr_aug, y_tr_aug, sample_weight=w_tr_aug)
+            self.model_p90.fit(X_tr_aug, y_tr_aug, sample_weight=w_tr_aug)
 
             pred_err = self.model_mean.predict(X_te)
             pred_p10 = np.minimum(self.model_p10.predict(X_te), pred_err - 0.35)
@@ -662,10 +677,14 @@ class TassajaraMOSCorrector:
             self.precomputed_importances = {}
 
         # Final full-sample refit (with lead-time augmentation)
-        X_full_aug, y_full_aug = self._augment_training_leads(X, y_err, seed=99)
-        self.model_mean.fit(X_full_aug, y_full_aug)
-        self.model_p10.fit(X_full_aug, y_full_aug)
-        self.model_p90.fit(X_full_aug, y_full_aug)
+        age_days_full = (dt_valid_all.max() - dt_valid_all).dt.total_seconds().values / 86400.0
+        w_full = np.maximum(0.30, np.exp(-age_days_full / 270.0))
+        X_full_aug, y_full_aug, w_full_aug = self._augment_training_leads(
+            X, y_err, seed=99, sample_weight=w_full
+        )
+        self.model_mean.fit(X_full_aug, y_full_aug, sample_weight=w_full_aug)
+        self.model_p10.fit(X_full_aug, y_full_aug, sample_weight=w_full_aug)
+        self.model_p90.fit(X_full_aug, y_full_aug, sample_weight=w_full_aug)
 
         m_pop, m_qpf, m_p90 = self._fit_hydro_models(X, y_precip)
         if m_pop is not None:
@@ -762,3 +781,152 @@ class TassajaraMOSCorrector:
 
     def save(self, filepath: str = "models/tassajara_mos_v1.joblib"):
         joblib.dump(self, filepath)
+
+
+def compute_diurnal_ewma_bias(
+    conn,
+    anchor_utc_iso: str,
+    lookback_days: int = 14,
+    half_life_days: float = 5.0,
+    shrinkage_n0: float = 6.0,
+    max_abs_bias_c: float = 3.5,
+) -> dict:
+    """
+    Causal 14-day Diurnal EWMA residual bias estimator across six 4-hour PST/PDT blocks.
+    Evaluates strictly pre-EWMA dual-baseline residuals (actual - unadjusted_mos) on
+    valid_time_utc < anchor_utc_iso to prevent feedback oscillation or leakage.
+    """
+    try:
+        m_cols = {r[1] for r in conn.execute("PRAGMA table_info(mos_corrected_forecasts)").fetchall()}
+        if "ewma_bias_applied_c" not in m_cols:
+            return {}
+        anchor_dt = pd.to_datetime(anchor_utc_iso, utc=True)
+        start_iso = (anchor_dt - pd.Timedelta(days=int(lookback_days))).isoformat()
+        df_res = pd.read_sql_query(
+            """
+            SELECT
+                o.valid_time_utc,
+                o.temp_c AS actual_temp_c,
+                m.corrected_temp_c,
+                COALESCE(m.ewma_bias_applied_c, 0.0) AS ewma_bias_applied_c
+            FROM local_observations o
+            JOIN (
+                SELECT
+                    valid_time_utc,
+                    issue_time_utc,
+                    corrected_temp_c,
+                    ewma_bias_applied_c,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY valid_time_utc
+                        ORDER BY
+                            ABS((julianday(valid_time_utc) - julianday(issue_time_utc)) * 24.0 - 6.0) ASC,
+                            issue_time_utc DESC
+                    ) AS rn
+                FROM mos_corrected_forecasts
+                WHERE model_version = 'MOS_GBM_v4_DUAL'
+                  AND issue_time_utc < valid_time_utc
+            ) m ON o.valid_time_utc = m.valid_time_utc AND m.rn = 1
+            WHERE o.temp_c IS NOT NULL
+              AND o.qc_flag = 'OK'
+              AND COALESCE(o.source, 'WL_LIVE') != 'OPENMETEO_SYNTH'
+              AND o.valid_time_utc < ?
+              AND o.valid_time_utc >= ?
+            ORDER BY o.valid_time_utc ASC
+            """,
+            conn,
+            params=(anchor_dt.isoformat(), start_iso),
+        )
+        if df_res.empty:
+            return {}
+        dt_v = pd.to_datetime(df_res["valid_time_utc"], utc=True)
+        dt_loc = dt_v.dt.tz_convert("America/Los_Angeles")
+        blocks = (dt_loc.dt.hour // 4).values
+        age_days = np.maximum(0.0, (anchor_dt - dt_v).dt.total_seconds().values / 86400.0)
+        weights = np.exp(-np.log(2.0) * age_days / float(half_life_days))
+        unadj_c = df_res["corrected_temp_c"].values - df_res["ewma_bias_applied_c"].values
+        resid_c = df_res["actual_temp_c"].values - unadj_c
+
+        bias_by_block = {}
+        for b in range(6):
+            mask = blocks == b
+            if not np.any(mask):
+                continue
+            w_b = weights[mask]
+            r_b = resid_c[mask]
+            val = float(np.sum(w_b * r_b) / (np.sum(w_b) + float(shrinkage_n0)))
+            bias_by_block[int(b)] = round(float(np.clip(val, -max_abs_bias_c, max_abs_bias_c)), 3)
+        return bias_by_block
+    except Exception:
+        return {}
+
+
+def predict_dual_baseline_with_ewma(
+    corrector: TassajaraMOSCorrector,
+    df_future: pd.DataFrame,
+    ewma_bias_by_block: dict = None,
+    om_weight: float = 0.50,
+) -> pd.DataFrame:
+    """
+    Dual-Baseline Consensus + Adaptive Diurnal EWMA:
+      1. Evaluates MOS on its native Open-Meteo 880m thermal/wind/sky inputs (preserving official NWS PoP/QPF).
+      2. Blends MOS_OM 50/50 with official NOAA NWS MTR temperature where both exist.
+      3. Applies causal 4-hour-block diurnal EWMA bias correction and preserves calibrated P10-P90 half-widths.
+    """
+    df_om = df_future.copy()
+    raw_nws_t = _num_series(df_future, "nws_temp_c", _num_series(df_future, "raw_nws_temp_c", 15.0)).values
+
+    has_om = pd.Series(False, index=df_future.index)
+    if "om_temp_c" in df_future.columns:
+        om_t_s = pd.to_numeric(df_future["om_temp_c"], errors="coerce")
+        has_om = om_t_s.notna()
+        if has_om.any():
+            for om_col, nws_col in (
+                ("om_temp_c", "nws_temp_c"),
+                ("om_dewpoint_c", "nws_dewpoint_c"),
+                ("om_rh_pct", "nws_rh_pct"),
+                ("om_sky_cover_pct", "nws_sky_cover_pct"),
+                ("om_wind_speed_ms", "nws_wind_speed_ms"),
+                ("om_wind_dir_deg", "nws_wind_dir_deg"),
+            ):
+                if om_col in df_future.columns:
+                    vals = pd.to_numeric(df_future[om_col], errors="coerce")
+                    if nws_col in df_om.columns:
+                        df_om[nws_col] = vals.combine_first(pd.to_numeric(df_om[nws_col], errors="coerce"))
+                    else:
+                        df_om[nws_col] = vals
+            if "issue_om_persistence_bias_c" in df_future.columns:
+                df_om["issue_persistence_bias_c"] = pd.to_numeric(
+                    df_future["issue_om_persistence_bias_c"], errors="coerce"
+                ).fillna(0.0).clip(-6.0, 6.0)
+            elif "issue_tass_temp_c" in df_future.columns:
+                first_om_t = float(om_t_s.dropna().iloc[0])
+                orig_bias = pd.to_numeric(df_future.get("issue_persistence_bias_c", 0.0), errors="coerce").fillna(0.0)
+                tass_iss = pd.to_numeric(df_future["issue_tass_temp_c"], errors="coerce").fillna(first_om_t)
+                df_om["issue_persistence_bias_c"] = np.where(
+                    orig_bias.abs() > 1e-6,
+                    np.clip(tass_iss - first_om_t, -6.0, 6.0),
+                    0.0,
+                )
+
+    preds_om = corrector.predict(df_om)
+    mos_om_c = preds_om["corrected_temp_c"].values
+    half_low = np.maximum(0.35, mos_om_c - preds_om["corrected_temp_p10_c"].values)
+    half_high = np.maximum(0.35, preds_om["corrected_temp_p90_c"].values - mos_om_c)
+
+    w_om = float(np.clip(om_weight, 0.0, 1.0))
+    blended_c = np.where(has_om.values, w_om * mos_om_c + (1.0 - w_om) * raw_nws_t, mos_om_c)
+
+    dt_loc = pd.to_datetime(df_future["valid_time_utc"], utc=True).dt.tz_convert("America/Los_Angeles")
+    blocks = (dt_loc.dt.hour // 4).values
+    ewma_map = ewma_bias_by_block or {}
+    ewma_arr = np.array([float(ewma_map.get(int(b), 0.0)) for b in blocks], dtype=float)
+
+    final_c = blended_c + ewma_arr
+    res = preds_om.copy()
+    res["nws_temp_c"] = np.round(raw_nws_t, 2)
+    res["pred_temp_error_c"] = np.round(final_c - raw_nws_t, 2)
+    res["corrected_temp_c"] = np.round(final_c, 2)
+    res["corrected_temp_p10_c"] = np.round(final_c - half_low, 2)
+    res["corrected_temp_p90_c"] = np.round(final_c + half_high, 2)
+    res["ewma_bias_applied_c"] = np.round(ewma_arr, 3)
+    return res
